@@ -8,7 +8,7 @@ from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreQueryParams, HealthScoreResponse
 from app.schemas.utils import PaginatedResponse, Pagination
 from app.schemas.utils.metadata import TimeseriesMetadata
-from app.services import ApiKeyDep
+from app.services import SelfOrApiKeyDep
 from app.services.health_score_service import health_score_service
 from app.utils.dates import DateTimeQueryParam, parse_query_datetime
 
@@ -19,7 +19,7 @@ router = APIRouter()
 def list_health_scores(
     user_id: UUID,
     db: DbSession,
-    _api_key: ApiKeyDep,
+    _api_key: SelfOrApiKeyDep,
     start_date: DateTimeQueryParam | None = None,
     end_date: DateTimeQueryParam | None = None,
     category: HealthScoreCategory | None = None,

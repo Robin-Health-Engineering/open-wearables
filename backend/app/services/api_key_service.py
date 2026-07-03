@@ -4,13 +4,15 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException
+from jose import JWTError, jwt
 
+from app.config import settings
 from app.database import DbSession
 from app.models import ApiKey, Developer
 from app.repositories.api_key_repository import ApiKeyRepository
 from app.schemas.model_crud.credentials import ApiKeyCreate, ApiKeyUpdate
 from app.services.services import AppService
-from app.utils.auth import get_current_developer_optional
+from app.utils.auth import get_current_developer_optional, oauth2_scheme
 
 
 class ApiKeyService(AppService[ApiKeyRepository, ApiKey, ApiKeyCreate, ApiKeyUpdate]):
@@ -69,3 +71,46 @@ async def _require_api_key(
 
 
 ApiKeyDep = Annotated[str, Depends(_require_api_key)]
+
+
+async def _require_api_key_or_self(
+    user_id: UUID,
+    db: DbSession,
+    developer: Developer | None = Depends(get_current_developer_optional),
+    token: Annotated[str | None, Depends(oauth2_scheme)] = None,
+    x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
+) -> str:
+    """Authorize a per-user read endpoint.
+
+    Accepts, in priority order:
+    - a dashboard/developer JWT (unchanged behaviour),
+    - the organization API key header (unchanged behaviour),
+    - an SDK-scoped token whose ``sub`` matches the path ``user_id`` (self-read).
+
+    The self-read branch lets a device read its OWN user's data with the SDK
+    token it already holds for the write path, so the organization API key never
+    has to ship to the client. It reuses the same ``sub == user_id`` ownership
+    check the SDK write path performs (see ``routes/v1/sdk_sync.py``).
+
+    Applied ONLY to user-scoped read endpoints: routes without a ``{user_id}``
+    path parameter (e.g. ``GET/POST /users``) keep the stricter ``ApiKeyDep`` so
+    an SDK token can never reach collection or cross-user data.
+    """
+    if developer:
+        return str(developer.id)
+    if x_open_wearables_api_key:
+        return api_key_service.validate_api_key(db, x_open_wearables_api_key).id
+    if token:
+        try:
+            payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+            if payload.get("scope") == "sdk" and payload.get("sub") == str(user_id):
+                return str(payload["sub"])
+        except JWTError:
+            pass
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required: provide an API key or an SDK token for this user",
+    )
+
+
+SelfOrApiKeyDep = Annotated[str, Depends(_require_api_key_or_self)]

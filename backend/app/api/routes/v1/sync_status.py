@@ -6,10 +6,11 @@ Endpoints exposed under ``/users/{user_id}/sync/...``:
 - ``GET /sync/recent``   — last N events stored in Redis (24 h TTL)
 - ``GET /sync/runs``     — aggregated per-run status summaries
 
-All three are tagged ``External: Sync Status`` and protected by
-``ApiKeyDep`` which accepts both a developer JWT bearer token and an
-``X-Open-Wearables-API-Key`` header — no separate /dashboard variants
-are needed.
+All three are tagged ``External: Sync Status``. The user-scoped feeds use
+``SelfOrApiKeyDep`` — a developer JWT bearer token, an
+``X-Open-Wearables-API-Key`` header, or an SDK token whose subject matches
+``{user_id}`` (self-read). The admin ``/sync/runs`` feed keeps ``ApiKeyDep``.
+No separate /dashboard variants are needed.
 
 The SSE feed covers events from every sync source: pull syncs
 (``sync_vendor_data``), Garmin webhook live + 30-day backfill, mobile
@@ -28,7 +29,7 @@ from fastapi.responses import StreamingResponse
 
 from app.database import DbSession
 from app.schemas.sync_status import SyncRunSummary, SyncStatusEvent
-from app.services import ApiKeyDep, user_service
+from app.services import ApiKeyDep, SelfOrApiKeyDep, user_service
 from app.services.sync_status_service import (
     get_all_run_summaries,
     get_recent_events,
@@ -67,7 +68,7 @@ def _ensure_user_exists(db: DbSession, user_id: UUID) -> None:
 def stream_user_sync_status(
     user_id: UUID,
     db: DbSession,
-    _api_key: ApiKeyDep,
+    _api_key: SelfOrApiKeyDep,
     replay: Annotated[int, Query(ge=1, le=200, description="Replay last N events on connect.")] = 20,
 ) -> StreamingResponse:
     """Open a Server-Sent Events stream of sync status for a user.
@@ -103,7 +104,7 @@ def stream_user_sync_status(
 def list_recent_sync_events(
     user_id: UUID,
     db: DbSession,
-    _api_key: ApiKeyDep,
+    _api_key: SelfOrApiKeyDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> list[SyncStatusEvent]:
     """Return the most recent stored sync events (newest first).
@@ -123,7 +124,7 @@ def list_recent_sync_events(
 def list_sync_run_summaries(
     user_id: UUID,
     db: DbSession,
-    _api_key: ApiKeyDep,
+    _api_key: SelfOrApiKeyDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
 ) -> list[SyncRunSummary]:
     """Return aggregated per-run summaries for recent sync activity."""

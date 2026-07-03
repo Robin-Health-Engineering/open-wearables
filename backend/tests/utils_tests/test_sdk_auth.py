@@ -1,9 +1,12 @@
 """Tests for SDK authentication utilities."""
 
+from uuid import UUID
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.services.api_key_service import _require_api_key_or_self
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_current_developer, get_sdk_auth
 from tests.factories import ApiKeyFactory, DeveloperFactory
@@ -97,5 +100,87 @@ class TestSDKTokenBlockedFromDeveloperEndpoints:
         """No token should raise 401."""
         with pytest.raises(HTTPException) as exc_info:
             await get_current_developer(db=db, token=None)
+
+        assert exc_info.value.status_code == 401
+
+
+class TestRequireApiKeyOrSelf:
+    """Tests for the per-user read dependency (developer JWT, org API key, or SDK self-read)."""
+
+    USER_ID = "123e4567-e89b-12d3-a456-426614174000"
+
+    @pytest.mark.asyncio
+    async def test_sdk_token_matching_user_allowed(self, db: Session) -> None:
+        """An SDK token whose sub matches the path user_id is allowed (self-read)."""
+        token = create_sdk_user_token("app_123", self.USER_ID)
+
+        result = await _require_api_key_or_self(
+            user_id=UUID(self.USER_ID),
+            db=db,
+            developer=None,
+            token=token,
+            x_open_wearables_api_key=None,
+        )
+
+        assert result == self.USER_ID
+
+    @pytest.mark.asyncio
+    async def test_sdk_token_other_user_rejected(self, db: Session) -> None:
+        """An SDK token for a different user cannot read this user's data."""
+        other_user = "123e4567-e89b-12d3-a456-426614174999"
+        token = create_sdk_user_token("app_123", other_user)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _require_api_key_or_self(
+                user_id=UUID(self.USER_ID),
+                db=db,
+                developer=None,
+                token=token,
+                x_open_wearables_api_key=None,
+            )
+
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_api_key_still_allowed(self, db: Session) -> None:
+        """The organization API key keeps working (unchanged behaviour)."""
+        api_key = ApiKeyFactory()
+
+        result = await _require_api_key_or_self(
+            user_id=UUID(self.USER_ID),
+            db=db,
+            developer=None,
+            token=None,
+            x_open_wearables_api_key=api_key.id,
+        )
+
+        assert result == api_key.id
+
+    @pytest.mark.asyncio
+    async def test_developer_jwt_still_allowed(self, db: Session) -> None:
+        """A resolved developer (dashboard JWT) keeps full access (unchanged behaviour)."""
+        developer = DeveloperFactory()
+
+        result = await _require_api_key_or_self(
+            user_id=UUID(self.USER_ID),
+            db=db,
+            developer=developer,
+            token=None,
+            x_open_wearables_api_key=None,
+        )
+
+        assert result == str(developer.id)
+
+    @pytest.mark.asyncio
+    async def test_no_auth_rejected(self, db: Session) -> None:
+        """No credentials at all raises 401."""
+        with pytest.raises(HTTPException) as exc_info:
+            await _require_api_key_or_self(
+                user_id=UUID(self.USER_ID),
+                db=db,
+                developer=None,
+                token=None,
+                x_open_wearables_api_key=None,
+            )
 
         assert exc_info.value.status_code == 401

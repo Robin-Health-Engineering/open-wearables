@@ -11,7 +11,7 @@ from app.schemas.responses.activity import (
     Workout,
 )
 from app.schemas.utils import PaginatedResponse
-from app.services import ApiKeyDep
+from app.services import ApiKeyDep, SelfOrApiKeyDep
 from app.services.event_record_service import event_record_service
 from app.utils.dates import DateTimeQueryParam, parse_query_datetime
 
@@ -24,7 +24,7 @@ def list_workouts(
     start_date: DateTimeQueryParam,
     end_date: DateTimeQueryParam,
     db: DbSession,
-    _api_key: ApiKeyDep,
+    _api_key: SelfOrApiKeyDep,
     record_type: str | None = None,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
@@ -46,7 +46,7 @@ def list_sleep_sessions(
     start_date: DateTimeQueryParam,
     end_date: DateTimeQueryParam,
     db: DbSession,
-    _api_key: ApiKeyDep,
+    _api_key: SelfOrApiKeyDep,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     filter_by_priority: Annotated[
@@ -73,7 +73,7 @@ def list_menstrual_cycles(
     start_date: DateTimeQueryParam,
     end_date: DateTimeQueryParam,
     db: DbSession,
-    _api_key: ApiKeyDep,
+    _api_key: SelfOrApiKeyDep,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> PaginatedResponse[MenstrualCycleRecord]:
