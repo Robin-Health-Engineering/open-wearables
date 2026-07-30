@@ -8,6 +8,7 @@ provider has a ``BaseWebhookHandler`` wired up, and delegates to:
 
 * ``strategy.webhooks.handle(request, body, db)``   – POST (data events)
 * ``strategy.webhooks.handle_challenge(request)``   – GET (subscription verification)
+* ``strategy.webhooks.handle_probe(request)``       – HEAD (callback reachability probe)
 
 The per-provider webhook handlers (to be implemented under
 ``app/services/providers/{provider}/webhook_handler.py``) are responsible for:
@@ -25,7 +26,7 @@ into its strategy, traffic can be cut over to this router.
 from logging import getLogger
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from app.database import DbSession
 from app.schemas.responses.incoming_webhooks import (
@@ -123,6 +124,14 @@ def verify_provider_webhook(provider: str, request: Request) -> dict:
     """
     handler = _get_webhook_handler(provider)
     return handler.handle_challenge(request)
+
+
+@router.head("")
+def probe_provider_webhook(provider: str, request: Request) -> Response:
+    """Handle a callback reachability probe without a response body."""
+    handler = _get_webhook_handler(provider)
+    handler.handle_probe(request)
+    return Response(status_code=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------

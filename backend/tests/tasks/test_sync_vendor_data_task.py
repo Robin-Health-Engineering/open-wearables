@@ -9,9 +9,23 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
-from app.schemas.auth import ConnectionStatus
+from app.schemas.auth import ConnectionStatus, LiveSyncMode
 from app.utils.sync_params import build_sync_params
-from tests.factories import UserConnectionFactory, UserFactory
+from tests.factories import ProviderSettingFactory, UserConnectionFactory, UserFactory
+
+
+def _strategy_mock(*, rest_pull: bool = True, live_sync_mode: LiveSyncMode | None = LiveSyncMode.PULL) -> MagicMock:
+    """A strategy mock carrying the fields the periodic-pull filter reads.
+
+    ``default_live_sync_mode`` has to hold a real value: the filter resolves it through
+    ``resolve_live_sync_mode``, so a bare MagicMock would fail the enum coercion in a way
+    no actual strategy can.
+    """
+    strategy = MagicMock()
+    strategy.capabilities.rest_pull = rest_pull
+    strategy.capabilities.webhook_stream = False
+    strategy.default_live_sync_mode = live_sync_mode
+    return strategy
 
 
 class TestSyncVendorDataTask:
@@ -43,9 +57,7 @@ class TestSyncVendorDataTask:
         mock_workouts = MagicMock()
         mock_workouts.load_data.return_value = True
 
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = True
-        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy = _strategy_mock()
         mock_strategy.workouts = mock_workouts
         mock_get_provider.return_value = mock_strategy
 
@@ -87,9 +99,7 @@ class TestSyncVendorDataTask:
         mock_workouts = MagicMock()
         mock_workouts.load_data.return_value = True
 
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = True
-        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy = _strategy_mock()
         mock_strategy.workouts = mock_workouts
         mock_get_provider.return_value = mock_strategy
 
@@ -128,9 +138,7 @@ class TestSyncVendorDataTask:
         mock_workouts = MagicMock()
         mock_workouts.load_data.return_value = True
 
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = True
-        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy = _strategy_mock()
         mock_strategy.workouts = mock_workouts
         mock_get_provider.return_value = mock_strategy
 
@@ -165,9 +173,7 @@ class TestSyncVendorDataTask:
         mock_workouts = MagicMock()
         mock_workouts.load_data.return_value = True
 
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = True
-        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy = _strategy_mock()
         mock_strategy.workouts = mock_workouts
         mock_get_provider.return_value = mock_strategy
 
@@ -229,9 +235,7 @@ class TestSyncVendorDataTask:
         mock_workouts = MagicMock()
         mock_workouts.load_data.side_effect = Exception("Provider API unavailable")
 
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = True
-        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy = _strategy_mock()
         mock_strategy.workouts = mock_workouts
         mock_get_provider.return_value = mock_strategy
 
@@ -264,9 +268,7 @@ class TestSyncVendorDataTask:
         mock_workouts = MagicMock()
         mock_workouts.load_data.return_value = False
 
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = True
-        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy = _strategy_mock()
         mock_strategy.workouts = mock_workouts
         mock_get_provider.return_value = mock_strategy
 
@@ -296,9 +298,7 @@ class TestSyncVendorDataTask:
         mock_session_local.return_value.__exit__.return_value = None
 
         # Mock provider without workout support
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = True
-        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy = _strategy_mock()
         mock_strategy.workouts = None
         # Also ensure data_247 is not set so the strategy is still processed
         del mock_strategy.data_247
@@ -329,8 +329,7 @@ class TestSyncVendorDataTask:
         mock_session_local.return_value.__enter__.return_value = db
         mock_session_local.return_value.__exit__.return_value = None
 
-        mock_strategy = MagicMock()
-        mock_strategy.capabilities.rest_pull = False
+        mock_strategy = _strategy_mock(rest_pull=False)
         mock_get_provider.return_value = mock_strategy
 
         # Act
@@ -340,6 +339,31 @@ class TestSyncVendorDataTask:
         assert "apple" not in result["providers_synced"]
         assert result["errors"] == {}
         assert result["message"] == "No active provider connections found"
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_sync_vendor_data_resolves_an_unset_mode_to_the_provider_default(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """A settings row that carries no mode must fall back to the provider's own default,
+        the same way every other reader resolves it - not to a locally hardcoded PULL."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="oura", status=ConnectionStatus.ACTIVE)
+        ProviderSettingFactory(provider="oura", live_sync_mode=None)
+
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        mock_strategy = _strategy_mock()
+        mock_get_provider.return_value = mock_strategy
+
+        result = sync_vendor_data(str(user.id))
+
+        assert "oura" in result["providers_synced"]
 
     def test_sync_vendor_data_invalid_user_id(self, mock_celery_app: MagicMock) -> None:
         """Test handling of invalid user ID format."""

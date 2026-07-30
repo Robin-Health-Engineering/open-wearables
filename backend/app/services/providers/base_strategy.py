@@ -1,16 +1,19 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
 from celery import current_app as celery_app
 
+from app.database import DbSession
 from app.models import EventRecord, User
 from app.repositories.event_record_repository import EventRecordRepository
+from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import LiveSyncMode
+from app.schemas.auth import LiveSyncMode, resolve_live_sync_mode
 from app.schemas.enums import SeriesType
 from app.schemas.enums.health_score_category import HealthScoreCategory
 from app.services.providers.templates.base_247_data import Base247DataTemplate
@@ -56,6 +59,16 @@ class ProviderCoverage:
     health_scores: frozenset[HealthScoreCategory] = field(default_factory=frozenset)
 
 
+class WebhookSubscriptionOwner(StrEnum):
+    """Identify who owns and creates a provider webhook subscription."""
+
+    APPLICATION = "application"
+    """One application-level registration covers every user."""
+
+    USER = "user"
+    """Each connection owns subscriptions created with its bearer token."""
+
+
 @dataclass(frozen=True)
 class ProviderCapabilities:
     """Fine-grained capability flags for a provider's data delivery model.
@@ -82,17 +95,19 @@ class ProviderCapabilities:
         Provider sends a lightweight ping to our webhook.
         Actual data must be fetched via REST (``rest_pull`` must be
         ``True``). Oura, Strava, Fitbit, Polar.
-    webhook_registration_api:
-        Provider exposes an API to programmatically register and update
-        webhook subscriptions. When ``True``, switching to webhook live-sync
-        mode triggers the ``register_provider_webhooks`` Celery task.
-        Polar, Oura, Strava.
+    webhook_subscription_owner:
+        Who owns the provider's webhook subscriptions, or ``None`` when they
+        cannot be managed programmatically. Application-owned subscriptions
+        register once; user-owned subscriptions reconcile each active connection.
+        When set, switching live-sync mode triggers the
+        ``register_provider_webhooks`` Celery task.
+        ``APPLICATION``: Polar, Oura, Strava, Google. ``USER``: Withings.
     webhook_inbound_secret:
         Provider signs inbound webhook payloads with HMAC; the signing
         secret is returned by the registration API (not pre-configured in
         env vars) and is stored in ``provider_settings.webhook_secret``.
-        Must be used together with ``webhook_registration_api=True``.
-        Currently: Polar.
+        Requires ``webhook_subscription_owner`` to be set, since the secret comes
+        back from the registration call. Currently: Polar.
     max_historical_days:
         Hard upper limit on how far back the provider allows data to be
         fetched. ``None`` means no known limit. Garmin: 30 days.
@@ -104,7 +119,7 @@ class ProviderCapabilities:
     webhook_callback: bool = False
     webhook_stream: bool = False
     webhook_ping: bool = False
-    webhook_registration_api: bool = False
+    webhook_subscription_owner: WebhookSubscriptionOwner | None = None
     webhook_inbound_secret: bool = False
     max_historical_days: int | None = None
 
@@ -113,8 +128,11 @@ class ProviderCapabilities:
             raise ValueError("webhook_stream and webhook_ping are mutually exclusive")
         if self.webhook_ping and not self.rest_pull:
             raise ValueError("webhook_ping requires rest_pull=True (data must be fetched via REST after the ping)")
-        if self.webhook_inbound_secret and not self.webhook_registration_api:
-            raise ValueError("webhook_inbound_secret requires webhook_registration_api=True")
+        # The secret is handed back by the registration call, so it presupposes that
+        # subscriptions are registered programmatically at all — not that the application
+        # rather than the user owns them.
+        if self.webhook_inbound_secret and self.webhook_subscription_owner is None:
+            raise ValueError("webhook_inbound_secret requires webhook_subscription_owner to be set")
 
 
 class BaseProviderStrategy(ABC):
@@ -254,6 +272,16 @@ class BaseProviderStrategy(ABC):
         if caps.webhook_ping or caps.webhook_stream:
             return LiveSyncMode.WEBHOOK
         return None
+
+    def effective_live_sync_mode(self, db: DbSession) -> LiveSyncMode | None:
+        """The admin override from provider settings, else this provider's default.
+
+        ``None`` means this provider has no server-side live-sync mode.
+        """
+        return resolve_live_sync_mode(
+            ProviderSettingsRepository().get_live_sync_mode(db, self.name),
+            self.default_live_sync_mode,
+        )
 
     @property
     def icon_url(self) -> str:

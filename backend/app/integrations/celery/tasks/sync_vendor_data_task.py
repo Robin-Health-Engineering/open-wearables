@@ -10,7 +10,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.auth import LiveSyncMode
+from app.schemas.auth import LiveSyncMode, resolve_live_sync_mode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
 from app.services.providers.factory import ProviderFactory
@@ -127,14 +127,16 @@ def sync_vendor_data(
             # Only sync providers in pull mode. Push-only providers (Garmin, Apple SDK)
             # deliver data via webhooks/SDK and must not be polled here.
             # Historical backfill always uses REST regardless of live_sync_mode.
+            strategies = {c.provider: factory.get_provider(c.provider) for c in connections}
             connections = [
                 c
                 for c in connections
                 if _include_in_periodic_pull(
-                    factory.get_provider(c.provider).capabilities,
-                    provider_settings[c.provider].live_sync_mode
-                    if c.provider in provider_settings
-                    else LiveSyncMode.PULL,
+                    strategies[c.provider].capabilities,
+                    resolve_live_sync_mode(
+                        provider_settings[c.provider].live_sync_mode if c.provider in provider_settings else None,
+                        strategies[c.provider].default_live_sync_mode,
+                    ),
                     is_historical,
                 )
             ]
