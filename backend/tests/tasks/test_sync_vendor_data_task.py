@@ -399,3 +399,36 @@ class TestBuildSyncParams:
         params = build_sync_params("invalid-date", "2025-12-31T23:59:59Z")
 
         assert params == {"start_date": "invalid-date", "end_date": "2025-12-31T23:59:59Z"}
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.log_and_capture_error")
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_sync_vendor_data_component_failure_is_reported_via_log_and_capture_error(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        mock_capture: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        failure = Exception("Provider API unavailable")
+        mock_workouts = MagicMock()
+        mock_workouts.load_data.side_effect = failure
+
+        mock_strategy = _strategy_mock()
+        mock_strategy.workouts = mock_workouts
+        mock_get_provider.return_value = mock_strategy
+
+        result = sync_vendor_data(str(user.id))
+
+        assert result["providers_synced"]["garmin"]["params"]["workouts"]["success"] is False
+        mock_capture.assert_called_once()
+        assert mock_capture.call_args.args[0] is failure
+        db.refresh(connection)
+        assert connection.last_synced_at is not None
