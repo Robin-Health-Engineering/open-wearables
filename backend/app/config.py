@@ -216,6 +216,13 @@ class Settings(BaseSettings):
     # true - reconcile, false - list; for details check docs
     google_use_reconcile: bool = True
 
+    withings_client_id: str | None = None
+    withings_client_secret: SecretStr | None = None
+    withings_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
+    withings_webhook_token: SecretStr | None = None
+    # user.sleepevents gates unused bed events; sleep summaries and appli 44 use user.activity.
+    withings_default_scope: str = "user.info,user.metrics,user.activity"
+
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None
     email_from_address: str | None = None

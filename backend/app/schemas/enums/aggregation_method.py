@@ -105,6 +105,10 @@ AGGREGATION_METHOD_BY_TYPE: dict[SeriesType, AggregationMethod] = {
     SeriesType.garmin_skin_temperature: AggregationMethod.AVG,
     SeriesType.garmin_fitness_age: AggregationMethod.AVG,
     SeriesType.garmin_body_battery: AggregationMethod.AVG,
+    SeriesType.body_water_mass: AggregationMethod.AVG,
+    SeriesType.bone_mass: AggregationMethod.AVG,
+    SeriesType.withings_pulse_wave_velocity: AggregationMethod.AVG,
+    SeriesType.withings_metabolic_age: AggregationMethod.AVG,
     # ── Other ──
     SeriesType.electrodermal_activity: AggregationMethod.AVG,
     SeriesType.push_count: AggregationMethod.SUM,

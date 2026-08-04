@@ -61,6 +61,8 @@ class SeriesType(str, Enum):
     waist_circumference = "waist_circumference"
     body_fat_mass = "body_fat_mass"
     skeletal_muscle_mass = "skeletal_muscle_mass"
+    bone_mass = "bone_mass"
+    body_water_mass = "body_water_mass"
 
     # =========================================================================
     # BIOMETRICS - Fitness Metrics (IDs 60-79)
@@ -156,6 +158,12 @@ class SeriesType(str, Enum):
     garmin_body_battery = "garmin_body_battery"  # Garmin body battery (0-100)
 
     # =========================================================================
+    # WITHINGS-SPECIFIC METRICS (IDs 240-259)
+    # =========================================================================
+    withings_pulse_wave_velocity = "withings_pulse_wave_velocity"
+    withings_metabolic_age = "withings_metabolic_age"
+
+    # =========================================================================
     # OTHER (IDs 500-)
     # =========================================================================
 
@@ -215,6 +223,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (49, SeriesType.skeletal_muscle_mass, "kg"),
     (50, SeriesType.skin_temperature_deviation, "celsius"),
     (51, SeriesType.skin_temperature_trend_deviation, "celsius"),
+    (52, SeriesType.bone_mass, "kg"),
+    (53, SeriesType.body_water_mass, "kg"),
     # -------------------------------------------------------------------------
     # BIOMETRICS - Fitness Metrics (IDs 60-79)
     # -------------------------------------------------------------------------
@@ -297,6 +307,11 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (221, SeriesType.garmin_skin_temperature, "celsius"),  # kept for backwards compatibility
     (222, SeriesType.garmin_fitness_age, "years"),
     (223, SeriesType.garmin_body_battery, "percent"),
+    # -------------------------------------------------------------------------
+    # WITHINGS-SPECIFIC METRICS (IDs 240-259)
+    # -------------------------------------------------------------------------
+    (240, SeriesType.withings_pulse_wave_velocity, "m_per_s"),
+    (241, SeriesType.withings_metabolic_age, "years"),
     # -------------------------------------------------------------------------
     # OTHER (IDs 500-)
     # -------------------------------------------------------------------------

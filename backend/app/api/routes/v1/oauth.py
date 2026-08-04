@@ -1,12 +1,18 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from uuid import UUID
 
+from celery import current_app as celery_app
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
 from app.config import settings
 from app.database import DbSession
+from app.integrations.celery.tasks.register_provider_webhooks_task import (
+    SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
+)
+from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.credentials import AuthorizationURLResponse
 from app.schemas.model_crud.data_priority import (
@@ -16,10 +22,12 @@ from app.schemas.model_crud.data_priority import (
 )
 from app.services import DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
-from app.services.providers.base_strategy import BaseProviderStrategy
+from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
+from app.utils.sentry_helpers import log_and_capture_error
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 factory = ProviderFactory()
 settings_service = ProviderSettingsService()
 
@@ -117,6 +125,27 @@ def oauth_callback(
                 providers=[provider.value],
                 is_historical=True,
             )
+
+    # User-scoped webhook subscriptions exist only after OAuth has persisted
+    # the connection and its bearer token.
+    try:
+        if (
+            strategy.capabilities.webhook_subscription_owner == WebhookSubscriptionOwner.USER
+            and strategy.webhook_service is not None
+            and strategy.effective_live_sync_mode(db) == LiveSyncMode.WEBHOOK
+        ):
+            celery_app.send_task(
+                SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
+                args=[provider.value, str(oauth_state.user_id)],
+                queue="webhook_sync",
+            )
+    except Exception as e:
+        log_and_capture_error(
+            e,
+            logger,
+            "Provider user subscription scheduling failed",
+            extra={"provider": provider.value, "user_id": str(oauth_state.user_id)},
+        )
 
     # If a specific redirect_uri was requested (e.g. by frontend), redirect there
     if oauth_state.redirect_uri:
