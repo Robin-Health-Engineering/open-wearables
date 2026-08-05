@@ -13,6 +13,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.providers.withings import WithingsMeasure
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.withings.request_budget import acquire_request_slot
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ def withings_request(
         endpoint=service_path,
         method="POST",
         form_data=request_params,
+        acquire_slot=acquire_request_slot,
     )
 
     status = envelope.get("status") if isinstance(envelope, dict) else None

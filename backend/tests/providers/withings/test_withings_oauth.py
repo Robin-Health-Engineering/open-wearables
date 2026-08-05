@@ -73,8 +73,11 @@ def test_exchange_token_unwraps_envelope(mock_post: MagicMock, withings_oauth: W
     assert sent["code"] == "the_code"
 
 
+@patch("app.services.providers.withings.oauth.acquire_request_slot")
 @patch("httpx.post")
-def test_exchange_token_raises_on_nonzero_status(mock_post: MagicMock, withings_oauth: WithingsOAuth) -> None:
+def test_exchange_token_raises_on_nonzero_status(
+    mock_post: MagicMock, mock_acquire: MagicMock, withings_oauth: WithingsOAuth
+) -> None:
     # Invalid request input maps to HTTP 400.
     mock_post.return_value = MagicMock(
         status_code=200,
@@ -97,9 +100,10 @@ def test_exchange_token_raises_on_nonzero_status(mock_post: MagicMock, withings_
 
 
 @pytest.mark.parametrize("withings_status", [100, 101, 102, 200, 401])
+@patch("app.services.providers.withings.oauth.acquire_request_slot")
 @patch("httpx.post")
 def test_exchange_authentication_failure_is_unauthorized_without_invalidating_refresh_grant(
-    mock_post: MagicMock, withings_status: int, withings_oauth: WithingsOAuth
+    mock_post: MagicMock, mock_acquire: MagicMock, withings_status: int, withings_oauth: WithingsOAuth
 ) -> None:
     mock_post.return_value = MagicMock(
         status_code=200,
@@ -173,6 +177,54 @@ def test_refresh_status_343_is_non_terminal(
     assert not exc_info.value.invalid_grant
     assert connection.status == ConnectionStatus.ACTIVE
     mock_revoked.assert_not_called()
+
+
+@patch("app.services.providers.withings.oauth.acquire_request_slot")
+@patch("httpx.post")
+def test_exchange_token_bounds_its_budget_wait_by_the_authorization_code_lifetime(
+    mock_post: MagicMock, mock_acquire: MagicMock, withings_oauth: WithingsOAuth
+) -> None:
+    mock_post.return_value = MagicMock(
+        status_code=200,
+        raise_for_status=MagicMock(return_value=None),
+        json=MagicMock(
+            return_value={
+                "status": 0,
+                "body": {
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "expires_in": 10800,
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+    )
+    withings_oauth._exchange_token("the_code", None)
+    mock_acquire.assert_called_once_with(max_wait_seconds=5)
+
+
+@patch("app.services.providers.withings.oauth.acquire_request_slot")
+@patch("httpx.post")
+def test_refresh_access_token_uses_the_default_budget_wait(
+    mock_post: MagicMock, mock_acquire: MagicMock, withings_oauth: WithingsOAuth, db: Session
+) -> None:
+    mock_post.return_value = MagicMock(
+        status_code=200,
+        raise_for_status=MagicMock(return_value=None),
+        json=MagicMock(
+            return_value={
+                "status": 0,
+                "body": {
+                    "access_token": "at",
+                    "refresh_token": "rt2",
+                    "expires_in": 10800,
+                    "token_type": "Bearer",
+                },
+            }
+        ),
+    )
+    withings_oauth.refresh_access_token(db, uuid4(), "old-refresh-token")
+    mock_acquire.assert_called_once_with()
 
 
 def test_user_info_reads_userid_from_token_body(withings_oauth: WithingsOAuth) -> None:

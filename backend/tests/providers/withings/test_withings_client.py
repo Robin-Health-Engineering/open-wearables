@@ -32,6 +32,7 @@ def test_withings_request_unwraps_body(mock_req: MagicMock) -> None:
     assert kwargs["method"] == "POST"
     assert kwargs["form_data"]["action"] == "getmeas"
     assert kwargs["form_data"]["meastypes"] == "1"
+    assert kwargs["acquire_slot"] is _client.acquire_request_slot
 
 
 @patch("app.services.providers.withings._client.make_authenticated_request")

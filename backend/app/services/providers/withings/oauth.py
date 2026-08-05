@@ -18,8 +18,11 @@ from app.schemas.model_crud.credentials import (
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings.applis import SUBSCRIBED_APPLIS, withings_callback_url
+from app.services.providers.withings.request_budget import acquire_request_slot
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
+
+_NOTIFY_URL = "https://wbsapi.withings.net/notify"
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,9 @@ _TOKEN_CLIENT_ERROR_STATUSES = {247, 250, 283, 286, 293, 303, 304, 342}
 # is spent; on exchange they usually mean an expired authorization code.
 _AUTHENTICATION_FAILED_STATUSES = {100, 101, 102, 200, 401}
 _RATE_LIMIT_STATUS = 601
+
+# Preserve the short-lived authorization code by bounding request-budget wait time.
+_EXCHANGE_MAX_WAIT_SECONDS = 5
 
 
 class WithingsTokenError(HTTPException):
@@ -58,9 +64,6 @@ class WithingsTokenError(HTTPException):
             status_code=status_code,
             detail=detail or f"Withings token error (status={withings_status})",
         )
-
-
-_NOTIFY_URL = "https://wbsapi.withings.net/notify"
 
 
 class WithingsOAuth(BaseOAuthTemplate):
@@ -96,7 +99,7 @@ class WithingsOAuth(BaseOAuthTemplate):
             "code": code,
             "redirect_uri": self.credentials.redirect_uri,
         }
-        return self._request_token(payload, task="exchange_token")
+        return self._request_token(payload, task="exchange_token", max_wait_seconds=_EXCHANGE_MAX_WAIT_SECONDS)
 
     def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
         payload = {
@@ -133,8 +136,14 @@ class WithingsOAuth(BaseOAuthTemplate):
         )
         return token_response
 
-    def _request_token(self, payload: dict[str, str], *, task: str) -> OAuthTokenResponse:
+    def _request_token(
+        self, payload: dict[str, str], *, task: str, max_wait_seconds: float | None = None
+    ) -> OAuthTokenResponse:
         """POST a token request and unwrap the Withings ``{status, body}`` envelope."""
+        if max_wait_seconds is not None:
+            acquire_request_slot(max_wait_seconds=max_wait_seconds)
+        else:
+            acquire_request_slot()
         try:
             response = httpx.post(
                 self.endpoints.token_url,

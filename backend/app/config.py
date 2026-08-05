@@ -220,6 +220,7 @@ class Settings(BaseSettings):
     withings_client_secret: SecretStr | None = None
     withings_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     withings_webhook_token: SecretStr | None = None
+    withings_api_requests_per_minute: int = Field(120, ge=1)
     # user.sleepevents gates unused bed events; sleep summaries and appli 44 use user.activity.
     withings_default_scope: str = "user.info,user.metrics,user.activity"
 
