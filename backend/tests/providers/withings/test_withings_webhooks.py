@@ -214,8 +214,63 @@ def test_dispatch_passes_a_fresh_trace_id_not_the_user_id(mock_celery: MagicMock
 
 def _process(h: WithingsWebhookHandler, appli: str) -> dict:
     h.connection_repo.get_by_provider_user_id.return_value = MagicMock(user_id=uuid4())
-    payload = {"userid": "123", "appli": appli, "startdate": "1728000000", "enddate": "1728001000"}
+    # A distinct account per call: fetches are deduplicated per account and window,
+    # so a shared id would have each test suppressing the next one's fetch.
+    payload = {"userid": uuid4().hex, "appli": appli, "startdate": "1728000000", "enddate": "1728001000"}
     return h.process_payload(MagicMock(), payload, "trace-1")
+
+
+def _burst(appli: str, userid: str) -> dict:
+    return {"userid": userid, "appli": appli, "startdate": "1728000000", "enddate": "1728001000"}
+
+
+def test_process_payload_fetches_once_for_a_burst_of_duplicate_notifications() -> None:
+    h = _handler()
+    h.data_247.save_measures.return_value = 1
+    userid = uuid4().hex
+    db = MagicMock()
+
+    first = h.process_payload(db, _burst("1", userid), "trace-1")
+    second = h.process_payload(db, _burst("1", userid), "trace-2")
+    third = h.process_payload(db, _burst("4", userid), "trace-3")
+
+    assert first["status"] == "processed"
+    assert [r["status"] for r in (second, third)] == ["ignored", "ignored"]
+    assert {r["reason"] for r in (second, third)} == {"duplicate_notification"}
+    h.data_247.save_measures.assert_called_once()
+
+
+def test_process_payload_lets_a_duplicate_retry_a_failed_fetch() -> None:
+    h = _handler()
+    h.data_247.save_measures.side_effect = [RuntimeError("getmeas failed"), 1]
+    userid = uuid4().hex
+    db = MagicMock()
+
+    with pytest.raises(RuntimeError):
+        h.process_payload(db, _burst("1", userid), "trace-1")
+    retried = h.process_payload(db, _burst("4", userid), "trace-2")
+
+    assert retried["status"] == "processed"
+    assert h.data_247.save_measures.call_count == 2
+
+
+def test_process_payload_refetches_a_notification_redelivered_after_a_lost_worker() -> None:
+    h = _handler()
+    h.data_247.save_measures.return_value = 1
+    userid = uuid4().hex
+    db = MagicMock()
+
+    # SystemExit escapes the ``except Exception`` release, exactly as a SIGKILL would.
+    with (
+        patch.object(h.data_247, "save_measures", side_effect=SystemExit("worker killed")),
+        pytest.raises(SystemExit),
+    ):
+        h.process_payload(db, _burst("1", userid), "trace-1")
+
+    redelivered = h.process_payload(db, _burst("1", userid), "trace-1")
+
+    assert redelivered["status"] == "processed"
+    h.data_247.save_measures.assert_called_once()
 
 
 def test_process_payload_appli_1_goes_to_measures() -> None:

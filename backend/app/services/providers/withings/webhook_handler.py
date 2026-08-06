@@ -21,6 +21,7 @@ from app.schemas.providers.withings import WithingsNotification
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.providers.withings.applis import APPLI_DOMAIN, PROFILE_CHANGE_APPLI, Domain
 from app.services.providers.withings.data_247 import Withings247Data
+from app.services.providers.withings.webhook_dedup import claim_fetch
 from app.services.providers.withings.workouts import WithingsWorkouts
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.structured_logging import log_structured
@@ -163,22 +164,40 @@ class WithingsWebhookHandler(BaseWebhookHandler):
 
         user_id = connection.user_id
         domain, start, end = screened.domain, screened.start, screened.end
-        if domain == "measures":
-            # appli 1/2/4/58 all fetch via getmeas (requested meastypes in coverage.py).
-            saved = self.data_247.save_measures(db, user_id, start, end)
-        elif domain == "sleep":
-            saved = self.data_247.save_sleep(db, user_id, start, end)
-        elif domain == "activity_workouts":
-            # appli 16 covers both daily activity and workouts.
-            saved = self.data_247.save_activity(db, user_id, start, end)
-            saved += self.workouts.load_data(
-                db,
-                user_id,
-                start_date=start.isoformat(),
-                end_date=end.isoformat(),
-            )
-        else:
-            assert_never(domain)
+        # Withings notifies once per category, so one event arrives several times
+        # over the same window; only the first of them has anything to fetch. The
+        # trace id is minted per notification and travels in the task payload, so
+        # it tells a sibling apart from a redelivery of this very notification.
+        with claim_fetch(
+            withings_user_id=screened.notification.userid,
+            domain=domain,
+            start=start,
+            end=end,
+            notification_id=trace_id,
+        ) as claimed:
+            if not claimed:
+                return {
+                    "status": "ignored",
+                    "reason": "duplicate_notification",
+                    "appli": screened.notification.appli,
+                    "domain": domain,
+                }
+            if domain == "measures":
+                # appli 1/2/4/58 all fetch via getmeas (requested meastypes in coverage.py).
+                saved = self.data_247.save_measures(db, user_id, start, end)
+            elif domain == "sleep":
+                saved = self.data_247.save_sleep(db, user_id, start, end)
+            elif domain == "activity_workouts":
+                # appli 16 covers both daily activity and workouts.
+                saved = self.data_247.save_activity(db, user_id, start, end)
+                saved += self.workouts.load_data(
+                    db,
+                    user_id,
+                    start_date=start.isoformat(),
+                    end_date=end.isoformat(),
+                )
+            else:
+                assert_never(domain)
 
         log_structured(
             logger,
