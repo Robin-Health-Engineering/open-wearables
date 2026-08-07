@@ -10,15 +10,18 @@ Tests cover:
 """
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import UserCreate, UserUpdate
+from app.services.providers.base_strategy import WebhookSubscriptionOwner
 from app.services.user_service import user_service
-from tests.factories import UserFactory
+from tests.factories import UserConnectionFactory, UserFactory
 
 
 class TestUserServiceCreate:
@@ -223,6 +226,80 @@ class TestUserServiceDelete:
 
         # Act & Assert - should not raise error
         user_service.delete(db, fake_id, raise_404=False)
+
+    @patch("app.services.user_service.ProviderFactory")
+    def test_delete_removes_webhook_subscriptions_for_per_user_providers(
+        self, mock_factory_cls: MagicMock, db: Session
+    ) -> None:
+        user = UserFactory(email="withings-user@example.com")
+        UserConnectionFactory(
+            user=user,
+            provider="withings",
+            status=ConnectionStatus.ACTIVE,
+            access_token="live-token",
+        )
+
+        strategy = MagicMock()
+        strategy.capabilities.webhook_subscription_owner = WebhookSubscriptionOwner.USER
+        mock_factory_cls.return_value.get_provider.return_value = strategy
+
+        user_service.delete(db, user.id)
+
+        strategy.webhook_service.remove_user.assert_called_once_with(db, user.id)
+
+    @patch("app.services.user_service.ProviderFactory")
+    def test_delete_skips_webhook_removal_for_non_per_user_providers(
+        self, mock_factory_cls: MagicMock, db: Session
+    ) -> None:
+        user = UserFactory(email="garmin-user@example.com")
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            status=ConnectionStatus.ACTIVE,
+            access_token="live-token",
+        )
+
+        strategy = MagicMock()
+        strategy.capabilities.webhook_subscription_owner = None
+        mock_factory_cls.return_value.get_provider.return_value = strategy
+
+        user_service.delete(db, user.id)
+
+        strategy.webhook_service.remove_user.assert_not_called()
+
+    @patch("app.services.user_service.ProviderFactory")
+    def test_delete_preserves_provider_account_while_another_user_is_linked(
+        self, mock_factory_cls: MagicMock, db: Session
+    ) -> None:
+        provider_user_id = "shared-withings-user"
+        user = UserFactory(email="deleted-withings-user@example.com")
+        linked_user = UserFactory(email="remaining-withings-user@example.com")
+        UserConnectionFactory(
+            user=user,
+            provider="withings",
+            provider_user_id=provider_user_id,
+            status=ConnectionStatus.ACTIVE,
+            access_token="deleted-token",
+        )
+        linked_connection = UserConnectionFactory(
+            user=linked_user,
+            provider="withings",
+            provider_user_id=provider_user_id,
+            status=ConnectionStatus.ACTIVE,
+            access_token="remaining-token",
+        )
+
+        strategy = MagicMock()
+        strategy.capabilities.webhook_subscription_owner = WebhookSubscriptionOwner.USER
+        mock_factory_cls.return_value.get_provider.return_value = strategy
+
+        user_service.delete(db, user.id)
+
+        db.refresh(linked_connection)
+        assert linked_connection.status == ConnectionStatus.ACTIVE
+        # The deleted user's own grant is revoked; the shared subscription is left for the sibling.
+        strategy.oauth.deregister_user.assert_called_once()
+        strategy.webhook_service.remove_user.assert_not_called()
 
 
 class TestUserServiceGetCountInRange:

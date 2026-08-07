@@ -20,6 +20,7 @@ from celery import current_app as celery_app
 
 from app.database import SessionLocal
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
+from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
@@ -51,12 +52,35 @@ class WebhookReconciliationResult:
         return asdict(self)
 
 
-def _fan_out_user_subscriptions(strategy: BaseProviderStrategy, provider: str) -> WebhookReconciliationResult:
+def _fan_out_user_subscriptions(
+    strategy: BaseProviderStrategy,
+    provider: str,
+    *,
+    webhook_mode_only: bool,
+) -> WebhookReconciliationResult:
     if strategy.webhook_service is None:
         raise NotImplementedError(f"Provider '{provider}' has no webhook subscription service")
 
     with SessionLocal() as db:
-        user_ids = [str(c.user_id) for c in strategy.connection_repo.get_all_active_by_provider(db, provider)]
+        if webhook_mode_only and strategy.effective_live_sync_mode(db) != LiveSyncMode.WEBHOOK:
+            return WebhookReconciliationResult(
+                provider=provider,
+                owner=WebhookSubscriptionOwner.USER,
+                reason="pull_mode",
+            )
+        connections = strategy.connection_repo.get_all_active_by_provider(db, provider)
+
+    # The oldest active link owns each provider account's subscriptions, matching
+    # inbound webhook attribution. A revoked grant yields ownership on the next sweep.
+    subscription_owners: dict[tuple[str, str], str] = {}
+    for connection in sorted(connections, key=lambda item: (item.created_at, str(item.id))):
+        owner_key = (
+            ("provider_user_id", connection.provider_user_id)
+            if connection.provider_user_id is not None
+            else ("connection_id", str(connection.id))
+        )
+        subscription_owners.setdefault(owner_key, str(connection.user_id))
+    user_ids = list(subscription_owners.values())
 
     for user_id in user_ids:
         celery_app.send_task(SYNC_PROVIDER_USER_SUBSCRIPTION_TASK, args=[provider, user_id], queue="webhook_sync")
@@ -126,7 +150,13 @@ def _sync_application_subscriptions(
     max_retries=3,
     default_retry_delay=60,
 )
-def register_provider_webhooks(self: Task, provider: str, callback_url: str | None = None) -> dict:
+def register_provider_webhooks(
+    self: Task,
+    provider: str,
+    callback_url: str | None = None,
+    *,
+    webhook_mode_only: bool = False,
+) -> dict:
     """Register webhook subscriptions for a provider via its registration API.
 
     Only dispatched for providers that declare a ``webhook_subscription_owner``.
@@ -138,7 +168,7 @@ def register_provider_webhooks(self: Task, provider: str, callback_url: str | No
         strategy = ProviderFactory().get_provider(provider)
         capabilities = strategy.capabilities
         if capabilities.webhook_subscription_owner == WebhookSubscriptionOwner.USER:
-            return _fan_out_user_subscriptions(strategy, provider).to_dict()
+            return _fan_out_user_subscriptions(strategy, provider, webhook_mode_only=webhook_mode_only).to_dict()
         if capabilities.webhook_subscription_owner == WebhookSubscriptionOwner.APPLICATION:
             return _sync_application_subscriptions(strategy, provider, callback_url).to_dict()
         # Dispatched for a provider that declares no subscription owner: a wiring

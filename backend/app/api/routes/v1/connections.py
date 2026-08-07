@@ -10,11 +10,20 @@ from app.schemas.auth import ConnectionStatus, resolve_live_sync_mode
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionWithCapabilities
 from app.services import ApiKeyDep, user_connection_service
+from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.templates.base_webhook_service import BaseWebhookService
 
 router = APIRouter()
 factory = ProviderFactory()
 provider_settings_repo = ProviderSettingsRepository()
+
+
+def _per_user_webhook_service(strategy: BaseProviderStrategy) -> BaseWebhookService | None:
+    """Return subscriptions that can be torn down for one connection."""
+    if strategy.capabilities.webhook_subscription_owner != WebhookSubscriptionOwner.USER:
+        return None
+    return strategy.webhook_service
 
 
 def _with_capabilities(
@@ -76,7 +85,10 @@ def disconnect_provider_endpoint(
 ) -> Response:
     """Disconnect a user from a provider, revoking the connection and clearing tokens."""
     strategy = ProviderFactory().get_provider(provider.value)
-    user_connection_service.disconnect(db, user_id, provider.value, oauth=strategy.oauth)
+    webhook_service = _per_user_webhook_service(strategy)
+    user_connection_service.disconnect(
+        db, user_id, provider.value, oauth=strategy.oauth, webhook_service=webhook_service
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -89,5 +101,8 @@ def delete_provider_data_endpoint(
 ) -> Response:
     """Delete all of a user's data for a provider and revoke the connection."""
     strategy = ProviderFactory().get_provider(provider.value)
-    user_connection_service.purge_provider_data(db, user_id, provider.value, oauth=strategy.oauth)
+    webhook_service = _per_user_webhook_service(strategy)
+    user_connection_service.purge_provider_data(
+        db, user_id, provider.value, oauth=strategy.oauth, webhook_service=webhook_service
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

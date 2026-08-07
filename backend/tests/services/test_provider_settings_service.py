@@ -359,9 +359,12 @@ class TestProviderSettingsServiceLiveSyncMode:
         with pytest.raises(ValidationError, match="live_sync_mode cannot be set to null"):
             ProviderSettingUpdate(live_sync_mode=None)
 
-    @pytest.mark.parametrize("mode", [LiveSyncMode.WEBHOOK, LiveSyncMode.PULL])
+    @pytest.mark.parametrize(
+        ("mode", "webhook_mode_only"),
+        [(LiveSyncMode.WEBHOOK, True), (LiveSyncMode.PULL, False)],
+    )
     def test_update_per_user_subscription_mode_queues_generic_fanout_task(
-        self, db: Session, mode: LiveSyncMode
+        self, db: Session, mode: LiveSyncMode, *, webhook_mode_only: bool
     ) -> None:
         service = ProviderSettingsService()
 
@@ -374,5 +377,16 @@ class TestProviderSettingsServiceLiveSyncMode:
         mock_celery.send_task.assert_called_once_with(
             "app.integrations.celery.tasks.register_provider_webhooks_task.register_provider_webhooks",
             args=["withings"],
+            kwargs={"webhook_mode_only": webhook_mode_only},
             queue="webhook_sync",
         )
+
+    def test_update_unrelated_per_user_subscription_setting_does_not_queue_fanout_task(self, db: Session) -> None:
+        service = ProviderSettingsService()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_celery = MagicMock()
+            mp.setattr("app.services.provider_settings_service.celery_app", mock_celery)
+            service.update_provider_setting(db, "withings", ProviderSettingUpdate(is_enabled=False))
+
+        mock_celery.send_task.assert_not_called()

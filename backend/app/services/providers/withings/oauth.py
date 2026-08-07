@@ -17,12 +17,8 @@ from app.schemas.model_crud.credentials import (
     ProviderEndpoints,
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
-from app.services.providers.withings.applis import SUBSCRIBED_APPLIS, withings_callback_url
 from app.services.providers.withings.request_budget import acquire_request_slot
-from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
-
-_NOTIFY_URL = "https://wbsapi.withings.net/notify"
 
 logger = logging.getLogger(__name__)
 
@@ -201,53 +197,4 @@ class WithingsOAuth(BaseOAuthTemplate):
         return {"user_id": str(userid) if userid is not None else None, "username": None}
 
     def deregister_user(self, access_token: str, provider_user_id: str | None = None) -> None:
-        """Revoke the user's Withings notify subscriptions (best-effort).
-
-        Mirrors Garmin/Strava token-only deregistration. Called by the disconnect
-        flow *before* the stored token is cleared, so the bearer token is live.
-        Per-appli failures are logged, never raised — disconnect must not block.
-        """
-        try:
-            callback = withings_callback_url()
-        except ValueError as e:
-            log_and_capture_error(
-                e,
-                logger,
-                "Withings notify revoke skipped: callback URL is not configured",
-                level="warning",
-                extra={"provider": self.provider_name, "action": "deregister_user"},
-            )
-            return
-
-        for appli in SUBSCRIBED_APPLIS:
-            try:
-                response = httpx.post(
-                    _NOTIFY_URL,
-                    data={"action": "revoke", "appli": appli, "callbackurl": callback},
-                    headers={
-                        "Authorization": f"Bearer {access_token}",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                    timeout=30.0,
-                )
-                response.raise_for_status()
-                envelope = response.json()
-                status = envelope.get("status") if isinstance(envelope, dict) else None
-                if status != 0:
-                    log_structured(
-                        logger,
-                        "warning",
-                        "Withings notify revoke returned non-zero status",
-                        provider=self.provider_name,
-                        action="deregister_user",
-                        appli=appli,
-                        withings_status=status,
-                    )
-            except Exception as e:
-                log_and_capture_error(
-                    e,
-                    logger,
-                    "Withings notify revoke failed",
-                    level="warning",
-                    extra={"provider": self.provider_name, "action": "deregister_user", "appli": appli},
-                )
+        """Leave Notify teardown to the webhook subscription lifecycle."""

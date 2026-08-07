@@ -11,12 +11,16 @@ Tests the /api/v1/users/{user_id}/connections endpoint including:
 
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.api.routes.v1.connections import delete_provider_data_endpoint
 from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, User, UserConnection, WorkoutDetails
 from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import ProviderName
+from app.services.providers.base_strategy import WebhookSubscriptionOwner
 from tests.factories import (
     ApiKeyFactory,
     DataPointSeriesFactory,
@@ -476,6 +480,36 @@ class TestDisconnectEndpoint:
 
 class TestDeleteProviderDataEndpoint:
     """Test suite for DELETE /api/v1/users/{user_id}/connections/{provider}/data."""
+
+    def test_delete_data_forwards_capability_gated_webhook_service(self) -> None:
+        db = MagicMock(spec=Session)
+        user_id = uuid4()
+
+        for provider, has_per_user_subscriptions in (
+            (ProviderName.WITHINGS, True),
+            (ProviderName.APPLE, False),
+        ):
+            strategy = MagicMock()
+            strategy.capabilities.webhook_subscription_owner = (
+                WebhookSubscriptionOwner.USER if has_per_user_subscriptions else None
+            )
+
+            with (
+                patch("app.api.routes.v1.connections.ProviderFactory") as provider_factory,
+                patch("app.api.routes.v1.connections.user_connection_service.purge_provider_data") as purge,
+            ):
+                provider_factory.return_value.get_provider.return_value = strategy
+
+                response = delete_provider_data_endpoint(user_id, provider, db, MagicMock())
+
+            assert response.status_code == 204
+            purge.assert_called_once_with(
+                db,
+                user_id,
+                provider.value,
+                oauth=strategy.oauth,
+                webhook_service=strategy.webhook_service if has_per_user_subscriptions else None,
+            )
 
     def _seed_provider_data(self, user: User, provider: str) -> DataSource:
         """Create a data_source with a workout (+details), a time series and a health score."""

@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -47,7 +49,13 @@ def test_fanout_dispatches_one_reconciliation_per_active_user() -> None:
     )
     strategy.webhook_service = MagicMock()
     strategy.connection_repo.get_all_active_by_provider.return_value = [
-        MagicMock(user_id=user_id) for user_id in user_ids
+        SimpleNamespace(
+            id=uuid4(),
+            user_id=user_id,
+            provider_user_id=f"external-{user_id}",
+            created_at=datetime.now(timezone.utc),
+        )
+        for user_id in user_ids
     ]
 
     with (
@@ -65,6 +73,77 @@ def test_fanout_dispatches_one_reconciliation_per_active_user() -> None:
     dispatched_user_ids = {call.kwargs["args"][1] for call in celery.send_task.call_args_list}
     assert dispatched_user_ids == {str(user_id) for user_id in user_ids}
     assert all(call.args[0] == _SYNC_USER for call in celery.send_task.call_args_list)
+
+
+def test_fanout_dispatches_once_for_linked_users_sharing_a_provider_account() -> None:
+    first_user_id = uuid4()
+    second_user_id = uuid4()
+    created_at = datetime.now(timezone.utc)
+    strategy = MagicMock()
+    strategy.capabilities = ProviderCapabilities(
+        rest_pull=True,
+        webhook_ping=True,
+        webhook_subscription_owner=WebhookSubscriptionOwner.USER,
+    )
+    strategy.webhook_service = MagicMock()
+    strategy.connection_repo.get_all_active_by_provider.return_value = [
+        SimpleNamespace(
+            id=uuid4(),
+            user_id=second_user_id,
+            provider_user_id="shared-account",
+            created_at=created_at,
+        ),
+        SimpleNamespace(
+            id=uuid4(),
+            user_id=first_user_id,
+            provider_user_id="shared-account",
+            created_at=created_at - timedelta(microseconds=1),
+        ),
+    ]
+
+    with (
+        patch("app.integrations.celery.tasks.register_provider_webhooks_task.ProviderFactory") as factory,
+        patch("app.integrations.celery.tasks.register_provider_webhooks_task.SessionLocal") as session_local,
+        patch("app.integrations.celery.tasks.register_provider_webhooks_task.celery_app") as celery,
+    ):
+        factory.return_value.get_provider.return_value = strategy
+        session_local.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        session_local.return_value.__exit__ = MagicMock(return_value=False)
+        result = register_provider_webhooks.apply(args=["withings"]).get()
+
+    assert result == _expected(provider="withings", owner=WebhookSubscriptionOwner.USER, dispatched=1)
+    celery.send_task.assert_called_once_with(
+        _SYNC_USER,
+        args=["withings", str(first_user_id)],
+        queue="webhook_sync",
+    )
+
+
+def test_periodic_fanout_skips_pull_mode() -> None:
+    strategy = MagicMock()
+    strategy.capabilities = ProviderCapabilities(
+        rest_pull=True,
+        webhook_ping=True,
+        webhook_subscription_owner=WebhookSubscriptionOwner.USER,
+    )
+    strategy.webhook_service = MagicMock()
+    strategy.effective_live_sync_mode.return_value = LiveSyncMode.PULL
+
+    with (
+        patch("app.integrations.celery.tasks.register_provider_webhooks_task.ProviderFactory") as factory,
+        patch("app.integrations.celery.tasks.register_provider_webhooks_task.SessionLocal") as session_local,
+        patch("app.integrations.celery.tasks.register_provider_webhooks_task.celery_app") as celery,
+    ):
+        factory.return_value.get_provider.return_value = strategy
+        session_local.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        session_local.return_value.__exit__ = MagicMock(return_value=False)
+        result = register_provider_webhooks.apply(
+            args=["withings"],
+            kwargs={"webhook_mode_only": True},
+        ).get()
+
+    assert result == _expected(provider="withings", owner=WebhookSubscriptionOwner.USER, reason="pull_mode")
+    celery.send_task.assert_not_called()
 
 
 def test_provider_without_a_subscription_owner_fails_loudly() -> None:

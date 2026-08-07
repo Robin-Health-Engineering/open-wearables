@@ -281,3 +281,11 @@ def test_user_info_returns_none_when_userid_absent(withings_oauth: WithingsOAuth
     )
     info = withings_oauth._get_provider_user_info(token, "internal")
     assert info["user_id"] is None
+
+
+@patch("httpx.post")
+def test_deregister_user_does_not_duplicate_notify_teardown(
+    mock_post: MagicMock, withings_oauth: WithingsOAuth
+) -> None:
+    withings_oauth.deregister_user("the_token", provider_user_id="withings-user")
+    mock_post.assert_not_called()

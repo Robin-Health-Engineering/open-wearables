@@ -78,6 +78,7 @@ class ProviderSettingsService:
             celery_app.send_task(
                 REGISTER_PROVIDER_WEBHOOKS_TASK,
                 args=[provider],
+                kwargs={"webhook_mode_only": update.live_sync_mode == LiveSyncMode.WEBHOOK},
                 queue="webhook_sync",
             )
         elif (
