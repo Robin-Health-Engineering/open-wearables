@@ -17,10 +17,9 @@ from app.services.providers.withings.callback import (
 )
 
 
-def test_subscribed_applis_are_derived_from_routing() -> None:
-    # Subscription set == routing keys, so they can never drift.
-    assert sorted(APPLI_DOMAIN) == SUBSCRIBED_APPLIS
-    assert SUBSCRIBED_APPLIS == [1, 2, 4, 16, 44, 58]
+def test_subscribed_applis_are_derived_from_routing_plus_profile_change() -> None:
+    assert sorted({*APPLI_DOMAIN, PROFILE_CHANGE_APPLI}) == SUBSCRIBED_APPLIS
+    assert SUBSCRIBED_APPLIS == [1, 2, 4, 16, 44, 46, 58]
 
 
 def test_appli_domains() -> None:

@@ -17,8 +17,12 @@ APPLI_DOMAIN: dict[int, Domain] = {
     58: "measures",  # Glucose
 }
 
-# Profile change (delete / unlink / update) — handled inline, never subscribed.
+# Profile change (delete / unlink / update) — subscribed like any other appli,
+# but handled inline by `_screen()` before domain routing, never fetched as data.
 PROFILE_CHANGE_APPLI = 46
 
-# Per-user subscription set: routing keys == subscriptions, by construction.
-SUBSCRIBED_APPLIS: list[int] = sorted(APPLI_DOMAIN)
+# Of appli 46's three `action` values, only these mean we lost access upstream
+# and should revoke local connections; `update` is a metadata-only change.
+PROFILE_CHANGE_REVOKING_ACTIONS = frozenset({"delete", "unlink"})
+
+SUBSCRIBED_APPLIS: list[int] = sorted({*APPLI_DOMAIN, PROFILE_CHANGE_APPLI})

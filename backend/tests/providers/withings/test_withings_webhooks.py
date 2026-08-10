@@ -1,5 +1,6 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -21,9 +22,14 @@ def _handler(live_sync_mode: LiveSyncMode | None = LiveSyncMode.WEBHOOK) -> With
     h = WithingsWebhookHandler(data_247=MagicMock(), workouts=MagicMock())
     h.connection_repo = MagicMock()
     h.connection_repo.get_by_provider_user_id.return_value = MagicMock(user_id=uuid4())
+    h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=uuid4())]
     h.provider_settings_repo = MagicMock()
     h.provider_settings_repo.get_live_sync_mode.return_value = live_sync_mode
     return h
+
+
+def test_supported_event_types_include_profile_changes() -> None:
+    assert _handler().supported_event_types() == ["1", "2", "4", "16", "44", "46", "58"]
 
 
 def test_parse_payload_reads_form_fields() -> None:
@@ -33,6 +39,15 @@ def test_parse_payload_reads_form_fields() -> None:
     assert payload["userid"] == "123"
     assert payload["appli"] == "1"
     assert payload["startdate"] == "1728000000"
+
+
+def test_extract_user_id_reads_the_userid_form_field() -> None:
+    h = _handler()
+    payload = h.parse_payload(b"userid=123&appli=1&startdate=1728000000&enddate=1728001000")
+
+    assert WithingsWebhookHandler.user_id_field == "userid"
+    assert h.extract_user_id(payload) == "123"
+    assert h.extract_user_id({"appli": "1"}) is None
 
 
 def test_verify_signature_accepts_wellformed_notification() -> None:
@@ -101,12 +116,33 @@ def test_dispatch_ignores_invalid_payload_fields(mock_celery: MagicMock) -> None
 
 
 @patch("app.services.providers.withings.webhook_handler.celery_app")
-def test_dispatch_ignores_profile_change(mock_celery: MagicMock) -> None:
+def test_dispatch_ignores_profile_change_update(mock_celery: MagicMock) -> None:
     h = _handler()
-    result = h.dispatch(MagicMock(), {"userid": "123", "appli": "46", "action": "unlink"})
+    result = h.dispatch(MagicMock(), {"userid": "123", "appli": "46", "action": "update"})
     assert result["status"] == "ignored"
     assert result["reason"] == "profile_change"
-    assert result["action"] == "unlink"
+    assert result["action"] == "update"
+    mock_celery.send_task.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["delete", "unlink"])
+@patch("app.services.providers.withings.webhook_handler.celery_app")
+def test_dispatch_enqueues_profile_change_delete_or_unlink(mock_celery: MagicMock, action: str) -> None:
+    h = _handler()
+    result = h.dispatch(MagicMock(), {"userid": "123", "appli": "46", "action": action})
+    assert result["status"] == "accepted"
+    assert result["appli"] == 46
+    mock_celery.send_task.assert_called_once()
+
+
+@patch("app.services.providers.withings.webhook_handler.celery_app")
+def test_dispatch_ignores_profile_change_unknown_user(mock_celery: MagicMock) -> None:
+    h = _handler()
+    h.connection_repo.get_all_by_provider_user_id.return_value = []
+    result = h.dispatch(MagicMock(), {"userid": "999", "appli": "46", "action": "unlink"})
+    assert result["status"] == "ignored"
+    assert result["reason"] == "user_not_found"
+    assert result["withings_user_id"] == "999"
     mock_celery.send_task.assert_not_called()
 
 
@@ -313,7 +349,7 @@ def test_process_payload_appli_16_fetches_activity_and_workouts() -> None:
 
 def test_process_payload_unknown_user_is_reported() -> None:
     h = _handler()
-    h.connection_repo.get_by_provider_user_id.return_value = None
+    h.connection_repo.get_all_by_provider_user_id.return_value = []
     payload = {"userid": "999", "appli": "1", "startdate": "1", "enddate": "2"}
     result = h.process_payload(MagicMock(), payload, "trace-1")
     assert result["status"] == "user_not_found"
@@ -357,3 +393,55 @@ def test_process_payload_new_categories_go_to_measures() -> None:
         result = _process(h, appli)
         assert result["domain"] == "measures"
         h.data_247.save_measures.assert_called_once()
+
+
+@pytest.mark.parametrize("action", ["delete", "unlink"])
+@patch("app.services.providers.withings.webhook_handler.on_connection_revoked")
+def test_process_payload_revokes_connections_on_delete_or_unlink(mock_revoked: MagicMock, action: str) -> None:
+    h = _handler()
+    user_id = uuid4()
+    connection = MagicMock(user_id=user_id, updated_at=datetime.now(timezone.utc))
+    h.connection_repo.get_all_by_provider_user_id.return_value = [connection]
+    h.connection_repo.disconnect.return_value = 1
+    payload = {"userid": "123", "appli": "46", "action": action}
+    result = h.process_payload(MagicMock(), payload, "trace-1")
+    assert result["status"] == "revoked"
+    assert result["action"] == action
+    assert result["withings_user_id"] == "123"
+    assert result["user_ids"] == [str(user_id)]
+    h.connection_repo.disconnect.assert_called_once_with(ANY, user_id, "withings")
+    mock_revoked.assert_called_once()
+    assert mock_revoked.call_args.kwargs["reason"] == f"provider_{action}"
+
+
+def test_process_payload_revokes_every_connection_for_multi_account_fanout() -> None:
+    h = _handler()
+    user_ids = [uuid4(), uuid4()]
+    h.connection_repo.get_all_by_provider_user_id.return_value = [
+        MagicMock(user_id=uid, updated_at=datetime.now(timezone.utc)) for uid in user_ids
+    ]
+    h.connection_repo.disconnect.return_value = 1
+    payload = {"userid": "123", "appli": "46", "action": "unlink"}
+    result = h.process_payload(MagicMock(), payload, "trace-1")
+    assert result["status"] == "revoked"
+    assert set(result["user_ids"]) == {str(uid) for uid in user_ids}
+    assert h.connection_repo.disconnect.call_count == 2
+
+
+def test_process_payload_profile_change_unknown_user_is_reported() -> None:
+    h = _handler()
+    h.connection_repo.get_all_by_provider_user_id.return_value = []
+    payload = {"userid": "999", "appli": "46", "action": "delete"}
+    result = h.process_payload(MagicMock(), payload, "trace-1")
+    assert result["status"] == "user_not_found"
+    assert result["withings_user_id"] == "999"
+    h.connection_repo.disconnect.assert_not_called()
+
+
+def test_process_payload_ignores_profile_change_update() -> None:
+    h = _handler()
+    payload = {"userid": "123", "appli": "46", "action": "update"}
+    result = h.process_payload(MagicMock(), payload, "trace-1")
+    assert result["status"] == "ignored"
+    assert result["reason"] == "profile_change"
+    h.connection_repo.disconnect.assert_not_called()
