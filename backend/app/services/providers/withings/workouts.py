@@ -16,6 +16,7 @@ from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.providers.withings._client import paginate
 from app.services.providers.withings.data_requests import WORKOUTS
+from app.services.providers.withings.results import IngestionResult
 from app.services.providers.withings.timezone import zone_offset_at
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
@@ -148,7 +149,9 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
         connection = self.connection_repo.get_active_connection(db, user_id, self.provider_name)
         user_connection_id = connection.id if connection is not None and isinstance(connection.id, UUID) else None
         raw_workouts = self.get_workouts_from_api(db, user_id, **kwargs)
-        count = 0
+        processed = 0
+        skipped = 0
+        failed = 0
         warned_unknown_categories: set[int] = set()
         for raw in raw_workouts:
             # Tolerate a malformed record without dropping the rest of the batch.
@@ -164,8 +167,10 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
                     user_id=str(user_id),
                     error=str(e),
                 )
+                skipped += 1
                 continue
             if workout.category == 128:
+                skipped += 1
                 continue
             if (
                 workout.category not in OFFICIAL_WITHINGS_CATEGORY_IDS
@@ -194,13 +199,14 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
                     workout_id=workout.id,
                     error=str(e),
                 )
+                skipped += 1
                 continue
             try:
                 # create() dedups on the (source, start, end) window and returns the
                 # canonical record; the detail FK must point at its id, not ours.
                 created = event_record_service.create(db, record)
                 event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
-                count += 1
+                processed += 1
             except Exception as e:
                 # Reset the session so one bad record doesn't poison the batch.
                 db.rollback()
@@ -215,5 +221,6 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
                         "workout_id": workout.id,
                     },
                 )
+                failed += 1
                 continue
-        return count
+        return IngestionResult(processed, skipped=skipped, failed=failed)

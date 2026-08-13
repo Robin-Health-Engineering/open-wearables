@@ -7,6 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.config import settings
+from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import SeriesType
 from app.services.providers.withings._client import PaginatedResult
 from app.services.providers.withings.coverage import MEASURE_TYPE_MAP
@@ -111,9 +112,12 @@ def test_save_measures_persists_samples(mock_paginate: MagicMock, mock_ts: Magic
     mock_paginate.return_value = PaginatedResult(
         rows=[{"date": 1728000000, "measures": [{"value": 7500, "type": 1, "unit": -2}]}], envelope={}
     )
+    mock_ts.bulk_create_samples.return_value = WriteCounts(inserted=0, updated=1)
     with patch.object(d.connection_repo, "get_active_connection", return_value=MagicMock(id=connection_id)):
         count = d.save_measures(db, uuid4(), datetime.now(timezone.utc), datetime.now(timezone.utc))
     assert count == 1
+    assert count.inserted == 0
+    assert count.updated == 1
     assert mock_paginate.call_args.kwargs["service_path"] == "/measure"
     assert mock_paginate.call_args.kwargs["action"] == "getmeas"
     assert mock_paginate.call_args.kwargs["list_key"] == "measuregrps"
@@ -215,7 +219,7 @@ def test_save_measures_stamps_unzoned_groups_with_the_response_zone(
         envelope={"timezone": "Pacific/Auckland"},
     )
     # The write count is irrelevant here; this asserts what reaches normalisation.
-    mock_ts.bulk_create_samples.return_value = 1
+    mock_ts.bulk_create_samples.return_value = WriteCounts(inserted=1, updated=0)
 
     with patch.object(d.connection_repo, "get_active_connection", return_value=MagicMock(id=uuid4())):
         d.save_measures(MagicMock(), uuid4(), datetime.now(timezone.utc), datetime.now(timezone.utc))
@@ -231,6 +235,24 @@ def test_normalize_activity_drops_invalid_negative_passive_calories() -> None:
     )
 
     assert {sample.series_type for sample in samples} == {SeriesType.energy}
+
+
+@patch("app.services.providers.withings.data_247.timeseries_service")
+@patch("app.services.providers.withings.data_247.paginate")
+def test_save_activity_preserves_write_counts(mock_paginate: MagicMock, mock_ts: MagicMock) -> None:
+    d = _make_data_247()
+    mock_paginate.return_value = PaginatedResult(
+        rows=[{"date": "2024-01-15", "steps": 8000, "distance": 6000.0}], envelope={}
+    )
+    mock_ts.bulk_create_samples.return_value = WriteCounts(inserted=1, updated=1)
+
+    result = d.save_activity(
+        MagicMock(), uuid4(), datetime(2024, 1, 15, tzinfo=timezone.utc), datetime(2024, 1, 16, tzinfo=timezone.utc)
+    )
+
+    assert result == 2
+    assert result.inserted == 1
+    assert result.updated == 1
 
 
 def test_normalize_activity_skips_externally_sourced_rows() -> None:
@@ -281,6 +303,8 @@ def test_save_sleep_creates_event_record(mock_paginate: MagicMock, mock_event: M
         db, uuid4(), datetime(2024, 1, 15, tzinfo=timezone.utc), datetime(2024, 1, 16, tzinfo=timezone.utc)
     )
     assert count == 1
+    assert count.failed == 0
+    assert count.skipped == 0
     mock_event.create_or_merge_sleep.assert_called_once()
     call = mock_event.create_or_merge_sleep.call_args
     record = call.args[2]
@@ -367,6 +391,8 @@ def test_save_sleep_continues_on_row_error(mock_paginate: MagicMock, mock_event:
         db, uuid4(), datetime(2024, 1, 15, tzinfo=timezone.utc), datetime(2024, 1, 16, tzinfo=timezone.utc)
     )
     assert count == 1
+    assert count.skipped == 0
+    assert count.failed == 1
     db.rollback.assert_called()
 
 
@@ -485,6 +511,8 @@ def test_save_sleep_skips_unparseable_row(mock_paginate: MagicMock, mock_event: 
     )
 
     assert count == 1
+    assert count.skipped == 1
+    assert count.failed == 0
     mock_event.create_or_merge_sleep.assert_called_once()
 
 

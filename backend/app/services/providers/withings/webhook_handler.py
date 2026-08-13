@@ -18,6 +18,7 @@ from app.repositories import UserConnectionRepository
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.schemas.auth import LiveSyncMode, resolve_live_sync_mode
 from app.schemas.providers.withings import WithingsNotification
+from app.services import sync_status_service
 from app.services.outgoing_webhooks.events import on_connection_revoked
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.providers.withings.applis import (
@@ -28,6 +29,7 @@ from app.services.providers.withings.applis import (
     Domain,
 )
 from app.services.providers.withings.data_247 import Withings247Data
+from app.services.providers.withings.results import IngestionResult, WithingsUserWebhookResult
 from app.services.providers.withings.webhook_dedup import claim_fetch
 from app.services.providers.withings.workouts import WithingsWorkouts
 from app.services.raw_payload_storage import store_raw_payload
@@ -211,25 +213,49 @@ class WithingsWebhookHandler(BaseWebhookHandler):
                 }
             saved = 0
             user_ids: list[str] = []
+            user_results: list[WithingsUserWebhookResult] = []
             for connection in connections:
                 user_id = connection.user_id
                 user_ids.append(str(user_id))
+                components: dict[str, IngestionResult]
                 if domain == "measures":
                     # appli 1/2/4/58 all fetch via getmeas (requested meastypes in coverage.py).
-                    saved += self.data_247.save_measures(db, user_id, start, end)
+                    components = {
+                        "measures": IngestionResult.coerce(self.data_247.save_measures(db, user_id, start, end))
+                    }
                 elif domain == "sleep":
-                    saved += self.data_247.save_sleep(db, user_id, start, end)
+                    components = {"sleep": IngestionResult.coerce(self.data_247.save_sleep(db, user_id, start, end))}
                 elif domain == "activity_workouts":
                     # appli 16 covers both daily activity and workouts.
-                    saved += self.data_247.save_activity(db, user_id, start, end)
-                    saved += self.workouts.load_data(
-                        db,
-                        user_id,
-                        start_date=start.isoformat(),
-                        end_date=end.isoformat(),
-                    )
+                    components = {
+                        "activity": IngestionResult.coerce(self.data_247.save_activity(db, user_id, start, end)),
+                        "workouts": IngestionResult.coerce(
+                            self.workouts.load_data(
+                                db,
+                                user_id,
+                                start_date=start.isoformat(),
+                                end_date=end.isoformat(),
+                            )
+                        ),
+                    }
                 else:
                     assert_never(domain)
+
+                user_result = WithingsUserWebhookResult(user_id=user_id, domain=domain, components=components)
+                saved += user_result.items_processed
+                user_results.append(user_result)
+
+            # Emit only after the complete fan-out succeeds. A retry must not leave
+            # terminal events for users processed before a later top-level failure.
+            for user_result in user_results:
+                sync_status_service.webhook_delivered(
+                    str(user_result.user_id),
+                    "withings",
+                    status=user_result.status,
+                    items_processed=user_result.items_processed,
+                    message=f"Withings webhook processed {user_result.items_processed} items",
+                    metadata=user_result.metadata(),
+                )
 
         log_structured(
             logger,
@@ -239,10 +265,17 @@ class WithingsWebhookHandler(BaseWebhookHandler):
             appli=screened.notification.appli,
             domain=domain,
             user_ids=user_ids,
-            records=saved,
+            items_processed=saved,
             trace_id=trace_id,
         )
-        return {"status": "processed", "domain": domain, "records_saved": saved, "user_ids": user_ids}
+        return {
+            "status": "processed",
+            "domain": domain,
+            "records_saved": saved,
+            "items_processed": saved,
+            "user_ids": user_ids,
+            "user_results": [user_result.to_dict() for user_result in user_results],
+        }
 
     def _revoke_local_connections(
         self, db: DbSession, notification: WithingsNotification, trace_id: str

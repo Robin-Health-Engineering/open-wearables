@@ -95,6 +95,16 @@ def test_self_reporting_provider_excluded(user_id: str) -> None:
     assert calls == []
 
 
+def test_multi_user_provider_excluded(user_id: str) -> None:
+    calls, fake = _capture()
+    with patch.object(task.sync_status_service, "webhook_delivered", side_effect=fake):
+        task._emit_webhook_sync_status(
+            "withings",
+            {"status": "processed", "records_saved": 9, "user_ids": [user_id, str(uuid4())]},
+        )
+    assert calls == []
+
+
 def test_emission_never_raises() -> None:
     """Sync-log emission must never break webhook processing."""
     calls, fake = _capture()

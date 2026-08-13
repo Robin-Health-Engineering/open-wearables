@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
@@ -8,7 +9,9 @@ from fastapi import HTTPException
 from pydantic import SecretStr
 
 from app.config import settings
+from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.auth import LiveSyncMode
+from app.services.providers.withings.results import IngestionResult
 from app.services.providers.withings.webhook_handler import WithingsWebhookHandler
 
 _CALLBACK_TOKEN = "withings-test-token"
@@ -26,6 +29,12 @@ def _handler(live_sync_mode: LiveSyncMode | None = LiveSyncMode.WEBHOOK) -> With
     h.provider_settings_repo = MagicMock()
     h.provider_settings_repo.get_live_sync_mode.return_value = live_sync_mode
     return h
+
+
+@pytest.fixture(autouse=True)
+def mock_webhook_delivered() -> Iterator[MagicMock]:
+    with patch("app.services.providers.withings.webhook_handler.sync_status_service.webhook_delivered") as mock:
+        yield mock
 
 
 def test_supported_event_types_include_profile_changes() -> None:
@@ -249,7 +258,7 @@ def test_dispatch_passes_a_fresh_trace_id_not_the_user_id(mock_celery: MagicMock
 
 
 def _process(h: WithingsWebhookHandler, appli: str) -> dict:
-    h.connection_repo.get_by_provider_user_id.return_value = MagicMock(user_id=uuid4())
+    h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=uuid4())]
     # A distinct account per call: fetches are deduplicated per account and window,
     # so a shared id would have each test suppressing the next one's fetch.
     payload = {"userid": uuid4().hex, "appli": appli, "startdate": "1728000000", "enddate": "1728001000"}
@@ -377,13 +386,81 @@ def test_process_payload_does_not_store_raw_again(mock_store: MagicMock) -> None
 
 def test_process_payload_appli_16_single_date_fetches_activity_and_workouts() -> None:
     h = _handler()
-    h.connection_repo.get_by_provider_user_id.return_value = MagicMock(user_id=uuid4())
+    h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=uuid4())]
     h.data_247.save_activity.return_value = 5
     h.workouts.load_data.return_value = 3
     result = h.process_payload(MagicMock(), {"userid": "1", "appli": "16", "date": "2018-07-02"}, "t")
     assert result["records_saved"] == 8
     h.data_247.save_activity.assert_called_once()
     h.workouts.load_data.assert_called_once()
+
+
+def test_process_payload_fans_out_data_to_every_linked_profile(mock_webhook_delivered: MagicMock) -> None:
+    h = _handler()
+    user_ids = [uuid4(), uuid4()]
+    h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=user_id) for user_id in user_ids]
+    h.data_247.save_measures.side_effect = [
+        IngestionResult(2, write_counts=WriteCounts(2, 0)),
+        IngestionResult(3, write_counts=WriteCounts(1, 2), failed=1),
+    ]
+
+    result = h.process_payload(
+        MagicMock(),
+        {"userid": "123", "appli": "1", "startdate": "1728000000", "enddate": "1728001000"},
+        "trace-1",
+    )
+
+    assert result["records_saved"] == 5
+    assert result["items_processed"] == 5
+    assert set(result["user_ids"]) == {str(user_id) for user_id in user_ids}
+    assert [user_result["status"] for user_result in result["user_results"]] == ["success", "partial"]
+    assert [user_result["items_processed"] for user_result in result["user_results"]] == [2, 3]
+    assert result["user_results"][1]["components"]["measures"]["updated"] == 2
+    assert [call.args[1] for call in h.data_247.save_measures.call_args_list] == user_ids
+    assert [call.args[0] for call in mock_webhook_delivered.call_args_list] == [str(user_id) for user_id in user_ids]
+    assert [call.kwargs["items_processed"] for call in mock_webhook_delivered.call_args_list] == [2, 3]
+
+
+def test_process_payload_preserves_activity_workout_components_per_user(mock_webhook_delivered: MagicMock) -> None:
+    h = _handler()
+    user_ids = [uuid4(), uuid4()]
+    h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=user_id) for user_id in user_ids]
+    h.data_247.save_activity.side_effect = [
+        IngestionResult(2, write_counts=WriteCounts(1, 1)),
+        IngestionResult(0, write_counts=WriteCounts(0, 0)),
+    ]
+    h.workouts.load_data.side_effect = [IngestionResult(1, skipped=1), IngestionResult(0, failed=2)]
+
+    result = h.process_payload(
+        MagicMock(),
+        {"userid": "123", "appli": "16", "startdate": "1728000000", "enddate": "1728001000"},
+        "trace-1",
+    )
+
+    assert result["records_saved"] == 3
+    assert result["user_results"][0]["status"] == "success"
+    assert result["user_results"][0]["skipped"] == 1
+    assert result["user_results"][0]["components"]["activity"]["updated"] == 1
+    assert result["user_results"][0]["components"]["workouts"]["items_processed"] == 1
+    assert result["user_results"][1]["status"] == "failed"
+    assert result["user_results"][1]["failed"] == 2
+    assert [call.kwargs["status"].value for call in mock_webhook_delivered.call_args_list] == ["success", "failed"]
+
+
+def test_process_payload_later_user_exception_emits_no_status(mock_webhook_delivered: MagicMock) -> None:
+    h = _handler()
+    user_ids = [uuid4(), uuid4()]
+    h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=user_id) for user_id in user_ids]
+    h.data_247.save_measures.side_effect = [IngestionResult(2), RuntimeError("retry me")]
+
+    with pytest.raises(RuntimeError, match="retry me"):
+        h.process_payload(
+            MagicMock(),
+            {"userid": "123", "appli": "1", "startdate": "1728000000", "enddate": "1728001000"},
+            "trace-1",
+        )
+
+    mock_webhook_delivered.assert_not_called()
 
 
 def test_process_payload_new_categories_go_to_measures() -> None:

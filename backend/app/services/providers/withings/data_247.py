@@ -17,6 +17,7 @@ from app.config import settings
 from app.database import DbSession
 from app.models import EventRecord
 from app.repositories import EventRecordRepository, UserConnectionRepository
+from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -34,6 +35,7 @@ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import paginate, scale_measure
 from app.services.providers.withings.coverage import ACTIVITY_FIELD_MAP, MEASURE_TYPE_MAP
 from app.services.providers.withings.data_requests import ACTIVITY, MEASURES, SLEEP_SUMMARY
+from app.services.providers.withings.results import IngestionResult
 from app.services.providers.withings.timezone import local_day_start, zone_offset_at
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
@@ -151,7 +153,7 @@ class Withings247Data(Base247DataTemplate):
             )
         return samples
 
-    def save_measures(self, db: DbSession, user_id: UUID, start: datetime, end: datetime) -> int:
+    def save_measures(self, db: DbSession, user_id: UUID, start: datetime, end: datetime) -> IngestionResult:
         user_connection_id = self._active_connection_id(db, user_id)
         page = paginate(
             db=db,
@@ -174,10 +176,11 @@ class Withings247Data(Base247DataTemplate):
             user_connection_id,
             default_timezone=page.envelope.get("timezone"),
         )
-        if samples:
-            timeseries_service.bulk_create_samples(db, samples)
-            db.commit()
-        return len(samples)
+        if not samples:
+            return IngestionResult(0, write_counts=WriteCounts(0, 0))
+        counts = timeseries_service.bulk_create_samples(db, samples)
+        db.commit()
+        return IngestionResult(int(counts), write_counts=counts)
 
     # ---------------------- Daily activity (getactivity) ----------------------
 
@@ -268,7 +271,7 @@ class Withings247Data(Base247DataTemplate):
         user_id: UUID,
         start: datetime,
         end: datetime,
-    ) -> int:
+    ) -> IngestionResult:
         user_connection_id = self._active_connection_id(db, user_id)
         start_ymd, end_ymd = self._ymd_window(start, end)
         rows = paginate(
@@ -286,10 +289,11 @@ class Withings247Data(Base247DataTemplate):
             list_key=ACTIVITY.list_key,
         ).rows
         samples = self.normalize_activity(rows, user_id, user_connection_id)
-        if samples:
-            timeseries_service.bulk_create_samples(db, samples)
-            db.commit()
-        return len(samples)
+        if not samples:
+            return IngestionResult(0, write_counts=WriteCounts(0, 0))
+        counts = timeseries_service.bulk_create_samples(db, samples)
+        db.commit()
+        return IngestionResult(int(counts), write_counts=counts)
 
     # ---------------------- Sleep (getsummary) ----------------------
 
@@ -299,7 +303,7 @@ class Withings247Data(Base247DataTemplate):
         user_id: UUID,
         start: datetime,
         end: datetime,
-    ) -> int:
+    ) -> IngestionResult:
         user_connection_id = self._active_connection_id(db, user_id)
         start_ymd, end_ymd = self._ymd_window(start, end)
         rows = paginate(
@@ -316,12 +320,16 @@ class Withings247Data(Base247DataTemplate):
             },
             list_key=SLEEP_SUMMARY.list_key,
         ).rows
-        count = 0
+        processed = 0
+        skipped = 0
+        failed = 0
         for row in rows:
             # Tolerate a malformed night without dropping the rest of the batch.
             try:
                 if self._save_sleep_row(db, user_id, row, user_connection_id):
-                    count += 1
+                    processed += 1
+                else:
+                    failed += 1
             except Exception as e:
                 db.rollback()
                 log_and_capture_error(
@@ -331,7 +339,8 @@ class Withings247Data(Base247DataTemplate):
                     level="warning",
                     extra={"provider": "withings", "user_id": str(user_id)},
                 )
-        return count
+                skipped += 1
+        return IngestionResult(processed, skipped=skipped, failed=failed)
 
     def _save_sleep_row(
         self,

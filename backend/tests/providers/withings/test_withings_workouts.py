@@ -13,6 +13,7 @@ from app.constants.workout_types.withings import (
 from app.schemas.enums.workout_types import WorkoutType
 from app.schemas.providers.withings import WithingsWorkout
 from app.services.providers.withings._client import PaginatedResult
+from app.services.providers.withings.results import IngestionResult
 from app.services.providers.withings.workouts import WithingsWorkouts
 
 
@@ -271,6 +272,9 @@ def test_load_data_rolls_back_on_save_failure(mock_api: MagicMock, mock_event: M
 
     result = w.load_data(db, uuid4())
     assert result == 1
+    assert isinstance(result, IngestionResult)
+    assert result.failed == 1
+    assert result.skipped == 0
     db.rollback.assert_called_once()
     assert mock_event.create.call_count == 2
 
@@ -288,6 +292,9 @@ def test_load_data_skips_bad_workout(mock_api: MagicMock, mock_event: MagicMock)
     mock_api.return_value = [bad_workout, good_workout]
     result = w.load_data(db, uuid4())
     assert result == 1
+    assert isinstance(result, IngestionResult)
+    assert result.skipped == 1
+    assert result.failed == 0
     mock_event.create.assert_called_once()
     mock_event.create_detail.assert_called_once()
 
@@ -306,6 +313,8 @@ def test_load_data_skips_no_activity_without_unknown_warning(
     result = w.load_data(MagicMock(), uuid4())
 
     assert result == 0
+    assert isinstance(result, IngestionResult)
+    assert result.skipped == 1
     mock_event.create.assert_not_called()
     mock_log.assert_not_called()
 
