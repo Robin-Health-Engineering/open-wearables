@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
@@ -104,10 +105,12 @@ def make_authenticated_request(
     endpoint: str,
     method: str = "GET",
     params: dict[str, Any] | None = None,
+    form_data: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     json_data: dict[str, Any] | None = None,
     expect_json: bool = True,
     http2: bool = False,
+    acquire_slot: Callable[[], None] | None = None,
 ) -> Any:
     """Make authenticated request to provider API.
 
@@ -123,6 +126,7 @@ def make_authenticated_request(
         endpoint: API endpoint path (e.g., "/v3/workouts/")
         method: HTTP method (default: GET)
         params: Query parameters
+        form_data: Form-encoded request body
         headers: Additional headers (Authorization header will be added automatically)
         json_data: JSON body for POST/PUT requests
         expect_json: Whether to parse response as JSON (default True).
@@ -130,6 +134,9 @@ def make_authenticated_request(
         http2: Enable HTTP/2 for this request (default False). Requires the h2
             package (installed via httpx[http2]).  Use for providers that require
             HTTP/2, e.g. Sensor Bio.  Other providers are unaffected.
+        acquire_slot: Called before every HTTP attempt, including retries, so a
+            provider's own rate-limit policy paces the retry loop instead of
+            being outrun by it. Raise from it to reject the request.
 
     Returns:
         Any: API response JSON, or dict with status_code if expect_json=False
@@ -137,6 +144,9 @@ def make_authenticated_request(
     Raises:
         HTTPException: If API request fails
     """
+    if form_data is not None and json_data is not None:
+        raise ValueError("form_data and json_data are mutually exclusive")
+
     # Get valid token (will auto-refresh if needed)
     access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
 
@@ -153,12 +163,15 @@ def make_authenticated_request(
 
     for attempt in range(MAX_RETRIES + 1):
         try:
+            if acquire_slot is not None:
+                acquire_slot()
             with httpx.Client(http2=http2) as client:
                 response = client.request(
                     method=method,
                     url=url,
                     headers=request_headers,
                     params=params or {},
+                    data=form_data,
                     json=json_data,
                     timeout=30.0,
                 )
