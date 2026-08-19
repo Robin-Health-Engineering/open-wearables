@@ -800,6 +800,10 @@ When an admin switches the sync mode to `webhook` via `PUT /api/v1/oauth/provide
 If `webhook_subscription_owner` is unset (the default), switching sync mode to `webhook` only updates the database — you must register subscriptions manually in the provider's developer portal pointing to `{API_BASE_URL}/api/v1/providers/{provider}/webhooks`.
 </Note>
 
+#### Per-user subscriptions
+
+Some providers create subscriptions with each user's own bearer token rather than one app-level registration (e.g. Withings). For these, set `webhook_subscription_owner=WebhookSubscriptionOwner.USER` instead of `APPLICATION`, and implement `sync_user(db, user_id, mode)` (and optionally `remove_user`) on your `BaseWebhookService` rather than `register_subscriptions`. The platform fans this out per active connection — on connect, on a live-sync mode toggle, and on a daily reconciliation sweep — instead of calling it once for the whole application.
+
 ---
 
 ## Troubleshooting

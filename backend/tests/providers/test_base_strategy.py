@@ -18,10 +18,11 @@ from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.services.providers.apple.strategy import AppleStrategy
-from app.services.providers.base_strategy import BaseProviderStrategy
+from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
 from app.services.providers.garmin.strategy import GarminStrategy
 from app.services.providers.polar.strategy import PolarStrategy
 from app.services.providers.suunto.strategy import SuuntoStrategy
+from app.services.providers.withings.strategy import WithingsStrategy
 
 
 class TestBaseProviderStrategy:
@@ -111,6 +112,21 @@ class TestBaseProviderStrategy:
         # Assert
         assert strategy.has_cloud_api is False
         assert strategy.oauth is None
+
+    def test_withings_exposes_per_user_webhook_service(self) -> None:
+        """USER-owned subscriptions surface the strategy's webhook service."""
+        strategy = WithingsStrategy()
+
+        assert strategy.capabilities.webhook_subscription_owner == WebhookSubscriptionOwner.USER
+        assert strategy.per_user_webhook_service is strategy.webhook_service
+        assert strategy.per_user_webhook_service is not None
+
+    def test_apple_has_no_per_user_webhook_service(self) -> None:
+        """A provider without USER-owned subscriptions exposes none, regardless of webhook_service."""
+        strategy = AppleStrategy()
+
+        assert strategy.capabilities.webhook_subscription_owner != WebhookSubscriptionOwner.USER
+        assert strategy.per_user_webhook_service is None
 
     def test_icon_url_generation(self) -> None:
         """Should generate correct icon URL path."""

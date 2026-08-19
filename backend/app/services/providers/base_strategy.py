@@ -246,6 +246,18 @@ class BaseProviderStrategy(ABC):
         return self.oauth is not None
 
     @property
+    def per_user_webhook_service(self) -> BaseWebhookService | None:
+        """This provider's webhook service, only when subscriptions are user-owned.
+
+        Callers that tear down one connection's subscriptions (disconnect, data
+        purge) use this to skip providers whose subscriptions are application-owned
+        and would outlive the connection being removed.
+        """
+        if self.capabilities.webhook_subscription_owner != WebhookSubscriptionOwner.USER:
+            return None
+        return self.webhook_service
+
+    @property
     def live_sync_configurable(self) -> bool:
         """True when the admin can choose between pull and webhook live sync.
 

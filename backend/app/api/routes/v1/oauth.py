@@ -24,7 +24,7 @@ from app.services import DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
-from app.utils.sentry_helpers import log_and_capture_error
+from app.utils.structured_logging import log_structured
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -140,11 +140,13 @@ def oauth_callback(
                 queue="webhook_sync",
             )
     except Exception as e:
-        log_and_capture_error(
-            e,
+        log_structured(
             logger,
+            "error",
             "Provider user subscription scheduling failed",
-            extra={"provider": provider.value, "user_id": str(oauth_state.user_id)},
+            provider=provider.value,
+            user_id=str(oauth_state.user_id),
+            error=str(e),
         )
 
     # If a specific redirect_uri was requested (e.g. by frontend), redirect there

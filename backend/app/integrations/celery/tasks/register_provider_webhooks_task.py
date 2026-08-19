@@ -10,9 +10,7 @@ connection.
 
 import asyncio
 import random
-from dataclasses import asdict, dataclass
 from logging import getLogger
-from typing import Any
 from uuid import UUID
 
 from celery import Task, shared_task
@@ -22,6 +20,7 @@ from app.database import SessionLocal
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import ProviderName
+from app.schemas.webhook_reconciliation import WebhookReconciliationResult
 from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
 from app.utils.structured_logging import log_structured
@@ -34,22 +33,6 @@ REGISTER_PROVIDER_WEBHOOKS_TASK = (
 SYNC_PROVIDER_USER_SUBSCRIPTION_TASK = (
     "app.integrations.celery.tasks.register_provider_webhooks_task.sync_provider_user_subscription"
 )
-
-
-@dataclass(frozen=True)
-class WebhookReconciliationResult:
-    """Represent a reconciliation outcome across subscription ownership models."""
-
-    provider: str
-    owner: WebhookSubscriptionOwner | None = None
-    dispatched: int = 0
-    created: int = 0
-    skipped: int = 0
-    errors: int = 0
-    reason: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 def _fan_out_user_subscriptions(

@@ -20,7 +20,6 @@ from app.api.routes.v1.connections import delete_provider_data_endpoint
 from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, User, UserConnection, WorkoutDetails
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
-from app.services.providers.base_strategy import WebhookSubscriptionOwner
 from tests.factories import (
     ApiKeyFactory,
     DataPointSeriesFactory,
@@ -482,17 +481,20 @@ class TestDeleteProviderDataEndpoint:
     """Test suite for DELETE /api/v1/users/{user_id}/connections/{provider}/data."""
 
     def test_delete_data_forwards_capability_gated_webhook_service(self) -> None:
+        """Whatever the strategy resolves per_user_webhook_service to is forwarded as-is.
+
+        The gating logic itself (USER-owned vs not) is covered on BaseProviderStrategy
+        directly in tests/providers/test_base_strategy.py.
+        """
         db = MagicMock(spec=Session)
         user_id = uuid4()
 
-        for provider, has_per_user_subscriptions in (
-            (ProviderName.WITHINGS, True),
-            (ProviderName.APPLE, False),
+        for provider, per_user_webhook_service in (
+            (ProviderName.WITHINGS, MagicMock()),
+            (ProviderName.APPLE, None),
         ):
             strategy = MagicMock()
-            strategy.capabilities.webhook_subscription_owner = (
-                WebhookSubscriptionOwner.USER if has_per_user_subscriptions else None
-            )
+            strategy.per_user_webhook_service = per_user_webhook_service
 
             with (
                 patch("app.api.routes.v1.connections.ProviderFactory") as provider_factory,
@@ -508,7 +510,7 @@ class TestDeleteProviderDataEndpoint:
                 user_id,
                 provider.value,
                 oauth=strategy.oauth,
-                webhook_service=strategy.webhook_service if has_per_user_subscriptions else None,
+                webhook_service=per_user_webhook_service,
             )
 
     def _seed_provider_data(self, user: User, provider: str) -> DataSource:
