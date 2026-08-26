@@ -1,5 +1,4 @@
 from app.schemas.enums import ProviderName
-from app.services.providers.base_strategy import WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.withings.coverage import HEALTH_SCORES, SLEEP_FIELDS, TIMESERIES, WORKOUT_FIELDS
 from app.services.providers.withings.data_247 import Withings247Data
@@ -19,7 +18,8 @@ def test_withings_identity_and_capabilities() -> None:
     caps = strategy.capabilities
     assert caps.rest_pull is True
     assert caps.webhook_ping is True
-    assert caps.webhook_subscription_owner is WebhookSubscriptionOwner.USER
+    assert caps.webhook_registration_api is True
+    assert caps.webhook_subscription_per_user is True
     assert strategy.live_sync_configurable is True
 
 

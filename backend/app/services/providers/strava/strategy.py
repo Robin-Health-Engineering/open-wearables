@@ -1,9 +1,4 @@
-from app.services.providers.base_strategy import (
-    BaseProviderStrategy,
-    ProviderCapabilities,
-    ProviderCoverage,
-    WebhookSubscriptionOwner,
-)
+from app.services.providers.base_strategy import BaseProviderStrategy, ProviderCapabilities, ProviderCoverage
 from app.services.providers.strava.coverage import HEALTH_SCORES, SLEEP_FIELDS, TIMESERIES, WORKOUT_FIELDS
 from app.services.providers.strava.oauth import StravaOAuth
 from app.services.providers.strava.webhook_handler import StravaWebhookHandler
@@ -75,8 +70,4 @@ class StravaStrategy(BaseProviderStrategy):
         # Strava REST API is used for historical activity backfills.
         # Strava webhook events contain only the object_id and aspect_type;
         # the full activity must still be fetched via GET /activities/{id}.
-        return ProviderCapabilities(
-            rest_pull=True,
-            webhook_ping=True,
-            webhook_subscription_owner=WebhookSubscriptionOwner.APPLICATION,
-        )
+        return ProviderCapabilities(rest_pull=True, webhook_ping=True, webhook_registration_api=True)

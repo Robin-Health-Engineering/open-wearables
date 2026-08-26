@@ -9,9 +9,7 @@ from fastapi.responses import RedirectResponse
 
 from app.config import settings
 from app.database import DbSession
-from app.integrations.celery.tasks.register_provider_webhooks_task import (
-    SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
-)
+from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
 from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.credentials import AuthorizationURLResponse
@@ -22,7 +20,7 @@ from app.schemas.model_crud.data_priority import (
 )
 from app.services import DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
-from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
+from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
 from app.utils.structured_logging import log_structured
 
@@ -130,7 +128,7 @@ def oauth_callback(
     # the connection and its bearer token.
     try:
         if (
-            strategy.capabilities.webhook_subscription_owner == WebhookSubscriptionOwner.USER
+            strategy.capabilities.webhook_subscription_per_user
             and strategy.webhook_service is not None
             and strategy.effective_live_sync_mode(db) == LiveSyncMode.WEBHOOK
         ):

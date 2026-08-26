@@ -11,7 +11,6 @@ from pydantic import SecretStr
 from app.config import settings
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.auth import LiveSyncMode
-from app.services.providers.withings.results import IngestionResult
 from app.services.providers.withings.webhook_handler import WithingsWebhookHandler
 
 _CALLBACK_TOKEN = "withings-test-token"
@@ -400,8 +399,8 @@ def test_process_payload_fans_out_data_to_every_linked_profile(mock_webhook_deli
     user_ids = [uuid4(), uuid4()]
     h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=user_id) for user_id in user_ids]
     h.data_247.save_measures.side_effect = [
-        IngestionResult(2, write_counts=WriteCounts(2, 0)),
-        IngestionResult(3, write_counts=WriteCounts(1, 2), failed=1),
+        WriteCounts(2, 0),
+        WriteCounts(1, 2, failed=1),
     ]
 
     result = h.process_payload(
@@ -426,10 +425,10 @@ def test_process_payload_preserves_activity_workout_components_per_user(mock_web
     user_ids = [uuid4(), uuid4()]
     h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=user_id) for user_id in user_ids]
     h.data_247.save_activity.side_effect = [
-        IngestionResult(2, write_counts=WriteCounts(1, 1)),
-        IngestionResult(0, write_counts=WriteCounts(0, 0)),
+        WriteCounts(1, 1),
+        WriteCounts(0, 0),
     ]
-    h.workouts.load_data.side_effect = [IngestionResult(1, skipped=1), IngestionResult(0, failed=2)]
+    h.workouts.load_data.side_effect = [WriteCounts.unsplit(1, skipped=1), WriteCounts.unsplit(0, failed=2)]
 
     result = h.process_payload(
         MagicMock(),
@@ -451,7 +450,7 @@ def test_process_payload_later_user_exception_emits_no_status(mock_webhook_deliv
     h = _handler()
     user_ids = [uuid4(), uuid4()]
     h.connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=user_id) for user_id in user_ids]
-    h.data_247.save_measures.side_effect = [IngestionResult(2), RuntimeError("retry me")]
+    h.data_247.save_measures.side_effect = [WriteCounts.unsplit(2), RuntimeError("retry me")]
 
     with pytest.raises(RuntimeError, match="retry me"):
         h.process_payload(

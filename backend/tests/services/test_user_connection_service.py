@@ -421,39 +421,12 @@ class TestUserConnectionServiceDisconnect:
         db.refresh(connection)
         assert connection.status == ConnectionStatus.REVOKED
 
-    def test_disconnect_calls_webhook_service_remove_user_before_clearing_tokens(self, db: Session) -> None:
-        connection = UserConnectionFactory(
-            provider="withings", status=ConnectionStatus.ACTIVE, access_token="live-token"
-        )
-        webhook_service = MagicMock()
+    def test_disconnect_leaves_a_linked_users_connection_untouched(self, db: Session) -> None:
+        """Revoking one profile must not revoke a sibling profile sharing the provider account.
 
-        user_connection_service.disconnect(db, connection.user_id, "withings", webhook_service=webhook_service)
-
-        webhook_service.remove_user.assert_called_once_with(db, connection.user_id)
-
-    def test_disconnect_is_best_effort_on_webhook_removal_failure(self, db: Session) -> None:
-        connection = UserConnectionFactory(provider="withings", status=ConnectionStatus.ACTIVE)
-        webhook_service = MagicMock()
-        webhook_service.remove_user.side_effect = RuntimeError("boom")
-
-        user_connection_service.disconnect(db, connection.user_id, "withings", webhook_service=webhook_service)
-
-        db.refresh(connection)
-        assert connection.status == ConnectionStatus.REVOKED
-
-    def test_disconnect_skips_webhook_removal_without_a_live_access_token(self, db: Session) -> None:
-        connection = UserConnectionFactory(provider="withings", status=ConnectionStatus.ACTIVE, access_token=None)
-        webhook_service = MagicMock()
-
-        user_connection_service.disconnect(db, connection.user_id, "withings", webhook_service=webhook_service)
-
-        webhook_service.remove_user.assert_not_called()
-
-    def test_disconnect_preserves_provider_account_while_another_user_is_linked(self, db: Session) -> None:
-        """A subscription belongs to the provider account, so a sibling profile still linked
-        to it keeps it. The grant is the opposite: it is grant-scoped at most providers
-        (Polar, Whoop, Strava, Oura), so skipping revocation would strand this user's own
-        grant without protecting the sibling's."""
+        Provider-side teardown is not this service's concern: it happens in the provider's
+        own ``on_disconnect`` before disconnect is called.
+        """
         provider_user_id = "shared-withings-user"
         connection = UserConnectionFactory(
             provider="withings",
@@ -468,30 +441,21 @@ class TestUserConnectionServiceDisconnect:
             access_token="second-token",
         )
         oauth = MagicMock()
-        webhook_service = MagicMock()
 
-        user_connection_service.disconnect(
-            db,
-            connection.user_id,
-            "withings",
-            oauth=oauth,
-            webhook_service=webhook_service,
-        )
+        user_connection_service.disconnect(db, connection.user_id, "withings", oauth=oauth)
 
         db.refresh(connection)
         db.refresh(linked_connection)
         assert connection.status == ConnectionStatus.REVOKED
         assert linked_connection.status == ConnectionStatus.ACTIVE
         oauth.deregister_user.assert_called_once()
-        webhook_service.remove_user.assert_not_called()
 
 
 class TestUserConnectionServicePurgeProviderData:
-    def test_purge_forwards_webhook_service_before_deleting_provider_data(self) -> None:
+    def test_purge_disconnects_before_deleting_provider_data(self) -> None:
         db = MagicMock(spec=Session)
         user_id = uuid4()
         oauth = MagicMock()
-        webhook_service = MagicMock()
         lifecycle = MagicMock()
         disconnect = MagicMock()
         delete_provider_data = MagicMock(return_value=2)
@@ -502,16 +466,10 @@ class TestUserConnectionServicePurgeProviderData:
             patch.object(user_connection_service, "disconnect", disconnect),
             patch.object(user_connection_service.data_source_crud, "delete_user_provider_data", delete_provider_data),
         ):
-            deleted = user_connection_service.purge_provider_data(
-                db,
-                user_id,
-                "withings",
-                oauth=oauth,
-                webhook_service=webhook_service,
-            )
+            deleted = user_connection_service.purge_provider_data(db, user_id, "withings", oauth=oauth)
 
         assert lifecycle.mock_calls == [
-            call.disconnect(db, user_id, "withings", oauth=oauth, webhook_service=webhook_service),
+            call.disconnect(db, user_id, "withings", oauth=oauth),
             call.delete(db, user_id, ProviderName.WITHINGS),
         ]
         assert deleted == 2

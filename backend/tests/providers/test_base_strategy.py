@@ -10,6 +10,8 @@ Tests cover:
 """
 
 from abc import ABC
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -18,7 +20,7 @@ from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.services.providers.apple.strategy import AppleStrategy
-from app.services.providers.base_strategy import BaseProviderStrategy, WebhookSubscriptionOwner
+from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.garmin.strategy import GarminStrategy
 from app.services.providers.polar.strategy import PolarStrategy
 from app.services.providers.suunto.strategy import SuuntoStrategy
@@ -113,20 +115,19 @@ class TestBaseProviderStrategy:
         assert strategy.has_cloud_api is False
         assert strategy.oauth is None
 
-    def test_withings_exposes_per_user_webhook_service(self) -> None:
-        """USER-owned subscriptions surface the strategy's webhook service."""
+    def test_withings_tears_down_subscriptions_on_disconnect(self) -> None:
+        """A per-user provider overrides on_disconnect to revoke at the vendor."""
         strategy = WithingsStrategy()
+        db, user_id = MagicMock(), uuid4()
 
-        assert strategy.capabilities.webhook_subscription_owner == WebhookSubscriptionOwner.USER
-        assert strategy.per_user_webhook_service is strategy.webhook_service
-        assert strategy.per_user_webhook_service is not None
+        with patch.object(strategy.webhook_service, "remove_user") as remove_user:
+            strategy.on_disconnect(db, user_id)
 
-    def test_apple_has_no_per_user_webhook_service(self) -> None:
-        """A provider without USER-owned subscriptions exposes none, regardless of webhook_service."""
-        strategy = AppleStrategy()
+        remove_user.assert_called_once_with(db, user_id)
 
-        assert strategy.capabilities.webhook_subscription_owner != WebhookSubscriptionOwner.USER
-        assert strategy.per_user_webhook_service is None
+    def test_on_disconnect_is_a_no_op_by_default(self) -> None:
+        """Providers holding no per-connection vendor state inherit a no-op."""
+        assert AppleStrategy().on_disconnect(MagicMock(), uuid4()) is None
 
     def test_icon_url_generation(self) -> None:
         """Should generate correct icon URL path."""

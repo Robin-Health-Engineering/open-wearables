@@ -2,15 +2,14 @@ from celery import current_app as celery_app
 
 from app.config import settings
 from app.database import DbSession
-from app.integrations.celery.tasks.register_provider_webhooks_task import REGISTER_PROVIDER_WEBHOOKS_TASK
+from app.integrations.celery.task_names import REGISTER_PROVIDER_WEBHOOKS_TASK
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
-from app.schemas.auth.live_sync_mode import LiveSyncMode, resolve_live_sync_mode
+from app.schemas.auth.live_sync_mode import LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.data_priority import (
     ProviderSettingRead,
     ProviderSettingUpdate,
 )
-from app.services.providers.base_strategy import WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
 
 
@@ -30,10 +29,7 @@ class ProviderSettingsService:
             has_cloud_api=strategy.has_cloud_api,
             is_enabled=setting.is_enabled if setting else True,
             icon_url=strategy.icon_url,
-            live_sync_mode=resolve_live_sync_mode(
-                setting.live_sync_mode if setting else None,
-                strategy.default_live_sync_mode,
-            ),
+            live_sync_mode=(setting.live_sync_mode if setting else None) or strategy.default_live_sync_mode,
             live_sync_configurable=strategy.live_sync_configurable,
             data_granularity=setting.data_granularity if setting else None,
         )
@@ -73,18 +69,12 @@ class ProviderSettingsService:
         setting = self.repo.upsert(db, provider, new_is_enabled, effective_live_sync_mode, effective_granularity)
 
         caps = strategy.capabilities
-        if update.live_sync_mode is not None and caps.webhook_subscription_owner == WebhookSubscriptionOwner.USER:
-            # Reconcile every active connection when a user-owned subscription mode changes.
-            celery_app.send_task(
-                REGISTER_PROVIDER_WEBHOOKS_TASK,
-                args=[provider],
-                kwargs={"webhook_mode_only": update.live_sync_mode == LiveSyncMode.WEBHOOK},
-                queue="webhook_sync",
-            )
-        elif (
-            update.live_sync_mode == LiveSyncMode.WEBHOOK
-            and caps.webhook_subscription_owner == WebhookSubscriptionOwner.APPLICATION
-        ):
+        # Per-user subscriptions also need reconciling when webhooks are switched *off*,
+        # since each connection holds one that has to be revoked at the provider.
+        registers_on_mode_change = update.live_sync_mode == LiveSyncMode.WEBHOOK or (
+            update.live_sync_mode is not None and caps.webhook_subscription_per_user
+        )
+        if caps.webhook_registration_api and registers_on_mode_change:
             callback_url = f"{settings.api_base_url}{settings.api_v1}/providers/{provider}/webhooks"
             celery_app.send_task(REGISTER_PROVIDER_WEBHOOKS_TASK, args=[provider, callback_url], queue="webhook_sync")
 
@@ -94,7 +84,7 @@ class ProviderSettingsService:
             has_cloud_api=strategy.has_cloud_api,
             is_enabled=setting.is_enabled,
             icon_url=strategy.icon_url,
-            live_sync_mode=resolve_live_sync_mode(setting.live_sync_mode, strategy.default_live_sync_mode),
+            live_sync_mode=setting.live_sync_mode or strategy.default_live_sync_mode,
             live_sync_configurable=strategy.live_sync_configurable,
             data_granularity=setting.data_granularity,
         )

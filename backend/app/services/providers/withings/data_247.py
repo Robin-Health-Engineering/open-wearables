@@ -35,7 +35,6 @@ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import paginate, scale_measure
 from app.services.providers.withings.coverage import ACTIVITY_FIELD_MAP, MEASURE_TYPE_MAP
 from app.services.providers.withings.data_requests import ACTIVITY, MEASURES, SLEEP_SUMMARY
-from app.services.providers.withings.results import IngestionResult
 from app.services.providers.withings.timezone import local_day_start, zone_offset_at
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
@@ -153,7 +152,7 @@ class Withings247Data(Base247DataTemplate):
             )
         return samples
 
-    def save_measures(self, db: DbSession, user_id: UUID, start: datetime, end: datetime) -> IngestionResult:
+    def save_measures(self, db: DbSession, user_id: UUID, start: datetime, end: datetime) -> WriteCounts:
         user_connection_id = self._active_connection_id(db, user_id)
         page = paginate(
             db=db,
@@ -177,10 +176,10 @@ class Withings247Data(Base247DataTemplate):
             default_timezone=page.envelope.get("timezone"),
         )
         if not samples:
-            return IngestionResult(0, write_counts=WriteCounts(0, 0))
+            return WriteCounts(0, 0)
         counts = timeseries_service.bulk_create_samples(db, samples)
         db.commit()
-        return IngestionResult(int(counts), write_counts=counts)
+        return counts
 
     # ---------------------- Daily activity (getactivity) ----------------------
 
@@ -271,7 +270,7 @@ class Withings247Data(Base247DataTemplate):
         user_id: UUID,
         start: datetime,
         end: datetime,
-    ) -> IngestionResult:
+    ) -> WriteCounts:
         user_connection_id = self._active_connection_id(db, user_id)
         start_ymd, end_ymd = self._ymd_window(start, end)
         rows = paginate(
@@ -290,10 +289,10 @@ class Withings247Data(Base247DataTemplate):
         ).rows
         samples = self.normalize_activity(rows, user_id, user_connection_id)
         if not samples:
-            return IngestionResult(0, write_counts=WriteCounts(0, 0))
+            return WriteCounts(0, 0)
         counts = timeseries_service.bulk_create_samples(db, samples)
         db.commit()
-        return IngestionResult(int(counts), write_counts=counts)
+        return counts
 
     # ---------------------- Sleep (getsummary) ----------------------
 
@@ -303,7 +302,7 @@ class Withings247Data(Base247DataTemplate):
         user_id: UUID,
         start: datetime,
         end: datetime,
-    ) -> IngestionResult:
+    ) -> WriteCounts:
         user_connection_id = self._active_connection_id(db, user_id)
         start_ymd, end_ymd = self._ymd_window(start, end)
         rows = paginate(
@@ -340,7 +339,7 @@ class Withings247Data(Base247DataTemplate):
                     extra={"provider": "withings", "user_id": str(user_id)},
                 )
                 skipped += 1
-        return IngestionResult(processed, skipped=skipped, failed=failed)
+        return WriteCounts.unsplit(processed, skipped=skipped, failed=failed)
 
     def _save_sleep_row(
         self,

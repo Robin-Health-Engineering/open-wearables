@@ -15,8 +15,9 @@ from pydantic import ValidationError
 from app.config import settings
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
+from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
-from app.schemas.auth import LiveSyncMode, resolve_live_sync_mode
+from app.schemas.auth import LiveSyncMode
 from app.schemas.providers.withings import WithingsNotification
 from app.services import sync_status_service
 from app.services.outgoing_webhooks.events import on_connection_revoked
@@ -29,7 +30,7 @@ from app.services.providers.withings.applis import (
     Domain,
 )
 from app.services.providers.withings.data_247 import Withings247Data
-from app.services.providers.withings.results import IngestionResult, WithingsUserWebhookResult
+from app.services.providers.withings.results import WithingsUserWebhookResult
 from app.services.providers.withings.webhook_dedup import claim_fetch
 from app.services.providers.withings.workouts import WithingsWorkouts
 from app.services.raw_payload_storage import store_raw_payload
@@ -103,7 +104,7 @@ class WithingsWebhookHandler(BaseWebhookHandler):
 
     def _live_sync_mode_allows_webhook(self, db: DbSession) -> bool:
         configured = self.provider_settings_repo.get_live_sync_mode(db, self.provider_name)
-        return resolve_live_sync_mode(configured, self._default_live_sync_mode) == LiveSyncMode.WEBHOOK
+        return (configured or self._default_live_sync_mode) == LiveSyncMode.WEBHOOK
 
     @staticmethod
     def _bounded_window(notification: WithingsNotification) -> tuple[datetime, datetime, str | None] | None:
@@ -217,19 +218,17 @@ class WithingsWebhookHandler(BaseWebhookHandler):
             for connection in connections:
                 user_id = connection.user_id
                 user_ids.append(str(user_id))
-                components: dict[str, IngestionResult]
+                components: dict[str, WriteCounts]
                 if domain == "measures":
                     # appli 1/2/4/58 all fetch via getmeas (requested meastypes in coverage.py).
-                    components = {
-                        "measures": IngestionResult.coerce(self.data_247.save_measures(db, user_id, start, end))
-                    }
+                    components = {"measures": WriteCounts.coerce(self.data_247.save_measures(db, user_id, start, end))}
                 elif domain == "sleep":
-                    components = {"sleep": IngestionResult.coerce(self.data_247.save_sleep(db, user_id, start, end))}
+                    components = {"sleep": WriteCounts.coerce(self.data_247.save_sleep(db, user_id, start, end))}
                 elif domain == "activity_workouts":
                     # appli 16 covers both daily activity and workouts.
                     components = {
-                        "activity": IngestionResult.coerce(self.data_247.save_activity(db, user_id, start, end)),
-                        "workouts": IngestionResult.coerce(
+                        "activity": WriteCounts.coerce(self.data_247.save_activity(db, user_id, start, end)),
+                        "workouts": WriteCounts.coerce(
                             self.workouts.load_data(
                                 db,
                                 user_id,

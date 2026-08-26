@@ -37,8 +37,9 @@ Each provider declares its data delivery modes via `ProviderCapabilities`:
 | `webhook_callback` | Provider-initiates async export delivered to our webhook | Garmin backfill |
 | `webhook_stream` | Provider pushes full data payload in every webhook | Garmin, Suunto |
 | `webhook_ping` | Provider sends a lightweight notification; actual data must be fetched via REST | Oura, Strava, Fitbit, Polar, Withings |
-| `webhook_subscription_owner` | Who owns the provider's webhook subscriptions: `APPLICATION` for one app-level registration covering every user, `USER` for one subscription per connection created with that user's own bearer token. `None` (the default) means they cannot be registered programmatically and must be configured by hand in the provider's developer portal. | `APPLICATION`: Oura, Polar, Strava, Google. `USER`: Withings |
-| `webhook_inbound_secret` | Provider signs inbound payloads with a secret returned by the registration call. Requires `webhook_subscription_owner` to be set. | Polar |
+| `webhook_registration_api` | Provider exposes an API to programmatically register webhook subscriptions. When `False`, subscriptions must be configured manually in the provider's developer portal. | Oura, Polar, Strava, Google, Withings |
+| `webhook_subscription_per_user` | Subscriptions are created with each connection's own bearer token, so one exists per active connection instead of a single app-level registration. Requires `webhook_registration_api=True`. | Withings |
+| `webhook_inbound_secret` | Provider signs inbound payloads with a secret returned by the registration call. Requires `webhook_registration_api=True`. | Polar |
 
 <Note>
 `webhook_stream` and `webhook_ping` are mutually exclusive. Use `webhook_stream` when the provider embeds the complete record in the webhook body (Garmin, Suunto). Use `webhook_ping` when the webhook is only a trigger and you must call the REST API to retrieve the actual data (Oura, Strava, Fitbit, Polar, Withings).
@@ -776,7 +777,7 @@ Some providers expose an API to register webhook subscriptions programmatically 
 
 To enable this:
 
-1. Set `webhook_subscription_owner=WebhookSubscriptionOwner.APPLICATION` in your strategy's `ProviderCapabilities`.
+1. Set `webhook_registration_api=True` in your strategy's `ProviderCapabilities`.
 2. Implement `register_subscriptions(callback_url)` on your provider's `BaseWebhookService` and assign it to `self.webhook_service` in the strategy. It should be idempotent — skip existing subscriptions, create missing ones.
 
 ```python
@@ -790,19 +791,21 @@ class MyProviderStrategy(BaseProviderStrategy):
         return ProviderCapabilities(
             rest_pull=True,
             webhook_ping=True,
-            webhook_subscription_owner=WebhookSubscriptionOwner.APPLICATION,
+            webhook_registration_api=True,
         )
 ```
 
-When an admin switches the sync mode to `webhook` via `PUT /api/v1/oauth/providers/{provider}`, the platform dispatches `register_provider_webhooks`. For application-scoped providers, the task calls `strategy.webhook_service.register_subscriptions(callback_url)` in the background. The callback URL is derived from `API_BASE_URL`: `{API_BASE_URL}/api/v1/providers/{provider}/webhooks`.
+When an admin switches the sync mode to `webhook` via `PUT /api/v1/oauth/providers/{provider}`, the platform automatically dispatches a Celery task (`register_provider_webhooks`) that calls `strategy.webhook_service.register_subscriptions(callback_url)` in the background. The callback URL is derived from `API_BASE_URL`: `{API_BASE_URL}/api/v1/providers/{provider}/webhooks`.
 
 <Note>
-If `webhook_subscription_owner` is unset (the default), switching sync mode to `webhook` only updates the database — you must register subscriptions manually in the provider's developer portal pointing to `{API_BASE_URL}/api/v1/providers/{provider}/webhooks`.
+If `webhook_registration_api=False` (the default), switching sync mode to `webhook` only updates the database — you must register subscriptions manually in the provider's developer portal pointing to `{API_BASE_URL}/api/v1/providers/{provider}/webhooks`.
 </Note>
 
 #### Per-user subscriptions
 
-Some providers create subscriptions with each user's own bearer token rather than one app-level registration (e.g. Withings). For these, set `webhook_subscription_owner=WebhookSubscriptionOwner.USER` instead of `APPLICATION`, and implement `sync_user(db, user_id, mode)` (and optionally `remove_user`) on your `BaseWebhookService` rather than `register_subscriptions`. The platform fans this out per active connection — on connect, on a live-sync mode toggle, and on a daily reconciliation sweep — instead of calling it once for the whole application.
+Some providers create subscriptions with each user's own bearer token rather than one app-level registration (e.g. Withings). For these, also set `webhook_subscription_per_user=True`, and make `register_subscriptions(callback_url)` dispatch one `sync_provider_user_subscription` task per active connection instead of registering anything itself. Implement `reconcile_user_subscriptions(db, user_id)` on your `BaseWebhookService` — that is what the per-user task calls, and it should reconcile against the provider's currently configured live-sync mode.
+
+Because each connection holds its own subscription, `register_provider_webhooks` is dispatched on *any* live-sync mode change for these providers, not only on the switch to `webhook`, so that switching back to `pull` revokes them. Override `BaseProviderStrategy.on_disconnect` to tear a user's subscriptions down while their tokens are still valid; disconnect, data purge and account deletion all call it.
 
 ---
 
@@ -845,8 +848,8 @@ Use this checklist to ensure you've completed all steps:
 - [ ] Verified data in database
 - [ ] Tested webhook delivery at `POST /api/v1/providers/{provider}/webhooks` (if applicable)
 - [ ] Tested subscription verification at `GET /api/v1/providers/{provider}/webhooks` (if applicable)
-- [ ] If `webhook_subscription_owner=APPLICATION`: wired `webhook_service` on the strategy and implemented `register_subscriptions()` on it, and verified auto-registration fires on sync mode switch
-- [ ] If `webhook_subscription_owner=USER`: implemented `BaseWebhookService.sync_user()`/`remove_user()` and verified the fan-out reconciles one subscription per active connection
+- [ ] If `webhook_registration_api=True`: wired `webhook_service` on the strategy and implemented `register_subscriptions()` on it, and verified auto-registration fires on sync mode switch
+- [ ] If `webhook_subscription_per_user=True`: implemented `BaseWebhookService.reconcile_user_subscriptions()`, overrode `on_disconnect`, and verified the fan-out reconciles one subscription per active connection
 - [ ] Added error handling and logging
 - [ ] Updated API documentation
 

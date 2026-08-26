@@ -480,38 +480,27 @@ class TestDisconnectEndpoint:
 class TestDeleteProviderDataEndpoint:
     """Test suite for DELETE /api/v1/users/{user_id}/connections/{provider}/data."""
 
-    def test_delete_data_forwards_capability_gated_webhook_service(self) -> None:
-        """Whatever the strategy resolves per_user_webhook_service to is forwarded as-is.
+    def test_delete_data_runs_provider_teardown_before_purging(self) -> None:
+        """Teardown runs while the connection's tokens are still valid.
 
-        The gating logic itself (USER-owned vs not) is covered on BaseProviderStrategy
-        directly in tests/providers/test_base_strategy.py.
+        What a provider does in ``on_disconnect`` is its own concern; the default is
+        a no-op, covered in tests/providers/test_base_strategy.py.
         """
         db = MagicMock(spec=Session)
         user_id = uuid4()
+        strategy = MagicMock()
 
-        for provider, per_user_webhook_service in (
-            (ProviderName.WITHINGS, MagicMock()),
-            (ProviderName.APPLE, None),
+        with (
+            patch("app.api.routes.v1.connections.ProviderFactory") as provider_factory,
+            patch("app.api.routes.v1.connections.user_connection_service.purge_provider_data") as purge,
         ):
-            strategy = MagicMock()
-            strategy.per_user_webhook_service = per_user_webhook_service
+            provider_factory.return_value.get_provider.return_value = strategy
 
-            with (
-                patch("app.api.routes.v1.connections.ProviderFactory") as provider_factory,
-                patch("app.api.routes.v1.connections.user_connection_service.purge_provider_data") as purge,
-            ):
-                provider_factory.return_value.get_provider.return_value = strategy
+            response = delete_provider_data_endpoint(user_id, ProviderName.WITHINGS, db, MagicMock())
 
-                response = delete_provider_data_endpoint(user_id, provider, db, MagicMock())
-
-            assert response.status_code == 204
-            purge.assert_called_once_with(
-                db,
-                user_id,
-                provider.value,
-                oauth=strategy.oauth,
-                webhook_service=per_user_webhook_service,
-            )
+        assert response.status_code == 204
+        strategy.on_disconnect.assert_called_once_with(db, user_id)
+        purge.assert_called_once_with(db, user_id, ProviderName.WITHINGS.value, oauth=strategy.oauth)
 
     def _seed_provider_data(self, user: User, provider: str) -> DataSource:
         """Create a data_source with a workout (+details), a time series and a health score."""

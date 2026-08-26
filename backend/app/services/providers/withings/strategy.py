@@ -1,9 +1,7 @@
-from app.services.providers.base_strategy import (
-    BaseProviderStrategy,
-    ProviderCapabilities,
-    ProviderCoverage,
-    WebhookSubscriptionOwner,
-)
+from uuid import UUID
+
+from app.database import DbSession
+from app.services.providers.base_strategy import BaseProviderStrategy, ProviderCapabilities, ProviderCoverage
 from app.services.providers.withings.coverage import HEALTH_SCORES, SLEEP_FIELDS, TIMESERIES, WORKOUT_FIELDS
 from app.services.providers.withings.data_247 import Withings247Data
 from app.services.providers.withings.notify_service import WithingsNotifyService
@@ -13,6 +11,9 @@ from app.services.providers.withings.workouts import WithingsWorkouts
 
 
 class WithingsStrategy(BaseProviderStrategy):
+    # Narrowed from the base's optional: Withings always manages its own subscriptions.
+    webhook_service: WithingsNotifyService
+
     def __init__(self) -> None:
         super().__init__()
         self.oauth = WithingsOAuth(
@@ -41,6 +42,7 @@ class WithingsStrategy(BaseProviderStrategy):
         self.webhook_service = WithingsNotifyService(
             connection_repo=self.connection_repo,
             oauth=self.oauth,
+            default_live_sync_mode=self.default_live_sync_mode,
         )
 
     @property
@@ -56,8 +58,13 @@ class WithingsStrategy(BaseProviderStrategy):
         return ProviderCapabilities(
             rest_pull=True,
             webhook_ping=True,
-            webhook_subscription_owner=WebhookSubscriptionOwner.USER,
+            webhook_registration_api=True,
+            webhook_subscription_per_user=True,
         )
+
+    def on_disconnect(self, db: DbSession, user_id: UUID) -> None:
+        """Revoke this user's notify subscriptions before their tokens are cleared."""
+        self.webhook_service.remove_user(db, user_id)
 
     @property
     def coverage(self) -> ProviderCoverage:

@@ -8,23 +8,24 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
+from app.config import settings
 from app.constants.workout_types.withings import OFFICIAL_WITHINGS_CATEGORY_IDS, get_unified_workout_type
 from app.database import DbSession
+from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate
 from app.schemas.providers.withings import WithingsWorkout
 from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.providers.withings._client import paginate
 from app.services.providers.withings.data_requests import WORKOUTS
-from app.services.providers.withings.results import IngestionResult
 from app.services.providers.withings.timezone import zone_offset_at
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
 
-# Keep both required date bounds and avoid an unbounded history fetch.
-_DEFAULT_LOOKBACK_DAYS = 30
+# getworkouts requires both bounds; used only when PULL_SYNC_LOOKBACK is unset.
+_FALLBACK_LOOKBACK = timedelta(days=30)
 
 
 class WithingsWorkouts(BaseWorkoutsTemplate):
@@ -40,10 +41,10 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
         # Accept Withings-native ymd keys or the generic ISO keys the sync task emits.
         start_ymd = kwargs.get("startdateymd") or self._to_ymd(kwargs.get("start_date"))
         end_ymd = kwargs.get("enddateymd") or self._to_ymd(kwargs.get("end_date"))
-        # Missing or invalid bounds fall back to a bounded window.
+        # Missing or invalid bounds fall back to the configured trailing pull window.
         now = datetime.now(timezone.utc)
         if start_ymd is None:
-            start_ymd = (now - timedelta(days=_DEFAULT_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+            start_ymd = (now - (settings.pull_sync_lookback or _FALLBACK_LOOKBACK)).strftime("%Y-%m-%d")
         if end_ymd is None:
             end_ymd = now.strftime("%Y-%m-%d")
         # getworkouts keys on the user's local day while every caller's window is
@@ -145,7 +146,7 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
         )
         return record, detail
 
-    def load_data(self, db: DbSession, user_id: UUID, **kwargs: Any) -> int:
+    def load_data(self, db: DbSession, user_id: UUID, **kwargs: Any) -> WriteCounts:
         connection = self.connection_repo.get_active_connection(db, user_id, self.provider_name)
         user_connection_id = connection.id if connection is not None and isinstance(connection.id, UUID) else None
         raw_workouts = self.get_workouts_from_api(db, user_id, **kwargs)
@@ -223,4 +224,4 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
                 )
                 failed += 1
                 continue
-        return IngestionResult(processed, skipped=skipped, failed=failed)
+        return WriteCounts.unsplit(processed, skipped=skipped, failed=failed)

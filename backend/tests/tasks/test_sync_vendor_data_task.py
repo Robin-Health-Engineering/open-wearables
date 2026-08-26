@@ -17,9 +17,8 @@ from tests.factories import ProviderSettingFactory, UserConnectionFactory, UserF
 def _strategy_mock(*, rest_pull: bool = True, live_sync_mode: LiveSyncMode | None = LiveSyncMode.PULL) -> MagicMock:
     """A strategy mock carrying the fields the periodic-pull filter reads.
 
-    ``default_live_sync_mode`` has to hold a real value: the filter resolves it through
-    ``resolve_live_sync_mode``, so a bare MagicMock would fail the enum coercion in a way
-    no actual strategy can.
+    ``default_live_sync_mode`` has to hold a real value: a bare MagicMock is truthy, so
+    it would shadow the configured mode the filter is meant to read.
     """
     strategy = MagicMock()
     strategy.capabilities.rest_pull = rest_pull

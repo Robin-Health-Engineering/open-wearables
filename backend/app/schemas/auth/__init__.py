@@ -6,7 +6,6 @@ from .connection_status import (
 )
 from .live_sync_mode import (
     LiveSyncMode,
-    resolve_live_sync_mode,
 )
 from .sdk_auth import (
     SDKAuthContext,
@@ -30,7 +29,6 @@ __all__ = [
     "ConnectionStatus",
     # Live sync mode
     "LiveSyncMode",
-    "resolve_live_sync_mode",
     # Authentication method
     "AuthenticationMethod",
 ]

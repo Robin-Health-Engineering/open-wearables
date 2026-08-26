@@ -1,9 +1,4 @@
-from app.services.providers.base_strategy import (
-    BaseProviderStrategy,
-    ProviderCapabilities,
-    ProviderCoverage,
-    WebhookSubscriptionOwner,
-)
+from app.services.providers.base_strategy import BaseProviderStrategy, ProviderCapabilities, ProviderCoverage
 from app.services.providers.google.coverage import HEALTH_SCORES, SLEEP_FIELDS, TIMESERIES, WORKOUT_FIELDS
 from app.services.providers.google.health_api.data_247 import GoogleHealth247Data
 from app.services.providers.google.health_api.oauth import GoogleOAuth
@@ -60,7 +55,7 @@ class GoogleStrategy(BaseProviderStrategy):
             client_sdk=True,
             rest_pull=True,
             webhook_ping=True,
-            webhook_subscription_owner=WebhookSubscriptionOwner.APPLICATION,
+            webhook_registration_api=True,
         )
 
     @property

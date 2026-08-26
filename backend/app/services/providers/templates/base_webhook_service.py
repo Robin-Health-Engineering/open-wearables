@@ -4,7 +4,6 @@ from typing import Any
 from uuid import UUID
 
 from app.database import DbSession
-from app.schemas.auth import LiveSyncMode
 
 
 class BaseWebhookService:
@@ -33,15 +32,10 @@ class BaseWebhookService:
     async def update_subscription(self, subscription_id: str, callback_url: str) -> Any:
         raise NotImplementedError("This provider does not support updating a webhook subscription")
 
-    def sync_user(self, db: DbSession, user_id: UUID, mode: LiveSyncMode) -> list[dict[str, Any]]:
-        """Reconcile subscriptions owned by one connected provider user."""
-        raise NotImplementedError("This provider does not support per-user webhook subscription management")
+    def reconcile_user_subscriptions(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
+        """Reconcile one user's subscriptions against the provider's current live-sync mode.
 
-    def remove_user(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
-        """Tear down a user's subscriptions, e.g. on disconnect or account deletion.
-
-        Defaults to reconciling toward PULL (no subscriptions desired), which is
-        correct for any provider whose `sync_user` already prunes to the desired
-        set. Override only if teardown needs to differ from a PULL-mode sync.
+        Only implemented by providers declaring ``webhook_subscription_per_user``;
+        it is the entry point of the ``sync_provider_user_subscription`` task.
         """
-        return self.sync_user(db, user_id, LiveSyncMode.PULL)
+        raise NotImplementedError("This provider does not support per-user webhook subscription management")

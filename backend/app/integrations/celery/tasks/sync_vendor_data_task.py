@@ -10,7 +10,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.auth import LiveSyncMode, resolve_live_sync_mode
+from app.schemas.auth import LiveSyncMode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
 from app.services.providers.factory import ProviderFactory
@@ -159,10 +159,8 @@ def sync_vendor_data(
                 for c in connections
                 if _include_in_periodic_pull(
                     strategies[c.provider].capabilities,
-                    resolve_live_sync_mode(
-                        provider_settings[c.provider].live_sync_mode if c.provider in provider_settings else None,
-                        strategies[c.provider].default_live_sync_mode,
-                    ),
+                    (provider_settings[c.provider].live_sync_mode if c.provider in provider_settings else None)
+                    or strategies[c.provider].default_live_sync_mode,
                     is_historical,
                 )
             ]

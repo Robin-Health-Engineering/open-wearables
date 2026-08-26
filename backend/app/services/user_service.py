@@ -16,7 +16,6 @@ from app.schemas.model_crud.user_management import (
     UserUpdateInternal,
 )
 from app.schemas.utils import OldPaginatedResponse
-from app.services.providers.base_strategy import WebhookSubscriptionOwner
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.garmin.backfill_state import force_release_backfill_lock
 from app.services.services import AppService
@@ -76,20 +75,11 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
                 continue
             try:
                 strategy = provider_factory.get_provider(connection.provider)
+                # Teardown first: revoking the grant below invalidates the token that
+                # provider-side cleanup needs.
+                strategy.on_disconnect(db_session, user.id)
                 if oauth := strategy.oauth:
                     oauth.deregister_user(connection.access_token, provider_user_id=connection.provider_user_id)
-                # Subscriptions belong to the provider account, so a sibling profile still
-                # linked to it keeps them; the grant above is this user's own and always goes.
-                if (
-                    strategy.capabilities.webhook_subscription_owner == WebhookSubscriptionOwner.USER
-                    and strategy.webhook_service
-                    and user_connection_service.is_last_active_provider_link(
-                        db_session,
-                        user.id,
-                        connection.provider,
-                    )
-                ):
-                    strategy.webhook_service.remove_user(db_session, user.id)
             except Exception as e:
                 log_structured(
                     self.logger,

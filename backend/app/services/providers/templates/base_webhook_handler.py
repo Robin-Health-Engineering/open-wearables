@@ -62,8 +62,6 @@ class BaseWebhookHandler(ABC):
     ------------------
     * ``handle_challenge`` – GET-based subscription verification (Strava
       ``hub.challenge``, Oura ``verification_token``).  Defaults to 501.
-    * ``handle_probe`` – HEAD reachability probe sent while registering a
-      callback URL. Defaults to 501.
     * ``handle`` – the full pipeline orchestrator; override only when the
       standard *verify → parse → dispatch* sequence is insufficient.
     """
@@ -245,13 +243,6 @@ class BaseWebhookHandler(ABC):
         raise HTTPException(
             status_code=501,
             detail=f"Provider '{self.provider_name}' does not support webhook subscription verification via GET.",
-        )
-
-    def handle_probe(self, request: Request) -> None:
-        """Handle a HEAD reachability probe; raise HTTP 501 by default."""
-        raise HTTPException(
-            status_code=501,
-            detail=f"Provider '{self.provider_name}' does not support webhook reachability probes.",
         )
 
     # ------------------------------------------------------------------

@@ -9,7 +9,6 @@ from celery import current_app as current_celery_app
 from celery.schedules import crontab
 
 from app.config import settings
-from app.integrations.celery.tasks.register_provider_webhooks_task import REGISTER_PROVIDER_WEBHOOKS_TASK
 from app.services import raw_payload_storage
 
 _WEBHOOK_TASK = "emit_webhook_event_task.emit_webhook_event"
@@ -175,12 +174,6 @@ def create_celery() -> Celery:
             "schedule": crontab(day_of_month=1, hour=0, minute=0),  # 1st of each month at 00:00 UTC
             "args": (),
             "kwargs": {},
-        },
-        "reconcile-withings-subscriptions-daily": {
-            "task": REGISTER_PROVIDER_WEBHOOKS_TASK,
-            "schedule": crontab(hour=4, minute=0),
-            "args": ("withings",),
-            "kwargs": {"webhook_mode_only": True},
         },
     }
 
