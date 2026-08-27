@@ -377,7 +377,7 @@ _CATEGORY_RANGES: list[tuple[range, str]] = [
     (range(160, 180), "Activity - Swimming"),
     (range(180, 200), "Activity - Generic"),
     (range(200, 220), "Environmental"),
-    (range(220, 240), "Provider-Specific"),
+    (range(220, 260), "Provider-Specific"),  # 220-239 Garmin, 240-259 Withings
     (range(500, 600), "Other"),
 ]
 

@@ -36,13 +36,13 @@ Each provider declares its data delivery modes via `ProviderCapabilities`:
 | `file_import` | File-based data import | Apple Health |
 | `webhook_callback` | Provider-initiates async export delivered to our webhook | Garmin backfill |
 | `webhook_stream` | Provider pushes full data payload in every webhook | Garmin, Suunto |
-| `webhook_ping` | Provider sends a lightweight notification; actual data must be fetched via REST | Oura, Strava, Fitbit, Polar, Withings |
+| `webhook_ping` | Provider sends a lightweight notification; actual data must be fetched via REST | Oura, Strava, Polar, Google, Whoop, Withings |
 | `webhook_registration_api` | Provider exposes an API to programmatically register webhook subscriptions. When `False`, subscriptions must be configured manually in the provider's developer portal. | Oura, Polar, Strava, Google, Withings |
 | `webhook_subscription_per_user` | Subscriptions are created with each connection's own bearer token, so one exists per active connection instead of a single app-level registration. Requires `webhook_registration_api=True`. | Withings |
 | `webhook_inbound_secret` | Provider signs inbound payloads with a secret returned by the registration call. Requires `webhook_registration_api=True`. | Polar |
 
 <Note>
-`webhook_stream` and `webhook_ping` are mutually exclusive. Use `webhook_stream` when the provider embeds the complete record in the webhook body (Garmin, Suunto). Use `webhook_ping` when the webhook is only a trigger and you must call the REST API to retrieve the actual data (Oura, Strava, Fitbit, Polar, Withings).
+`webhook_stream` and `webhook_ping` are mutually exclusive. Use `webhook_stream` when the provider embeds the complete record in the webhook body (Garmin, Suunto). Use `webhook_ping` when the webhook is only a trigger and you must call the REST API to retrieve the actual data (Oura, Strava, Polar, Google, Whoop, Withings).
 </Note>
 
 <img src="/images/providers/custom-providers-architecture.png" alt="Custom providers architecture showing Strategy, OAuth, Workouts, 247 Data, and Webhook Handler components" />
@@ -781,6 +781,33 @@ To enable this:
 2. Implement `register_subscriptions(callback_url)` on your provider's `BaseWebhookService` and assign it to `self.webhook_service` in the strategy. It should be idempotent — skip existing subscriptions, create missing ones.
 
 ```python
+class MyProviderWebhookService(BaseWebhookService):
+    async def register_subscriptions(self, callback_url: str) -> list[dict[str, Any]]:
+        """Create any missing subscriptions; skip the ones already registered.
+
+        Each result's ``status`` is counted by the task: ``created``, ``skipped``
+        or ``error``. Never raise for a single failed event type — report it and
+        let the other types through.
+        """
+        existing = await self._list_subscriptions()
+        results: list[dict[str, Any]] = []
+        for event_type in DESIRED_EVENT_TYPES:
+            if event_type in existing:
+                results.append({"event_type": event_type, "status": "skipped"})
+                continue
+            try:
+                await self._create_subscription(event_type, callback_url)
+                results.append({"event_type": event_type, "status": "created"})
+            except Exception as e:
+                logger.exception("Subscription failed", extra={"event_type": event_type})
+                results.append({"event_type": event_type, "status": "error", "error": str(e)})
+        return results
+
+
+# One app-level registration serves every user, so a module singleton is enough.
+my_provider_webhook_service = MyProviderWebhookService()
+
+
 class MyProviderStrategy(BaseProviderStrategy):
     def __init__(self) -> None:
         super().__init__()
@@ -806,6 +833,77 @@ If `webhook_registration_api=False` (the default), switching sync mode to `webho
 Some providers create subscriptions with each user's own bearer token rather than one app-level registration (e.g. Withings). For these, also set `webhook_subscription_per_user=True`, and make `register_subscriptions(callback_url)` dispatch one `sync_provider_user_subscription` task per active connection instead of registering anything itself. Implement `reconcile_user_subscriptions(db, user_id)` on your `BaseWebhookService` — that is what the per-user task calls, and it should reconcile against the provider's currently configured live-sync mode.
 
 Because each connection holds its own subscription, `register_provider_webhooks` is dispatched on *any* live-sync mode change for these providers, not only on the switch to `webhook`, so that switching back to `pull` revokes them. Override `BaseProviderStrategy.on_disconnect` to tear a user's subscriptions down while their tokens are still valid; disconnect, data purge and account deletion all call it.
+
+```python
+class MyProviderWebhookService(BaseWebhookService):
+    """``BaseWebhookService`` holds no state, so a per-user service brings its own repos."""
+
+    def __init__(self, connection_repo: UserConnectionRepository, oauth: BaseOAuthTemplate) -> None:
+        self.connection_repo = connection_repo
+        self.oauth = oauth
+        self.provider_settings_repo = ProviderSettingsRepository()
+
+    async def register_subscriptions(self, callback_url: str) -> list[dict[str, Any]]:
+        """Fan out instead of registering: one task per active connection.
+
+        ``callback_url`` is unused here — each per-user task builds its own.
+        """
+        with SessionLocal() as db:
+            connections = self.connection_repo.get_all_active_by_provider(db, "myprovider")
+        results: list[dict[str, Any]] = []
+        for connection in connections:
+            user_id = str(connection.user_id)
+            try:
+                celery_app.send_task(
+                    SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
+                    args=["myprovider", user_id],
+                    queue="webhook_sync",
+                )
+                results.append({"status": "dispatched", "user_id": user_id})
+            except Exception as e:
+                results.append({"status": "error", "user_id": user_id, "error": str(e)})
+        return results
+
+    def reconcile_user_subscriptions(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
+        """The per-user task's entry point: reconcile against the configured mode."""
+        mode = self.provider_settings_repo.get_live_sync_mode(db, "myprovider") or LiveSyncMode.PULL
+        return self._reconcile(db, user_id, mode)
+
+    def remove_user(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
+        """Provider-local teardown, called from ``on_disconnect``.
+
+        Not part of ``BaseWebhookService`` — reconciling toward PULL means
+        "no subscriptions desired", which prunes exactly this user's set.
+        """
+        return self._reconcile(db, user_id, LiveSyncMode.PULL)
+
+    def _reconcile(self, db: DbSession, user_id: UUID, mode: LiveSyncMode) -> list[dict[str, Any]]:
+        """Each entry's ``status`` drives the task's retry policy.
+
+        ``error`` retries with the failures attached, and ``deferred`` (with a
+        ``retry_after`` in seconds) backs off on the provider's own schedule
+        instead of the flat default. Anything else counts as success, so return
+        ``skipped`` for what retrying cannot fix — an unusable callback URL, or
+        a revoked grant.
+        """
+        desired = DESIRED_EVENT_TYPES if mode == LiveSyncMode.WEBHOOK else set()
+        try:
+            existing = self._list_subscriptions(db, user_id)
+        except RateLimited as e:
+            return [{"status": "deferred", "reason": "rate_limited", "retry_after": e.retry_after}]
+        except InvalidGrant:
+            return [{"status": "skipped", "reason": "invalid_grant"}]
+        return [
+            *(self._subscribe(db, user_id, t) for t in desired - existing),
+            *(self._revoke(db, user_id, t) for t in existing - desired),
+        ]
+
+
+class MyProviderStrategy(BaseProviderStrategy):
+    def on_disconnect(self, db: DbSession, user_id: UUID) -> None:
+        """Revoke this user's subscriptions before their tokens are cleared."""
+        self.webhook_service.remove_user(db, user_id)
+```
 
 ---
 

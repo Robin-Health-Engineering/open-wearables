@@ -88,7 +88,10 @@ class WithingsWebhookHandler(BaseWebhookHandler):
     def _has_valid_callback_token(request: Request) -> bool:
         expected = settings.withings_webhook_token
         actual = request.query_params.get("token")
-        return bool(expected is not None and actual and compare_digest(actual, expected.get_secret_value()))
+        if expected is None or not actual:
+            return False
+        # compare_digest raises TypeError on non-ASCII str; the token is caller-supplied.
+        return compare_digest(actual.encode("utf-8"), expected.get_secret_value().encode("utf-8"))
 
     def verify_signature(self, request: Request, body: bytes) -> bool:
         """Verify the callback token and require a userid-bearing notify body."""

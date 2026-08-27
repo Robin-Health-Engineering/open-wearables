@@ -77,7 +77,9 @@ def test_verify_signature_rejects_missing_userid() -> None:
         assert h.verify_signature(_request(), b"appli=1") is False
 
 
-@pytest.mark.parametrize("token", [None, "wrong-token"])
+# "tokén": compare_digest raises TypeError on non-ASCII str, and the token is
+# caller-supplied — a bare 500 on every POST and HEAD would be one request away.
+@pytest.mark.parametrize("token", [None, "", "wrong-token", "tokén"])
 def test_verify_signature_rejects_invalid_callback_token(token: str | None) -> None:
     with patch.object(settings, "withings_webhook_token", SecretStr(_CALLBACK_TOKEN)):
         assert _handler().verify_signature(_request(token), b"userid=123&appli=1&startdate=1&enddate=2") is False
