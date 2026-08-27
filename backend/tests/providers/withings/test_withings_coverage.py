@@ -1,4 +1,5 @@
 from app.schemas.enums import SeriesType
+from app.schemas.enums.series_types import SERIES_TYPE_CATEGORY_BY_ENUM
 from app.services.providers.withings.coverage import DEFERRED_MEASURE_TYPES, MEASURE_TYPE_MAP, TIMESERIES
 
 
@@ -41,3 +42,10 @@ def test_deferred_getmeas_types_are_recorded_and_never_mapped() -> None:
 def test_all_mapped_getmeas_series_are_declared_timeseries_coverage() -> None:
     assert set(MEASURE_TYPE_MAP.values()).issubset(TIMESERIES)
     assert SeriesType.basal_energy in TIMESERIES
+
+
+def test_withings_series_use_their_canonical_categories() -> None:
+    assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.body_water_mass] == "Body Composition"
+    assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.bone_mass] == "Body Composition"
+    assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.withings_pulse_wave_velocity] == "Provider-Specific"
+    assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.withings_metabolic_age] == "Provider-Specific"
