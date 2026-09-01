@@ -190,6 +190,7 @@ class Withings247Data(Base247DataTemplate):
         user_connection_id: UUID | None = None,
     ) -> list[TimeSeriesSampleCreate]:
         samples: list[TimeSeriesSampleCreate] = []
+        external_rows = 0
         for row in rows:
             # Tolerate a malformed row without dropping the rest of the batch.
             try:
@@ -208,7 +209,7 @@ class Withings247Data(Base247DataTemplate):
             # Withings documents brand=18 as external and brand=1 as Withings.
             # deviceid is only an identifier and may be absent on valid rows.
             if activity.brand == 18:
-                logger.debug("Skipping externally sourced Withings activity for %s", activity.date)
+                external_rows += 1
                 continue
             day = local_day_start(
                 activity.date,
@@ -257,6 +258,18 @@ class Withings247Data(Base247DataTemplate):
                             is_daily_total=daily_total_flag(SeriesType.basal_energy, is_daily=True),
                         )
                     )
+        if external_rows:
+            # Echo suppression is otherwise invisible: skipped rows are absent from
+            # the returned counts, so this is the only trace of an empty sync.
+            log_structured(
+                logger,
+                "debug",
+                "Skipped externally sourced Withings activity rows",
+                provider=self.provider_name,
+                action="activity_external_source_skipped",
+                user_id=str(user_id),
+                skipped_rows=external_rows,
+            )
         return samples
 
     @staticmethod
