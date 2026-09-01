@@ -57,7 +57,16 @@ def claim_fetch(
     except Exception:
         try:
             get_redis_client().delete(key)
-        except RedisError:
+        except RedisError as exc:
             # The claim expires on its own; losing the release only delays the retry.
-            logger.warning("Withings webhook dedup claim could not be released", exc_info=True)
+            # The original exception is re-raised below and reported there, so this
+            # secondary failure is logged without a second Sentry event.
+            log_structured(
+                logger,
+                "warning",
+                "Withings webhook dedup claim could not be released",
+                provider="withings",
+                action="webhook_dedup_release_failed",
+                error=type(exc).__name__,
+            )
         raise
