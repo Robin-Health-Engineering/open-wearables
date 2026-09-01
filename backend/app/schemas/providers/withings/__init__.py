@@ -7,13 +7,14 @@ from app.schemas.providers.withings.imports import (
     WithingsWorkout,
     WithingsWorkoutData,
 )
-from app.schemas.providers.withings.notification import WithingsNotification
+from app.schemas.providers.withings.notification import WithingsNotification, WithingsNotifyProfile
 
 __all__ = [
     "WithingsActivity",
     "WithingsMeasure",
     "WithingsMeasureGroup",
     "WithingsNotification",
+    "WithingsNotifyProfile",
     "WithingsSleepData",
     "WithingsSleepSummary",
     "WithingsWorkout",

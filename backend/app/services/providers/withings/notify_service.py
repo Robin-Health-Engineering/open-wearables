@@ -11,13 +11,14 @@ from typing import Any
 from uuid import UUID
 
 from celery import current_app as celery_app
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from app.database import DbSession, SessionLocal
 from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import LiveSyncMode
+from app.schemas.providers.withings import WithingsNotifyProfile
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.templates.base_webhook_service import BaseWebhookService
 from app.services.providers.withings._client import withings_request
@@ -37,14 +38,6 @@ from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
-
-
-class WithingsNotifyProfile(BaseModel):
-    """One profile returned by Withings Notify List."""
-
-    appli: int
-    callbackurl: str
-    comment: str | None = None
 
 
 class WithingsNotifyService(BaseWebhookService):

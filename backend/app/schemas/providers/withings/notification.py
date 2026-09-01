@@ -48,3 +48,11 @@ class WithingsNotification(BaseModel):
             return datetime.fromtimestamp(int(value), tz=timezone.utc)
         except (ValueError, TypeError, OSError, OverflowError):
             return None
+
+
+class WithingsNotifyProfile(BaseModel):
+    """One profile returned by Withings Notify List."""
+
+    appli: int
+    callbackurl: str
+    comment: str | None = None
