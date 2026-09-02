@@ -18,8 +18,10 @@ from app.schemas.model_crud.credentials import (
     ProviderEndpoints,
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.withings._client import WITHINGS_API_BASE_URL
 from app.services.providers.withings.refresh_lock import single_flight_refresh
 from app.services.providers.withings.request_budget import acquire_request_slot
+from app.services.providers.withings.signature import sign_payload
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -180,10 +182,29 @@ class WithingsOAuth(BaseOAuthTemplate):
         )
         return token_response
 
+    def _authenticate_payload(self, payload: dict[str, str]) -> dict[str, str]:
+        """Apply the configured token-auth scheme.
+
+        In "signature" mode the client secret never leaves our process: it keys an HMAC
+        over a freshly fetched nonce. In "secret" mode the payload is passed through with
+        client_secret in the body, which is what the upstream branch did.
+        """
+        if settings.withings_auth_mode != "signature":
+            return payload
+        client_id = self.credentials.client_id
+        client_secret = self.credentials.client_secret
+        if not client_id or not client_secret:
+            raise HTTPException(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Withings credentials are not configured",
+            )
+        return sign_payload(payload, client_id, client_secret, api_base_url=WITHINGS_API_BASE_URL)
+
     def _request_token(
         self, payload: dict[str, str], *, task: str, max_wait_seconds: float | None = None
     ) -> OAuthTokenResponse:
         """POST a token request and unwrap the Withings ``{status, body}`` envelope."""
+        payload = self._authenticate_payload(payload)
         if max_wait_seconds is not None:
             acquire_request_slot(max_wait_seconds=max_wait_seconds)
         else:
