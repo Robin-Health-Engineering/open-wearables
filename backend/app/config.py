@@ -221,8 +221,19 @@ class Settings(BaseSettings):
     withings_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     withings_webhook_token: SecretStr | None = None
     withings_api_requests_per_minute: int = Field(120, ge=1)
-    # user.sleepevents gates unused bed events; sleep summaries and appli 44 use user.activity.
-    withings_default_scope: str = "user.info,user.metrics,user.activity"
+    # "signature" = nonce + HMAC-SHA256, the scheme Withings' current docs describe and the
+    # one verified against our credentials on 2026-09-02. "secret" = the older
+    # client_secret-in-body form. Kept switchable because Withings never confirmed in
+    # writing whether the legacy form is still accepted for our app, and flipping back
+    # must not need a code change. Phase 2's createuser requires "signature" regardless.
+    withings_auth_mode: Literal["signature", "secret"] = "signature"
+    # user.sleepevents is requested even though nothing consumes bed events (appli 50/51/52)
+    # yet: sleep summaries and appli 44 need only user.activity. It is here because OAuth
+    # scope is fixed at AUTHORIZATION time - adding it later would force every already
+    # connected member to re-authorize, which for a dropshipped device means asking people
+    # to redo a setup they completed months earlier. Cheap now, expensive later.
+    # (Divergence from upstream, which omits it deliberately - keep it on any rebase.)
+    withings_default_scope: str = "user.info,user.metrics,user.activity,user.sleepevents"
 
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None
