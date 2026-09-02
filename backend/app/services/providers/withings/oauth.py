@@ -1,6 +1,7 @@
 """Handle Withings OAuth token RPC envelopes and provider user identity."""
 
 import logging
+from datetime import UTC, datetime
 from uuid import UUID
 
 import httpx
@@ -17,6 +18,7 @@ from app.schemas.model_crud.credentials import (
     ProviderEndpoints,
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.withings.refresh_lock import single_flight_refresh
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.utils.structured_logging import log_structured
 
@@ -97,7 +99,53 @@ class WithingsOAuth(BaseOAuthTemplate):
         }
         return self._request_token(payload, task="exchange_token", max_wait_seconds=_EXCHANGE_MAX_WAIT_SECONDS)
 
+    def _already_rotated(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse | None:
+        """Return another worker's freshly rotated token, if there is one.
+
+        Withings invalidates ``refresh_token`` the moment a rotation happens, so a stored
+        refresh token that differs from the one we were handed is proof that somebody
+        else has already refreshed. Reusing their result is not an optimisation - issuing
+        our own requesttoken with the dead ``refresh_token`` would fail, and issuing it
+        with the live one would orphan their rotation.
+        """
+        db.expire_all()  # drop the identity-map copy; another worker wrote this row
+        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        if not connection or not connection.access_token or not connection.refresh_token:
+            return None
+        if connection.refresh_token == refresh_token:
+            return None  # nothing rotated while we waited
+
+        expires_at = connection.token_expires_at
+        expires_in = int((expires_at - datetime.now(UTC)).total_seconds()) if expires_at else 0
+        if expires_in <= 0:
+            return None  # rotated, but already stale - refresh properly
+
+        log_structured(
+            logger,
+            "info",
+            "Withings token already refreshed by another worker",
+            provider=self.provider_name,
+            task="refresh_access_token",
+            user_id=str(user_id),
+        )
+        return OAuthTokenResponse(
+            access_token=connection.access_token,
+            token_type="Bearer",
+            refresh_token=connection.refresh_token,
+            expires_in=expires_in,
+        )
+
     def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
+        # Serialised per user: Withings rotates the refresh token on every call, so two
+        # concurrent refreshes leave the connection holding an already-invalidated token.
+        # See refresh_lock.py for the interleaving this prevents.
+        with single_flight_refresh(user_id):
+            reused = self._already_rotated(db, user_id, refresh_token)
+            if reused:
+                return reused
+            return self._do_refresh(db, user_id, refresh_token)
+
+    def _do_refresh(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
         payload = {
             "action": "requesttoken",
             "grant_type": "refresh_token",
