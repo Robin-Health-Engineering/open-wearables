@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from pydantic import SecretStr
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -25,10 +26,18 @@ def _stub_withings_nonce() -> Iterator[None]:
     token envelope, which the nonce call would consume instead - so without this stub they
     fail on a missing nonce rather than on anything they mean to assert.
 
+    Credentials are set for the same reason: signature mode refuses to sign with an empty
+    secret (an empty key yields a plausible digest that Withings rejects opaquely), and CI
+    has no Withings environment configured.
+
     Only the network hop is stubbed: sign_payload still runs, so the real signing path is
     exercised and ``mock_post`` still sees exactly one call, the token request.
     """
-    with patch("app.services.providers.withings.signature.get_nonce", return_value="test-nonce"):
+    with (
+        patch("app.services.providers.withings.signature.get_nonce", return_value="test-nonce"),
+        patch.object(settings, "withings_client_id", "test-client-id"),
+        patch.object(settings, "withings_client_secret", SecretStr("test-client-secret")),
+    ):
         yield
 
 

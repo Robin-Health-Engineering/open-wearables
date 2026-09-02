@@ -8,8 +8,10 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.schemas.auth import ConnectionStatus, LiveSyncMode
 from app.services.providers.factory import ProviderFactory
 from tests.factories import DeveloperFactory, UserConnectionFactory, UserFactory
@@ -210,6 +212,8 @@ class TestWithingsOAuth:
     # nonce over HTTP. The single patched httpx.post below returns a token envelope, which
     # the nonce call would consume; stub the nonce so the mock stays dedicated to the token
     # request. The signing itself is left real.
+    @patch.object(settings, "withings_client_secret", SecretStr("test-client-secret"))
+    @patch.object(settings, "withings_client_id", "test-client-id")
     @patch("app.services.providers.withings.signature.get_nonce", return_value="test-nonce")
     @patch("app.api.routes.v1.oauth.celery_app.send_task")
     @patch(
