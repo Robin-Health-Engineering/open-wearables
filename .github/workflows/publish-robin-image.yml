@@ -1,7 +1,22 @@
-name: Publish Robin backend image
+name: Publish Robin images
 
-# Robin-specific: publishes the PATCHED backend image to our own ECR so the staging box
-# can run the Withings connector, which exists only in an unmerged upstream PR.
+# Robin-specific: publishes our PATCHED backend AND frontend images to our own ECR.
+#
+# BOTH are built on every run, deliberately. Publishing only the backend is what caused
+# the 2026-09-03 dashboard outage: staging ran a backend 122 commits ahead of an upstream
+# 0.6.3 frontend, and upstream ships both halves of a change in one commit (5e4dd9a0
+# deleted `top_series_types` from the dashboard schema and rewrote the component reading
+# it). The dashboard crashed on login with `undefined.slice()`. A matrix that always
+# publishes the pair makes that particular drift impossible to reintroduce by omission.
+#
+# Publishing the frontend ourselves is also REQUIRED, not just tidier: our backend carries
+# a security fix upstream lacks (70bb089b — `/oauth/{provider}/authorize` now requires
+# authentication, closing an account-linking hijack), and no upstream frontend sends that
+# header, so every Docker Hub image 401s on provider connect against our backend.
+#
+# VITE_API_URL is NOT baked in: frontend/src/lib/api/runtime-config.ts resolves it at
+# runtime (SSR injects it for the client), so one image serves staging and prod and the
+# environment stays in compose where it belongs.
 #
 # Deliberately separate from publish-images.yml (upstream's Docker Hub workflow) rather
 # than a matrix entry in it: that file belongs to upstream and we want it to keep merging
@@ -28,11 +43,23 @@ permissions:
 env:
   AWS_REGION: eu-central-1
   ECR_REGISTRY: 535002861150.dkr.ecr.eu-central-1.amazonaws.com
-  ECR_REPOSITORY: ow-backend
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    strategy:
+      # fail-fast off: one image failing to build should not cancel the other, or a
+      # transient backend failure would leave the frontend unpublished and reintroduce
+      # exactly the skew this matrix exists to prevent.
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            repository: ow-backend
+            context: ./backend
+          - name: frontend
+            repository: ow-frontend
+            context: ./frontend
     # Gates the OIDC trust. Adding required reviewers to this environment in repo
     # settings is what turns publishing into a reviewed action, without touching IAM.
     environment: staging-images
@@ -68,14 +95,16 @@ jobs:
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: ./backend
-          file: ./backend/Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/Dockerfile
           push: true
           tags: |
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:staging
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${{ steps.resolved.outputs.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:staging
+            ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:sha-${{ steps.resolved.outputs.sha }}
+          # Scope the cache per image: a shared key would let the two builds evict each
+          # other's layers on every run, which is slower than no cache at all.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
       # The digest is the whole point: ow-infra's docker-compose.yml pins tag@digest, so a
       # retag can never change what staging runs. Print it where whoever bumps compose can
@@ -83,10 +112,10 @@ jobs:
       - name: Report the image reference to pin
         run: |
           {
-            echo "### Image published"
+            echo "### Image published: ${{ matrix.name }}"
             echo
             echo '```'
-            echo "${ECR_REGISTRY}/${ECR_REPOSITORY}:staging@${{ steps.build.outputs.digest }}"
+            echo "${ECR_REGISTRY}/${{ matrix.repository }}:staging@${{ steps.build.outputs.digest }}"
             echo '```'
             echo
             echo "Pin this in \`ow-infra/docker-compose.yml\` (tag@digest), then merge to"
