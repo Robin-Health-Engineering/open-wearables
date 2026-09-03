@@ -206,10 +206,6 @@ class TestPolarOAuth:
 
 
 class TestWithingsOAuth:
-    # WITHINGS_AUTH_MODE defaults to "signature", so the token exchange first fetches a
-    # nonce over HTTP. The single patched httpx.post below returns a token envelope, which
-    # the nonce call would consume; stub the nonce so the mock stays dedicated to the token
-    # request. The signing itself is left real.
     @patch("app.api.routes.v1.oauth.celery_app.send_task")
     @patch(
         "app.services.providers.withings.strategy.WithingsStrategy.effective_live_sync_mode",
