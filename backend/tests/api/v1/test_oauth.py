@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from tests.factories import DeveloperFactory
 from tests.utils import developer_auth_headers
 
@@ -40,11 +41,11 @@ class TestOAuthAuthorizeEndpoint:
         assert isinstance(data["state"], str)
         assert len(data["state"]) > 0
 
-    def test_authorize_provider_with_redirect_uri(self, client: TestClient, db: Session) -> None:
-        """Test OAuth flow with optional redirect URI."""
-        # Arrange
+    def test_authorize_provider_with_allowlisted_redirect_uri(self, client: TestClient, db: Session) -> None:
+        """An allowlisted redirect URI is accepted and stored."""
+        # Arrange — frontend_url is always allowed, so it needs no extra configuration.
         user_id = uuid4()
-        redirect_uri = "https://myapp.com/oauth/callback"
+        redirect_uri = f"{settings.frontend_url}/oauth/callback"
 
         # Act
         response = client.get(
@@ -60,6 +61,27 @@ class TestOAuthAuthorizeEndpoint:
         data = response.json()
         assert "authorization_url" in data
         assert "state" in data
+
+    def test_authorize_provider_rejects_foreign_redirect_uri(self, client: TestClient, db: Session) -> None:
+        """A redirect URI outside the allowlist is refused before it reaches Redis.
+
+        This case previously returned 200 and stored the value, which the callback then
+        replayed into a RedirectResponse — an open redirect on this API's own origin,
+        reachable without an API key.
+        """
+        # Act
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={
+                "user_id": str(uuid4()),
+                "redirect_uri": "https://myapp.com/oauth/callback",
+            },
+        )
+
+        # Assert
+        assert response.status_code == 400
+        # The rejected value must not be echoed back to the caller.
+        assert "myapp.com" not in response.text
 
     def test_authorize_different_providers(self, client: TestClient, db: Session) -> None:
         """Test initiating OAuth for different providers."""
