@@ -35,6 +35,26 @@ def is_allowed_redirect_uri(uri: str | None, allowed_prefixes: list[str]) -> boo
         return False
     if any(ch in _FORBIDDEN for ch in uri):
         return False
-    # Prefix match, not host parsing: a native app target ("robin://…") has no host, and
-    # urlparse is too permissive about what it will accept as one.
-    return any(prefix and uri.startswith(prefix) for prefix in allowed_prefixes)
+    return any(prefix and _matches_prefix(uri, prefix) for prefix in allowed_prefixes)
+
+
+def _matches_prefix(uri: str, prefix: str) -> bool:
+    """Prefix match with a delimiter boundary.
+
+    A bare ``startswith`` is not enough, and the default configuration is precisely the
+    vulnerable shape: ``frontend_url`` is written the way URLs are written, without a trailing
+    slash, so ``https://dashboard.example`` would also admit
+    ``https://dashboard.example.attacker.test/steal`` — a redirect to a third-party host, which
+    is the exact harm this module exists to prevent.
+
+    Custom schemes were already safe (``robin://`` ends in ``/``, so ``robinevil://`` cannot
+    match), which is why prefix matching rather than URL parsing is still the right approach —
+    a native target has no host for urlparse to check. What was missing is the boundary.
+    """
+    if uri == prefix:
+        return True
+    if prefix.endswith("/"):
+        return uri.startswith(prefix)
+    # A bare origin may legitimately be followed by a path, a query or a fragment; anything
+    # else after it is a different host.
+    return any(uri.startswith(prefix + sep) for sep in ("/", "?", "#"))

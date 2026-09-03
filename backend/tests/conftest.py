@@ -381,3 +381,18 @@ def fast_password_hashing(monkeypatch: pytest.MonkeyPatch) -> None:
 def api_v1_prefix() -> str:
     """Return the API v1 prefix."""
     return "/api/v1"
+
+
+@pytest.fixture
+def developer_headers(db: "Session") -> dict[str, str]:
+    """Auth headers for an endpoint behind ApiKeyDep.
+
+    The OAuth authorize endpoint is authenticated: unauthenticated it lets anyone mint a
+    provider consent URL bound to a user id of their choosing.
+    """
+    from tests.factories import DeveloperFactory
+    from tests.utils.auth import developer_auth_headers
+
+    developer = DeveloperFactory()
+    db.flush()
+    return developer_auth_headers(developer.id)

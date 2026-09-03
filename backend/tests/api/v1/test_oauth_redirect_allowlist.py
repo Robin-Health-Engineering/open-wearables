@@ -26,6 +26,11 @@ class TestIsAllowedRedirectUri:
     @pytest.mark.parametrize(
         "uri",
         [
+            # The boundary case: a prefix match without a delimiter admits any host that
+            # merely STARTS with an allowed one. Written as a registrable domain because
+            # that is what an attacker buys.
+            "https://dashboard.example.test.attacker.com/steal",
+            "https://dashboard.example.testevil.com/steal",
             "https://evil.test/steal",
             "http://dashboard.example.test/settings",  # scheme downgrade is a different origin
             "//evil.test",
@@ -44,6 +49,17 @@ class TestIsAllowedRedirectUri:
     def test_rejects_control_characters_and_whitespace(self, ch: str) -> None:
         # Header/log injection once the value reaches a Location header.
         assert is_allowed_redirect_uri(f"robin://a{ch}b", PREFIXES) is False
+
+    def test_a_bare_origin_with_query_or_fragment_is_still_allowed(self) -> None:
+        # An origin followed by ? or # is the same origin; rejecting it would look like a bug.
+        assert is_allowed_redirect_uri("https://dashboard.example.test?next=x", PREFIXES) is True
+        assert is_allowed_redirect_uri("https://dashboard.example.test#frag", PREFIXES) is True
+        assert is_allowed_redirect_uri("https://dashboard.example.test", PREFIXES) is True
+
+    def test_custom_schemes_carry_their_own_boundary(self) -> None:
+        # "robin://" already ends in "/", so a lookalike scheme cannot match.
+        assert is_allowed_redirect_uri("robin://callback", PREFIXES) is True
+        assert is_allowed_redirect_uri("robinevil://callback", PREFIXES) is False
 
     def test_an_empty_allowlist_permits_nothing(self) -> None:
         # Fail closed: a deployment that configures nothing must not redirect anywhere.

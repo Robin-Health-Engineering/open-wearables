@@ -19,6 +19,7 @@ from app.schemas.model_crud.data_priority import (
     ProviderSettingUpdate,
 )
 from app.services import DeveloperDep, user_connection_service
+from app.services.api_key_service import ApiKeyDep
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
@@ -53,12 +54,20 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
 def authorize_provider(
     provider: ProviderName,
     user_id: Annotated[UUID, Query(description="User ID to connect")],
+    _caller: ApiKeyDep,
     redirect_uri: Annotated[str | None, Query(description="Optional redirect URI after authorization")] = None,
 ):
     """
     Initiate OAuth flow for a provider.
 
     Returns authorization URL where user should be redirected to log in.
+
+    Authenticated (developer JWT or API key). Unauthenticated, this endpoint is an
+    account-linking hijack that no redirect allowlist can address: an attacker calls it with
+    their OWN user_id and no redirect_uri, receives a genuine provider consent URL, and sends
+    it to a victim. The victim sees a real provider domain and a real consent screen, approves,
+    and the callback binds THEIR provider account to the ATTACKER's user — server-side, before
+    any redirect is chosen. The attacker then reads that person's health data as their own.
     """
     # Reject before the value reaches Redis. This endpoint has no API-key dependency, so an
     # unvalidated redirect_uri here is an open redirect on our own origin.
