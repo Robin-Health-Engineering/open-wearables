@@ -20,9 +20,10 @@ class WithingsSdkAccount(BaseDbModel):
       Withings requires both sources of them (the install notification AND ``Getdevice``),
       and background BLE sync does not work without one.
 
-    Distinct from the phase-1 consumer-OAuth connection by design: a member may link their
-    own Withings account AND buy a device from us, giving two ``provider_user_id``s for one
-    person. ``external_id`` is the value WE minted and is what ties this row back to the
+    Hangs off whichever ``user_connection`` the member has for Withings. There is only ever
+    one: that table's unique ``(user_id, provider)`` index means a personally-linked account
+    and an SDK-provisioned one cannot coexist for the same member, and provisioning
+    overwrites. ``external_id`` is the value WE minted and is what ties this row back to the
     member, so it is unique.
     """
 

@@ -20,6 +20,7 @@ from app.services.providers.withings.sdk_users import (
     SdkUser,
     WithingsSdkUserError,
     create_sdk_user,
+    exchange_sdk_code,
 )
 
 VALID: dict[str, Any] = {
@@ -172,3 +173,82 @@ class TestCreateSdkUserFailure:
         _post(monkeypatch, OK_ENVELOPE)
         with pytest.raises(ValueError, match="mailingpref"):
             create_sdk_user(**{**VALID, "mailingpref": bad_pref})
+
+
+TOKEN_OK = {
+    "status": 0,
+    "body": {
+        "userid": "5404071",
+        "access_token": "at",
+        "refresh_token": "rt",
+        "csrf_token": "ct",
+        "expires_in": 10800,
+        "scope": "user.info,user.metrics",
+        "token_type": "Bearer",
+    },
+}
+
+EXCHANGE: dict[str, Any] = {
+    "client_id": "cid",
+    "client_secret": "csecret",
+    "code": "abc123",
+    "redirect_uri": "https://ow-api-staging.robin.health/api/v1/oauth/withings/callback",
+}
+
+
+class TestExchangeSdkCode:
+    def test_returns_the_triple_including_csrf_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # csrf_token is the whole reason this does not reuse OAuthTokenResponse: without it
+        # neither SDK WebView will open.
+        _post(monkeypatch, TOKEN_OK)
+        tokens = exchange_sdk_code(**EXCHANGE)
+        assert tokens.csrf_token == "ct"
+        assert (tokens.userid, tokens.access_token, tokens.refresh_token) == ("5404071", "at", "rt")
+        assert tokens.expires_in == 10800
+
+    def test_sends_redirect_uri_even_though_no_redirect_happened(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Documented as required for the SDK code too. Omitting it fails, unintuitively.
+        captured: dict[str, Any] = {}
+        _post(monkeypatch, TOKEN_OK, captured)
+        exchange_sdk_code(**EXCHANGE)
+        assert captured["data"]["redirect_uri"] == EXCHANGE["redirect_uri"]
+        assert captured["data"]["grant_type"] == "authorization_code"
+        assert captured["url"].endswith("/v2/oauth2")
+
+    def test_authenticates_with_nonce_and_signature_not_a_body_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+        _post(monkeypatch, TOKEN_OK, captured)
+        exchange_sdk_code(**EXCHANGE)
+        assert captured["data"]["signature"]
+        assert "client_secret" not in captured["data"]
+
+    def test_non_zero_status_raises_despite_http_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _post(monkeypatch, {"status": 401, "error": "invalid code"})
+        with pytest.raises(WithingsSdkUserError) as e:
+            exchange_sdk_code(**EXCHANGE)
+        assert e.value.withings_status == 401
+
+    @pytest.mark.parametrize("absent", ["userid", "access_token", "refresh_token", "csrf_token"])
+    def test_a_partial_response_is_rejected_rather_than_half_stored(
+        self, monkeypatch: pytest.MonkeyPatch, absent: str
+    ) -> None:
+        # Partial success is worse than failure here: a connection saved without csrf_token
+        # looks healthy and then cannot open a WebView — a fault that surfaces much later.
+        body = {k: v for k, v in TOKEN_OK["body"].items() if k != absent}
+        _post(monkeypatch, {"status": 0, "body": body})
+        with pytest.raises(WithingsSdkUserError, match=absent):
+            exchange_sdk_code(**EXCHANGE)
+
+    def test_token_body_is_not_leaked_into_the_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_post(url: str, **_: Any) -> NoReturn:
+            request = httpx.Request("POST", url)
+            raise httpx.HTTPStatusError(
+                "boom",
+                request=request,
+                response=httpx.Response(500, text="refresh_token=supersecret", request=request),
+            )
+
+        monkeypatch.setattr(sdk_users.httpx, "post", fake_post)
+        with pytest.raises(WithingsSdkUserError) as e:
+            exchange_sdk_code(**EXCHANGE)
+        assert "supersecret" not in str(e.value)

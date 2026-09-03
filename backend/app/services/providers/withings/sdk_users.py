@@ -1,10 +1,11 @@
 """Partner-hosted User Creation for the Withings Mobile SDK.
 
 Phase 2 of the Withings integration provisions a Withings account on the member's behalf,
-rather than linking one they already own (which is phase 1's consumer OAuth flow). The two
-coexist by design: a member can link their own account AND buy a device from us, and will
-then have two ``provider_user_id``s. ``external_id`` is what ties the provisioned one back
-to our member.
+rather than linking one they already own (which is phase 1's consumer OAuth flow). Both
+flows ship, but a member holds only ONE connection: ``user_connection`` has a unique
+``(user_id, provider)`` index, so the two cannot coexist on one member. Provisioning wins and
+overwrites — see ``sdk_provisioning``. ``external_id`` is what ties the provisioned account
+back to our member.
 
 This lives in Open Wearables and not in robin-backend, deliberately. ``createuser`` must be
 signed with ``client_secret``, and the ``code`` it returns becomes tokens that OW then owns
@@ -34,6 +35,7 @@ from app.utils.structured_logging import log_structured
 logger = logging.getLogger(__name__)
 
 _SDK_PATH = "/v2/sdk"
+_TOKEN_PATH = "/v2/oauth2"
 _TIMEOUT_SECONDS = 30.0
 
 # Withings' own constraint, quoted from the docs: /^[a-zA-Z0-9]{3}$/. Enforced here rather
@@ -52,6 +54,23 @@ class WithingsSdkUserError(RuntimeError):
     def __init__(self, *, withings_status: int | None = None, detail: str | None = None) -> None:
         self.withings_status = withings_status
         super().__init__(detail or f"Withings createuser failed (status={withings_status})")
+
+
+@dataclass(frozen=True)
+class SdkTokens:
+    """The token triple an SDK user is provisioned with.
+
+    ``csrf_token`` is the reason this is not just an OAuthTokenResponse: the hosted SDK
+    WebViews take the access token as a secure cookie AND this value as a URL parameter, and
+    without it neither setup nor settings will open.
+    """
+
+    userid: str
+    access_token: str
+    refresh_token: str
+    csrf_token: str
+    expires_in: int
+    scope: str | None
 
 
 @dataclass(frozen=True)
@@ -200,3 +219,93 @@ def create_sdk_user(
     # Trust our own external_id over the echo: the caller keys the member off it, and an
     # echoed value that differs is a mismatch we would otherwise store silently.
     return SdkUser(code=code, external_id=user.get("external_id") or external_id)
+
+
+def exchange_sdk_code(
+    *,
+    client_id: str,
+    client_secret: str,
+    code: str,
+    redirect_uri: str,
+    api_base_url: str = WITHINGS_API_BASE_URL,
+) -> SdkTokens:
+    """Exchange a ``createuser`` code for the access/refresh/csrf triple.
+
+    Three things differ from the phase-1 consumer exchange, all documented:
+
+    * ``redirect_uri`` is REQUIRED even though this code never came from a redirect. Omitting
+      it fails, which is unintuitive enough to be worth stating here.
+    * Authentication is nonce+signature, not ``client_secret`` in the body — so this reuses
+      ``sign_payload`` rather than the OAuth strategy's ``_request_token``.
+    * The response carries ``csrf_token``, which ``OAuthTokenResponse`` does not model. That
+      is why this returns its own type.
+
+    Withings rotates the refresh token on every use; the previous one survives 8 hours, which
+    is a grace period rather than a licence to keep it.
+    """
+    payload = {
+        "action": "requesttoken",
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+    signed = sign_payload(payload, client_id, client_secret, api_base_url=api_base_url)
+
+    acquire_request_slot()
+    try:
+        response = httpx.post(
+            f"{api_base_url}{_TOKEN_PATH}",
+            data=signed,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        envelope = response.json()
+    except httpx.HTTPStatusError as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings SDK token HTTP error: {redact_body(e.response.text)}",
+            provider="withings",
+            task="sdk_exchange_code",
+            status_code=e.response.status_code,
+        )
+        raise WithingsSdkUserError(detail=f"Withings SDK token exchange failed (HTTP {e.response.status_code})") from e
+    except Exception as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings SDK token request failed: {type(e).__name__}",
+            provider="withings",
+            task="sdk_exchange_code",
+        )
+        raise WithingsSdkUserError(detail="Withings SDK token exchange failed") from e
+
+    status = envelope.get("status")
+    if status != _STATUS_OK:
+        # HTTP 200 with a non-zero status is how Withings reports failure here too.
+        log_structured(
+            logger,
+            "error",
+            "Withings SDK token exchange returned a non-zero status",
+            provider="withings",
+            task="sdk_exchange_code",
+            withings_status=status,
+        )
+        raise WithingsSdkUserError(withings_status=status)
+
+    body = envelope.get("body") or {}
+    missing = [f for f in ("userid", "access_token", "refresh_token", "csrf_token") if not body.get(f)]
+    if missing:
+        # Partial success is worse than failure: a connection stored without csrf_token looks
+        # healthy and then cannot open a WebView.
+        raise WithingsSdkUserError(detail=f"Withings SDK token response missing: {sorted(missing)}")
+
+    return SdkTokens(
+        userid=str(body["userid"]),
+        access_token=body["access_token"],
+        refresh_token=body["refresh_token"],
+        csrf_token=body["csrf_token"],
+        expires_in=int(body.get("expires_in") or 0),
+        scope=body.get("scope"),
+    )
