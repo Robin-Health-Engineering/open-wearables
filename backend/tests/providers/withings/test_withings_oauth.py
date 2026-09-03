@@ -11,7 +11,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import AuthenticationMethod, ConnectionStatus
 from app.schemas.model_crud.credentials import OAuthTokenResponse
-from app.services.providers.withings.oauth import WithingsOAuth, WithingsTokenError
+from app.services.providers.withings.oauth import WithingsOAuth, WithingsTokenError, redact_body
 from tests.factories import UserConnectionFactory, UserFactory
 
 
@@ -311,3 +311,33 @@ def test_upstream_error_body_never_reaches_the_api_caller(mock_post: MagicMock, 
     assert "abc123" not in str(exc.value.detail)
     assert "rt_xyz" not in str(exc.value.detail)
     assert "400" in str(exc.value.detail)
+
+
+@patch("httpx.post")
+def test_generic_exception_branch_also_leaks_nothing(mock_post: MagicMock, withings_oauth: WithingsOAuth) -> None:
+    """The second leak path, which nothing pinned.
+
+    A non-JSON 200 raises inside res.json(), and a SyntaxError's str() quotes a fragment of
+    the body — the more likely of the two to regress, because that message is produced by the
+    parser rather than written by us.
+    """
+    mock_post.return_value = MagicMock(
+        raise_for_status=MagicMock(),
+        json=MagicMock(side_effect=ValueError("Expecting value: client_secret=abc123 rt_xyz")),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        withings_oauth._exchange_token("the_code", None)
+
+    assert "abc123" not in str(exc.value.detail)
+    assert "rt_xyz" not in str(exc.value.detail)
+
+
+def test_redact_body_masks_credentials_and_bounds_length() -> None:
+    """The log half of the same contract: the body is logged, so it must be redacted there."""
+    out = redact_body("error: invalid client_secret=abc123 for refresh_token=rt_xyz")
+    assert "abc123" not in out
+    assert "rt_xyz" not in out
+    assert "client_secret=<redacted>" in out
+    # An HTML error page is not a useful log line either.
+    assert len(redact_body("x" * 5000)) < 600

@@ -1,6 +1,7 @@
 """Handle Withings OAuth token RPC envelopes and provider user identity."""
 
 import logging
+import re
 from uuid import UUID
 
 import httpx
@@ -21,6 +22,25 @@ from app.services.providers.withings.request_budget import acquire_request_slot
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
+
+# A token-endpoint response body is the reply to a request whose payload carried
+# client_secret and refresh_token, and providers do echo submitted values back in error text.
+# The caller-facing leak is closed by never putting the body in `detail`; this is the other
+# half — the log. Bounded, because an HTML error page is not a useful log line either.
+_SECRET_IN_BODY = re.compile(
+    r"((?:client_secret|refresh_token|access_token|code)\s*[=:]\s*)([^\s,&\"\'}]+)",
+    re.IGNORECASE,
+)
+_MAX_LOGGED_BODY = 500
+
+
+def redact_body(text: str) -> str:
+    """Mask credential-shaped values in an upstream body before it reaches the log."""
+    redacted = _SECRET_IN_BODY.sub(r"\1<redacted>", text or "")
+    if len(redacted) > _MAX_LOGGED_BODY:
+        return redacted[:_MAX_LOGGED_BODY] + "…[truncated]"
+    return redacted
+
 
 # Token-request statuses caused by invalid request inputs rather than provider faults.
 _TOKEN_CLIENT_ERROR_STATUSES = {247, 250, 283, 286, 293, 303, 304, 342}
@@ -153,12 +173,12 @@ class WithingsOAuth(BaseOAuthTemplate):
             log_structured(
                 logger,
                 "error",
-                f"Withings token HTTP error: {e.response.text}",
+                f"Withings token HTTP error: {redact_body(e.response.text)}",
                 provider=self.provider_name,
                 task=task,
                 status_code=e.response.status_code,
             )
-            # The body is LOGGED above, never returned: WithingsTokenError subclasses
+            # The body is logged above REDACTED, and never returned: WithingsTokenError subclasses
             # HTTPException, so `detail` is serialised to our own API caller — and this is the
             # response to a requesttoken whose payload carried client_secret and refresh_token.
             raise WithingsTokenError(
@@ -170,7 +190,7 @@ class WithingsOAuth(BaseOAuthTemplate):
             log_structured(
                 logger,
                 "error",
-                f"Withings token request failed: {e}",
+                f"Withings token request failed: {redact_body(str(e))}",
                 provider=self.provider_name,
                 task=task,
             )
