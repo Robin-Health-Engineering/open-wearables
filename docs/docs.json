@@ -198,7 +198,8 @@
             "pages": [
               "GET /api/v1/oauth/providers",
               "GET /api/v1/oauth/{provider}/authorize",
-              "POST /api/v1/providers/withings/sdk/accounts"
+              "POST /api/v1/providers/withings/sdk/accounts",
+              "GET /api/v1/providers/withings/sdk/session"
             ]
           },
           {

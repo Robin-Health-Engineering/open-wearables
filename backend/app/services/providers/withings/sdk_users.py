@@ -216,9 +216,22 @@ def create_sdk_user(
         task="createuser",
         external_id=external_id,
     )
-    # Trust our own external_id over the echo: the caller keys the member off it, and an
-    # echoed value that differs is a mismatch we would otherwise store silently.
-    return SdkUser(code=code, external_id=user.get("external_id") or external_id)
+    # Return OUR external_id, never the echo. The caller keys the member off the value we
+    # sent, so echoing back a different one would silently attach the account to the wrong
+    # person. A mismatch is not fatal — the account exists and the code is valid — but it is
+    # an anomaly worth seeing, so it is logged rather than swallowed.
+    echoed = user.get("external_id")
+    if echoed and echoed != external_id:
+        log_structured(
+            logger,
+            "warning",
+            "Withings echoed a different external_id than the one sent",
+            provider="withings",
+            task="createuser",
+            sent_external_id=external_id,
+            echoed_external_id=echoed,
+        )
+    return SdkUser(code=code, external_id=external_id)
 
 
 def exchange_sdk_code(

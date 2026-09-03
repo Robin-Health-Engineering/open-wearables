@@ -16,8 +16,13 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.database import DbSession
+from app.models.user_connection import UserConnection
+from app.models.withings_sdk_account import WithingsSdkAccount
+from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName
 from app.services.api_key_service import ApiKeyDep
+from app.services.providers.api_client import _get_valid_token
+from app.services.providers.factory import ProviderFactory
 from app.services.providers.withings.sdk_provisioning import provision_sdk_account
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 
@@ -125,3 +130,70 @@ def create_withings_sdk_account(
         )
 
     return SdkAccountResponse(external_id=account.external_id, csrf_token=account.csrf_token)
+
+
+class SdkSessionResponse(BaseModel):
+    """A live pair for opening a hosted Withings WebView.
+
+    Both are needed and neither is optional: the access token goes on as a secure cookie for
+    ``.withings.com``, the csrf_token as a URL parameter. One without the other does not open.
+    """
+
+    access_token: str
+    csrf_token: str
+
+
+@router.get(
+    "/withings/sdk/session",
+    summary="Get a live token pair for the Withings SDK WebViews",
+    tags=["External: Providers"],
+)
+def get_withings_sdk_session(
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> SdkSessionResponse:
+    """Return a currently-valid access token and csrf_token for one member.
+
+    Fetched per WebView rather than handed out at provisioning: an access token lasts three
+    hours, so a value returned at setup time is usually dead by the time a member opens
+    device settings.
+
+    ORDER IS LOAD-BEARING. The token is resolved first, which refreshes it if it is within
+    five minutes of expiry, and that refresh ROTATES csrf_token. Reading the SDK account
+    before refreshing would hand back the pre-rotation value — valid-looking, and rejected by
+    Withings. This also reuses the one refresher (`_get_valid_token`, Redis-locked per
+    user/provider) rather than adding a second one against a rotating refresh token.
+    """
+    provider = ProviderName.WITHINGS.value
+    strategy = ProviderFactory().get_provider(provider)
+    if not strategy.oauth:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Withings OAuth is not available on this deployment",
+        )
+
+    # Refresh-if-needed FIRST — see the docstring. Raises 401 if the member is not connected.
+    access_token = _get_valid_token(db, user_id, provider, UserConnectionRepository(), strategy.oauth)
+
+    account = (
+        db.query(WithingsSdkAccount)
+        .join(UserConnection, WithingsSdkAccount.user_connection_id == UserConnection.id)
+        .filter(UserConnection.user_id == user_id, UserConnection.provider == provider)
+        .one_or_none()
+    )
+    if account is None:
+        # Connected, but via phase-1 consumer OAuth rather than SDK provisioning. There is no
+        # csrf_token because no SDK account was ever created — a distinct condition from "not
+        # connected", and worth its own message.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This member has no Withings SDK account; the WebViews need one",
+        )
+    if not account.csrf_token:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Withings SDK account has no csrf_token; re-provision it",
+        )
+
+    return SdkSessionResponse(access_token=access_token, csrf_token=account.csrf_token)
