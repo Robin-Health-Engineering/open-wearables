@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from celery import current_app as celery_app
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from fastapi.responses import RedirectResponse
 
 from app.config import allowed_redirect_prefixes, settings
@@ -86,6 +86,26 @@ def authorize_provider(
     assert strategy.oauth
     auth_url, state = strategy.oauth.get_authorization_url(user_id, redirect_uri)
     return AuthorizationURLResponse(authorization_url=auth_url, state=state)
+
+
+@router.head("/{provider}/callback", tags=["System: OAuth"], include_in_schema=False)
+def probe_oauth_callback(provider: ProviderName) -> Response:
+    """Answer a provider's reachability probe on the OAuth callback.
+
+    Withings HEADs the callback URL registered in the partner dashboard before it will
+    activate it, and requires a 2xx. FastAPI's APIRoute does NOT add HEAD to a GET route
+    the way plain Starlette does, so the GET below answered 405 and the dashboard reported
+    the URL as unreachable ("Empty URL"). The OAuth flow then failed *after consent* with
+    `redirect_uri_mismatch`, because the URL we send had never become a partner callback —
+    a confusing symptom whose cause is three steps upstream.
+
+    This is the same defect the webhook route already fixed with `@router.head("")`; the
+    OAuth callback lives in another file and was missed.
+
+    Deliberately does no work and returns no body: a probe is not a callback. The real
+    exchange needs `code` and `state`, which a HEAD never carries.
+    """
+    return Response(status_code=status.HTTP_200_OK)
 
 
 @router.get("/{provider}/callback", tags=["System: OAuth"])

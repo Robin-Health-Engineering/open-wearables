@@ -493,3 +493,36 @@ class TestOAuthUpdateProviderEndpoint:
             data = response.json()
             assert data["provider"] == provider
             assert data["is_enabled"] is True
+
+
+class TestOAuthCallbackHeadProbe:
+    """The reachability probe a provider runs before activating a registered callback.
+
+    Withings HEADs the callback URL from the partner dashboard and requires a 2xx before it
+    will treat the URL as an active partner callback. FastAPI's APIRoute does not add HEAD
+    to a GET route (plain Starlette does), so this answered 405 and the dashboard reported
+    the URL unreachable — surfacing much later, and very confusingly, as a
+    `redirect_uri_mismatch` AFTER the user had already consented.
+    """
+
+    def test_head_on_callback_returns_200(self, client: TestClient) -> None:
+        response = client.head("/api/v1/oauth/withings/callback")
+        assert response.status_code == 200, (
+            "A provider probing the callback must get 2xx; a 405 makes the dashboard treat "
+            "the URL as unreachable and the OAuth flow then fails after consent."
+        )
+
+    def test_head_probe_returns_no_body(self, client: TestClient) -> None:
+        response = client.head("/api/v1/oauth/withings/callback")
+        assert response.content == b""
+
+    def test_head_probe_needs_no_oauth_parameters(self, client: TestClient) -> None:
+        """A probe carries no code/state — it must not be treated as a real callback."""
+        response = client.head("/api/v1/oauth/withings/callback")
+        assert response.status_code == 200
+
+    def test_get_callback_still_requires_oauth_parameters(self, client: TestClient) -> None:
+        """Adding HEAD must not make the real GET callback permissive."""
+        response = client.get("/api/v1/oauth/withings/callback", follow_redirects=False)
+        assert response.status_code == 303
+        assert "Missing+OAuth+parameters" in response.headers["location"]
