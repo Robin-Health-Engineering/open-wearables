@@ -38,6 +38,8 @@ class TestIsAllowedRedirectUri:
             # that is what an attacker buys.
             "https://dashboard.example.test.attacker.com/steal",
             "https://dashboard.example.testevil.com/steal",
+            # userinfo: everything before "@" is credentials, so the real host is evil.test.
+            "https://dashboard.example.test@evil.test/steal",
             "https://evil.test/steal",
             "http://dashboard.example.test/settings",  # scheme downgrade is a different origin
             "//evil.test",

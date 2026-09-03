@@ -69,8 +69,11 @@ def authorize_provider(
     and the callback binds THEIR provider account to the ATTACKER's user — server-side, before
     any redirect is chosen. The attacker then reads that person's health data as their own.
     """
-    # Reject before the value reaches Redis. This endpoint has no API-key dependency, so an
-    # unvalidated redirect_uri here is an open redirect on our own origin.
+    # Defence in depth, and it keeps bad values out of Redis in the first place. The
+    # endpoint is authenticated (see the docstring), so this is no longer the only thing
+    # standing between a caller and an off-origin redirect — but the callback replays
+    # whatever is stored here, so rejecting at the door means a bad value never exists to
+    # be replayed.
     if not is_allowed_redirect_uri(redirect_uri, allowed_redirect_prefixes()):
         # Deliberately does not echo the rejected value back to the caller.
         raise HTTPException(
