@@ -8,9 +8,12 @@ Tests cover:
 - Validation of provider names
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.data_priority import ProviderSettingUpdate
@@ -356,3 +359,32 @@ class TestProviderSettingsServiceLiveSyncMode:
 
         with pytest.raises(ValidationError, match="live_sync_mode cannot be set to null"):
             ProviderSettingUpdate(live_sync_mode=None)
+
+    @pytest.mark.parametrize("mode", [LiveSyncMode.WEBHOOK, LiveSyncMode.PULL])
+    def test_update_per_user_subscription_mode_queues_registration_either_way(
+        self, db: Session, mode: LiveSyncMode
+    ) -> None:
+        """Each connection holds its own subscription, so switching *off* has to revoke them."""
+        service = ProviderSettingsService()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_celery = MagicMock()
+            mp.setattr("app.services.provider_settings_service.celery_app", mock_celery)
+            result = service.update_provider_setting(db, "withings", ProviderSettingUpdate(live_sync_mode=mode))
+
+        assert result.live_sync_mode == mode
+        mock_celery.send_task.assert_called_once_with(
+            "app.integrations.celery.tasks.register_provider_webhooks_task.register_provider_webhooks",
+            args=["withings", f"{settings.api_base_url}{settings.api_v1}/providers/withings/webhooks"],
+            queue="webhook_sync",
+        )
+
+    def test_update_unrelated_per_user_subscription_setting_does_not_queue_fanout_task(self, db: Session) -> None:
+        service = ProviderSettingsService()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_celery = MagicMock()
+            mp.setattr("app.services.provider_settings_service.celery_app", mock_celery)
+            service.update_provider_setting(db, "withings", ProviderSettingUpdate(is_enabled=False))
+
+        mock_celery.send_task.assert_not_called()

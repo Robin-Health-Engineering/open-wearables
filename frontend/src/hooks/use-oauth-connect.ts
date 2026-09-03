@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { API_CONFIG } from '@/lib/api/config';
+import { apiClient } from '@/lib/api/client';
 
 export type OAuthConnectionState = 'idle' | 'connecting' | 'success' | 'error';
 
@@ -58,20 +58,13 @@ export function useOAuthConnect(
           redirect_uri: finalRedirectUri,
         });
 
-        const response = await fetch(
-          `${API_CONFIG.baseUrl}/api/v1/oauth/${providerId}/authorize?${params}`
+        // Must carry the session token: the authorize endpoint is authenticated, because
+        // unauthenticated it lets anyone mint a consent URL bound to a user id of their
+        // choosing and have a victim link their provider account to it. A bare fetch()
+        // sends no Authorization header, which is why this goes through apiClient.
+        const data = await apiClient.request<{ authorization_url: string }>(
+          `/api/v1/oauth/${providerId}/authorize?${params}`
         );
-
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          throw new Error(
-            errorData.detail ||
-              errorData.message ||
-              'Failed to get authorization URL'
-          );
-        }
-
-        const data = await response.json();
 
         onSuccess?.(providerId);
 

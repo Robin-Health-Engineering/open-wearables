@@ -6,8 +6,10 @@ from uuid import UUID
 
 from celery import current_app as celery_app
 
+from app.database import DbSession
 from app.models import EventRecord, User
 from app.repositories.event_record_repository import EventRecordRepository
+from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import LiveSyncMode
@@ -86,7 +88,13 @@ class ProviderCapabilities:
         Provider exposes an API to programmatically register and update
         webhook subscriptions. When ``True``, switching to webhook live-sync
         mode triggers the ``register_provider_webhooks`` Celery task.
-        Polar, Oura, Strava.
+        Polar, Oura, Strava, Google, Withings.
+    webhook_subscription_per_user:
+        Subscriptions are created with a connection's own bearer token, so one
+        exists per active connection rather than one for the whole application.
+        Registration then fans out over connections and must also run when
+        live-sync mode is switched *off*, to revoke each one. Requires
+        ``webhook_registration_api=True``. Currently: Withings.
     webhook_inbound_secret:
         Provider signs inbound webhook payloads with HMAC; the signing
         secret is returned by the registration API (not pre-configured in
@@ -105,6 +113,7 @@ class ProviderCapabilities:
     webhook_stream: bool = False
     webhook_ping: bool = False
     webhook_registration_api: bool = False
+    webhook_subscription_per_user: bool = False
     webhook_inbound_secret: bool = False
     max_historical_days: int | None = None
 
@@ -115,6 +124,8 @@ class ProviderCapabilities:
             raise ValueError("webhook_ping requires rest_pull=True (data must be fetched via REST after the ping)")
         if self.webhook_inbound_secret and not self.webhook_registration_api:
             raise ValueError("webhook_inbound_secret requires webhook_registration_api=True")
+        if self.webhook_subscription_per_user and not self.webhook_registration_api:
+            raise ValueError("webhook_subscription_per_user requires webhook_registration_api=True")
 
 
 class BaseProviderStrategy(ABC):
@@ -227,6 +238,14 @@ class BaseProviderStrategy(ABC):
         """Returns True if provider uses cloud OAuth API."""
         return self.oauth is not None
 
+    def on_disconnect(self, db: DbSession, user_id: UUID) -> None:
+        """Provider-side teardown to run while the connection's tokens are still valid.
+
+        Called before the connection is revoked, by disconnect, data purge and
+        account deletion. Default is a no-op; override for providers that hold
+        per-connection state at the vendor (e.g. Withings notify subscriptions).
+        """
+
     @property
     def live_sync_configurable(self) -> bool:
         """True when the admin can choose between pull and webhook live sync.
@@ -254,6 +273,13 @@ class BaseProviderStrategy(ABC):
         if caps.webhook_ping or caps.webhook_stream:
             return LiveSyncMode.WEBHOOK
         return None
+
+    def effective_live_sync_mode(self, db: DbSession) -> LiveSyncMode | None:
+        """The admin override from provider settings, else this provider's default.
+
+        ``None`` means this provider has no server-side live-sync mode.
+        """
+        return ProviderSettingsRepository().get_live_sync_mode(db, self.name) or self.default_live_sync_mode
 
     @property
     def icon_url(self) -> str:

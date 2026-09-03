@@ -33,13 +33,9 @@ def _with_capabilities(
         enriched.webhook_ping = caps.webhook_ping
         enriched.webhook_callback = caps.webhook_callback
         setting = settings_map.get(enriched.provider)
-        mode = (
-            setting.live_sync_mode
-            if (setting and setting.live_sync_mode is not None)
-            else strategy.default_live_sync_mode
-        )
+        mode = (setting.live_sync_mode if setting else None) or strategy.default_live_sync_mode
         # ORM yields a plain str and attribute assignment skips validation; coerce to the enum
-        enriched.live_sync_mode = LiveSyncMode(mode) if mode is not None else None
+        enriched.live_sync_mode = LiveSyncMode(mode) if mode else None
     if linked_user_ids:
         enriched.linked_user_ids = linked_user_ids
     return enriched
@@ -79,6 +75,7 @@ def disconnect_provider_endpoint(
 ) -> Response:
     """Disconnect a user from a provider, revoking the connection and clearing tokens."""
     strategy = ProviderFactory().get_provider(provider.value)
+    strategy.on_disconnect(db, user_id)
     user_connection_service.disconnect(db, user_id, provider.value, oauth=strategy.oauth)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -92,5 +89,6 @@ def delete_provider_data_endpoint(
 ) -> Response:
     """Delete all of a user's data for a provider and revoke the connection."""
     strategy = ProviderFactory().get_provider(provider.value)
+    strategy.on_disconnect(db, user_id)
     user_connection_service.purge_provider_data(db, user_id, provider.value, oauth=strategy.oauth)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

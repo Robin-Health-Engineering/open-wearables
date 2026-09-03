@@ -16,6 +16,7 @@ class ProviderName(str, Enum):
     FITBIT = "fitbit"
     ULTRAHUMAN = "ultrahuman"
     SENSORBIO = "sensorbio"
+    WITHINGS = "withings"
     UNKNOWN = "unknown"
     INTERNAL = "internal"
 
@@ -49,4 +50,11 @@ DEFAULT_PROVIDER_PRIORITY: dict[ProviderName, int] = {
     ProviderName.POLAR: 3,
     ProviderName.SUUNTO: 4,
     ProviderName.WHOOP: 5,
+    # Withings is dropshipped by our programme, so it must have a DETERMINISTIC rank.
+    # Without an entry here ensure_provider_exists() falls back to get_next_priority(),
+    # which depends on how many providers happen to already be in the table when the
+    # first Withings row is written - a different value per environment.
+    # Whether Withings should outrank Apple for weight/BP is a separate product call:
+    # it would renumber every entry below, so it is deliberately NOT done here.
+    ProviderName.WITHINGS: 6,
 }

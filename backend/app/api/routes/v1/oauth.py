@@ -1,12 +1,16 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from uuid import UUID
 
+from celery import current_app as celery_app
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
-from app.config import settings
+from app.config import allowed_redirect_prefixes, settings
 from app.database import DbSession
+from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
+from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.credentials import AuthorizationURLResponse
 from app.schemas.model_crud.data_priority import (
@@ -15,11 +19,15 @@ from app.schemas.model_crud.data_priority import (
     ProviderSettingUpdate,
 )
 from app.services import DeveloperDep, user_connection_service
+from app.services.api_key_service import ApiKeyDep
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.utils.redirect_allowlist import is_allowed_redirect_uri
+from app.utils.structured_logging import log_structured
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 factory = ProviderFactory()
 settings_service = ProviderSettingsService()
 
@@ -46,13 +54,33 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
 def authorize_provider(
     provider: ProviderName,
     user_id: Annotated[UUID, Query(description="User ID to connect")],
+    _caller: ApiKeyDep,
     redirect_uri: Annotated[str | None, Query(description="Optional redirect URI after authorization")] = None,
 ):
     """
     Initiate OAuth flow for a provider.
 
     Returns authorization URL where user should be redirected to log in.
+
+    Authenticated (developer JWT or API key). Unauthenticated, this endpoint is an
+    account-linking hijack that no redirect allowlist can address: an attacker calls it with
+    their OWN user_id and no redirect_uri, receives a genuine provider consent URL, and sends
+    it to a victim. The victim sees a real provider domain and a real consent screen, approves,
+    and the callback binds THEIR provider account to the ATTACKER's user — server-side, before
+    any redirect is chosen. The attacker then reads that person's health data as their own.
     """
+    # Defence in depth, and it keeps bad values out of Redis in the first place. The
+    # endpoint is authenticated (see the docstring), so this is no longer the only thing
+    # standing between a caller and an off-origin redirect — but the callback replays
+    # whatever is stored here, so rejecting at the door means a bad value never exists to
+    # be replayed.
+    if not is_allowed_redirect_uri(redirect_uri, allowed_redirect_prefixes()):
+        # Deliberately does not echo the rejected value back to the caller.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="redirect_uri is not an allowed redirect target",
+        )
+
     strategy = get_oauth_strategy(provider)
 
     assert strategy.oauth
@@ -118,9 +146,42 @@ def oauth_callback(
                 is_historical=True,
             )
 
-    # If a specific redirect_uri was requested (e.g. by frontend), redirect there
+    # User-scoped webhook subscriptions exist only after OAuth has persisted
+    # the connection and its bearer token.
+    try:
+        if (
+            strategy.capabilities.webhook_subscription_per_user
+            and strategy.webhook_service is not None
+            and strategy.effective_live_sync_mode(db) == LiveSyncMode.WEBHOOK
+        ):
+            celery_app.send_task(
+                SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
+                args=[provider.value, str(oauth_state.user_id)],
+                queue="webhook_sync",
+            )
+    except Exception as e:
+        log_structured(
+            logger,
+            "error",
+            "Provider user subscription scheduling failed",
+            provider=provider.value,
+            user_id=str(oauth_state.user_id),
+            error=str(e),
+        )
+
+    # If a specific redirect_uri was requested (e.g. by frontend), redirect there.
+    # Re-checked rather than trusted: this state may predate the check on authorize, and the
+    # cost of being wrong here is a redirect off our own origin.
     if oauth_state.redirect_uri:
-        return RedirectResponse(url=oauth_state.redirect_uri, status_code=303)
+        if is_allowed_redirect_uri(oauth_state.redirect_uri, allowed_redirect_prefixes()):
+            return RedirectResponse(url=oauth_state.redirect_uri, status_code=303)
+        log_structured(
+            logger,
+            "warning",
+            "Stored redirect_uri is not allowlisted; falling back to the success page",
+            provider=provider.value,
+            user_id=str(oauth_state.user_id),
+        )
 
     # Otherwise, redirect to internal success page
     return RedirectResponse(

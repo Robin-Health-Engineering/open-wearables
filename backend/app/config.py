@@ -216,11 +216,28 @@ class Settings(BaseSettings):
     # true - reconcile, false - list; for details check docs
     google_use_reconcile: bool = True
 
+    withings_client_id: str | None = None
+    withings_client_secret: SecretStr | None = None
+    withings_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
+    withings_webhook_token: SecretStr | None = None
+    withings_api_requests_per_minute: int = Field(120, ge=1)
+    # user.sleepevents is requested even though nothing consumes bed events (appli 50/51/52)
+    # yet: sleep summaries and appli 44 need only user.activity. It is here because OAuth
+    # scope is fixed at AUTHORIZATION time - adding it later would force every already
+    # connected member to re-authorize, which for a dropshipped device means asking people
+    # to redo a setup they completed months earlier. Cheap now, expensive later.
+    # (Divergence from upstream, which omits it deliberately - keep it on any rebase.)
+    withings_default_scope: str = "user.info,user.metrics,user.activity,user.sleepevents"
+
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None
     email_from_address: str | None = None
     email_from_name: str = "Open Wearables"
     frontend_url: str = "http://localhost:3000"
+    # Extra prefixes accepted as post-OAuth redirect targets, comma-separated. frontend_url is
+    # always allowed on top of these. Native apps add their custom scheme (e.g. "robin://").
+    # See app/utils/redirect_allowlist.py for why this is enforced.
+    oauth_allowed_redirect_prefixes: list[str] = []
     invitation_expire_days: int = 7
     email_max_retries: int = 5
 
@@ -328,6 +345,13 @@ class Settings(BaseSettings):
             self.google_webhook_secret = SecretStr(self.secret_key)
         return self
 
+    @field_validator("oauth_allowed_redirect_prefixes", mode="before")
+    @classmethod
+    def split_redirect_prefixes(cls, v: str | list[str]) -> list[str]:
+        if isinstance(v, str):
+            return [p.strip() for p in v.split(",") if p.strip()]
+        return v
+
     @field_validator("cors_origins", mode="after")
     @classmethod
     def assemble_cors_origins(cls, v: str | list[str]) -> list[str] | str:
@@ -421,3 +445,8 @@ def _get_settings() -> Settings:
 
 
 settings = _get_settings()
+
+
+def allowed_redirect_prefixes() -> list[str]:
+    """Redirect prefixes this deployment accepts: the configured ones plus frontend_url."""
+    return [*settings.oauth_allowed_redirect_prefixes, settings.frontend_url]

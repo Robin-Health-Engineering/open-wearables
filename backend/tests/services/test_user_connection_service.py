@@ -9,12 +9,15 @@ Tests cover:
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.services.user_connection_service import user_connection_service
 from tests.factories import UserConnectionFactory, UserFactory
@@ -380,6 +383,96 @@ class TestUserConnectionServiceDelete:
 
         # Act & Assert - should not raise error
         user_connection_service.delete(db, fake_id, raise_404=False)
+
+
+class TestUserConnectionServiceDisconnect:
+    def test_disconnect_revokes_connection(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="garmin", status=ConnectionStatus.ACTIVE)
+
+        user_connection_service.disconnect(db, connection.user_id, "garmin")
+
+        db.refresh(connection)
+        assert connection.status == ConnectionStatus.REVOKED
+        assert connection.access_token is None
+
+    def test_disconnect_raises_404_when_connection_not_found(self, db: Session) -> None:
+        with pytest.raises(HTTPException) as exc_info:
+            user_connection_service.disconnect(db, uuid4(), "garmin")
+
+        assert exc_info.value.status_code == 404
+
+    def test_disconnect_calls_oauth_deregister_before_clearing_tokens(self, db: Session) -> None:
+        connection = UserConnectionFactory(
+            provider="withings", status=ConnectionStatus.ACTIVE, access_token="live-token"
+        )
+        oauth = MagicMock()
+
+        user_connection_service.disconnect(db, connection.user_id, "withings", oauth=oauth)
+
+        oauth.deregister_user.assert_called_once_with("live-token", provider_user_id=connection.provider_user_id)
+
+    def test_disconnect_is_best_effort_on_deregister_failure(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="withings", status=ConnectionStatus.ACTIVE)
+        oauth = MagicMock()
+        oauth.deregister_user.side_effect = RuntimeError("boom")
+
+        user_connection_service.disconnect(db, connection.user_id, "withings", oauth=oauth)
+
+        db.refresh(connection)
+        assert connection.status == ConnectionStatus.REVOKED
+
+    def test_disconnect_leaves_a_linked_users_connection_untouched(self, db: Session) -> None:
+        """Revoking one profile must not revoke a sibling profile sharing the provider account.
+
+        Provider-side teardown is not this service's concern: it happens in the provider's
+        own ``on_disconnect`` before disconnect is called.
+        """
+        provider_user_id = "shared-withings-user"
+        connection = UserConnectionFactory(
+            provider="withings",
+            provider_user_id=provider_user_id,
+            status=ConnectionStatus.ACTIVE,
+            access_token="first-token",
+        )
+        linked_connection = UserConnectionFactory(
+            provider="withings",
+            provider_user_id=provider_user_id,
+            status=ConnectionStatus.ACTIVE,
+            access_token="second-token",
+        )
+        oauth = MagicMock()
+
+        user_connection_service.disconnect(db, connection.user_id, "withings", oauth=oauth)
+
+        db.refresh(connection)
+        db.refresh(linked_connection)
+        assert connection.status == ConnectionStatus.REVOKED
+        assert linked_connection.status == ConnectionStatus.ACTIVE
+        oauth.deregister_user.assert_called_once()
+
+
+class TestUserConnectionServicePurgeProviderData:
+    def test_purge_disconnects_before_deleting_provider_data(self) -> None:
+        db = MagicMock(spec=Session)
+        user_id = uuid4()
+        oauth = MagicMock()
+        lifecycle = MagicMock()
+        disconnect = MagicMock()
+        delete_provider_data = MagicMock(return_value=2)
+        lifecycle.attach_mock(disconnect, "disconnect")
+        lifecycle.attach_mock(delete_provider_data, "delete")
+
+        with (
+            patch.object(user_connection_service, "disconnect", disconnect),
+            patch.object(user_connection_service.data_source_crud, "delete_user_provider_data", delete_provider_data),
+        ):
+            deleted = user_connection_service.purge_provider_data(db, user_id, "withings", oauth=oauth)
+
+        assert lifecycle.mock_calls == [
+            call.disconnect(db, user_id, "withings", oauth=oauth),
+            call.delete(db, user_id, ProviderName.WITHINGS),
+        ]
+        assert deleted == 2
 
 
 class TestUserConnectionServiceConnectionStatus:

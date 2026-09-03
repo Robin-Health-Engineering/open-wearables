@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from tests.factories import DeveloperFactory
 from tests.utils import developer_auth_headers
 
@@ -20,7 +21,9 @@ from tests.utils import developer_auth_headers
 class TestOAuthAuthorizeEndpoint:
     """Test suite for OAuth authorization endpoint."""
 
-    def test_authorize_provider_success(self, client: TestClient, db: Session) -> None:
+    def test_authorize_provider_success(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
         """Test successfully initiating OAuth flow for a provider."""
         # Arrange
         user_id = uuid4()
@@ -29,6 +32,7 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
             params={"user_id": str(user_id)},
+            headers=developer_headers,
         )
 
         # Assert
@@ -40,11 +44,13 @@ class TestOAuthAuthorizeEndpoint:
         assert isinstance(data["state"], str)
         assert len(data["state"]) > 0
 
-    def test_authorize_provider_with_redirect_uri(self, client: TestClient, db: Session) -> None:
-        """Test OAuth flow with optional redirect URI."""
-        # Arrange
+    def test_authorize_provider_with_allowlisted_redirect_uri(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """An allowlisted redirect URI is accepted and stored."""
+        # Arrange — frontend_url is always allowed, so it needs no extra configuration.
         user_id = uuid4()
-        redirect_uri = "https://myapp.com/oauth/callback"
+        redirect_uri = f"{settings.frontend_url}/oauth/callback"
 
         # Act
         response = client.get(
@@ -53,6 +59,7 @@ class TestOAuthAuthorizeEndpoint:
                 "user_id": str(user_id),
                 "redirect_uri": redirect_uri,
             },
+            headers=developer_headers,
         )
 
         # Assert
@@ -61,7 +68,33 @@ class TestOAuthAuthorizeEndpoint:
         assert "authorization_url" in data
         assert "state" in data
 
-    def test_authorize_different_providers(self, client: TestClient, db: Session) -> None:
+    def test_authorize_provider_rejects_foreign_redirect_uri(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """A redirect URI outside the allowlist is refused before it reaches Redis.
+
+        This case previously returned 200 and stored the value, which the callback then
+        replayed into a RedirectResponse — an open redirect on this API's own origin,
+        reachable without an API key.
+        """
+        # Act
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={
+                "user_id": str(uuid4()),
+                "redirect_uri": "https://myapp.com/oauth/callback",
+            },
+            headers=developer_headers,
+        )
+
+        # Assert
+        assert response.status_code == 400
+        # The rejected value must not be echoed back to the caller.
+        assert "myapp.com" not in response.text
+
+    def test_authorize_different_providers(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
         """Test initiating OAuth for different providers."""
         # Arrange
         user_id = uuid4()
@@ -72,6 +105,7 @@ class TestOAuthAuthorizeEndpoint:
             response = client.get(
                 f"/api/v1/oauth/{provider}/authorize",
                 params={"user_id": str(user_id)},
+                headers=developer_headers,
             )
 
             # Assert
@@ -80,27 +114,57 @@ class TestOAuthAuthorizeEndpoint:
             assert "authorization_url" in data
             assert "state" in data
 
-    def test_authorize_missing_user_id(self, client: TestClient, db: Session) -> None:
-        """Test authorization without user_id parameter."""
+    def test_authorize_requires_authentication(self, client: TestClient, db: Session) -> None:
+        """Unauthenticated, this endpoint is an account-linking hijack.
+
+        An attacker calls it with their OWN user_id and no redirect_uri, gets a genuine
+        provider consent URL, and sends it to a victim; the callback then binds the victim's
+        provider account to the attacker's user, server-side, before any redirect is chosen.
+        No redirect allowlist can address that, which is why the auth matters separately.
+        """
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={"user_id": str(uuid4())},
+        )
+
+        assert response.status_code == 401
+
+    def test_authorize_missing_user_id(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """Test authorization without user_id parameter.
+
+        Authenticated on purpose: without headers this now returns 401 before validation
+        runs, which would assert the auth rather than the validation.
+        """
         # Act
-        response = client.get("/api/v1/oauth/garmin/authorize")
+        response = client.get("/api/v1/oauth/garmin/authorize", headers=developer_headers)
 
         # Assert
         assert response.status_code == 400
 
-    def test_authorize_invalid_user_id(self, client: TestClient, db: Session) -> None:
+    def test_authorize_invalid_user_id(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
         """Test authorization with invalid user_id format."""
         # Act
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
             params={"user_id": "not-a-uuid"},
+            headers=developer_headers,
         )
 
         # Assert
         assert response.status_code == 400
 
-    def test_authorize_invalid_provider(self, client: TestClient, db: Session) -> None:
-        """Test authorization with non-existent provider."""
+    def test_authorize_invalid_provider(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """Test authorization with non-existent provider.
+
+        Authenticated on purpose: auth runs before path validation, so without headers this
+        asserts the 401 rather than the 400 it is about.
+        """
         # Arrange
         user_id = uuid4()
 
@@ -108,13 +172,21 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/invalid-provider/authorize",
             params={"user_id": str(user_id)},
+            headers=developer_headers,
         )
 
         # Assert
         assert response.status_code == 400
 
-    def test_authorize_non_oauth_provider(self, client: TestClient, db: Session) -> None:
-        """Test authorization with provider that doesn't support OAuth."""
+    def test_authorize_non_oauth_provider(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """Test authorization with provider that doesn't support OAuth.
+
+        Authenticated deliberately. The assertion accepts a set of codes that now includes
+        the 401 auth returns, so an unauthenticated call would pass this test without ever
+        reaching the provider check it is named for.
+        """
         # Arrange
         user_id = uuid4()
 
@@ -122,10 +194,12 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/apple/authorize",
             params={"user_id": str(user_id)},
+            headers=developer_headers,
         )
 
-        # Assert - Should fail because apple doesn't have OAuth
-        assert response.status_code in [400, 401, 422]
+        # Assert - Should fail because apple doesn't have OAuth, NOT because of auth
+        assert response.status_code != 401
+        assert response.status_code in [400, 422]
 
 
 class TestOAuthProvidersEndpoint:

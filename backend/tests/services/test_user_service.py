@@ -10,15 +10,17 @@ Tests cover:
 """
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import UserCreate, UserUpdate
 from app.services.user_service import user_service
-from tests.factories import UserFactory
+from tests.factories import UserConnectionFactory, UserFactory
 
 
 class TestUserServiceCreate:
@@ -223,6 +225,62 @@ class TestUserServiceDelete:
 
         # Act & Assert - should not raise error
         user_service.delete(db, fake_id, raise_404=False)
+
+    @patch("app.services.user_service.ProviderFactory")
+    def test_delete_runs_provider_teardown_before_revoking_the_grant(
+        self, mock_factory_cls: MagicMock, db: Session
+    ) -> None:
+        """Teardown needs the token that deregistering invalidates, so it has to run first."""
+        user = UserFactory(email="withings-user@example.com")
+        UserConnectionFactory(
+            user=user,
+            provider="withings",
+            status=ConnectionStatus.ACTIVE,
+            access_token="live-token",
+        )
+
+        strategy = MagicMock()
+        mock_factory_cls.return_value.get_provider.return_value = strategy
+
+        user_service.delete(db, user.id)
+
+        strategy.on_disconnect.assert_called_once_with(db, user.id)
+        names = [name for name, _args, _kwargs in strategy.mock_calls]
+        assert names.index("on_disconnect") < names.index("oauth.deregister_user")
+
+    @patch("app.services.user_service.ProviderFactory")
+    def test_delete_leaves_a_linked_users_connection_untouched(self, mock_factory_cls: MagicMock, db: Session) -> None:
+        """Deleting one profile must not revoke a sibling profile sharing the provider account.
+
+        Which of the two owns the provider-side subscription is the provider's call, made
+        inside its own ``on_disconnect``.
+        """
+        provider_user_id = "shared-withings-user"
+        user = UserFactory(email="deleted-withings-user@example.com")
+        linked_user = UserFactory(email="remaining-withings-user@example.com")
+        UserConnectionFactory(
+            user=user,
+            provider="withings",
+            provider_user_id=provider_user_id,
+            status=ConnectionStatus.ACTIVE,
+            access_token="deleted-token",
+        )
+        linked_connection = UserConnectionFactory(
+            user=linked_user,
+            provider="withings",
+            provider_user_id=provider_user_id,
+            status=ConnectionStatus.ACTIVE,
+            access_token="remaining-token",
+        )
+
+        strategy = MagicMock()
+        mock_factory_cls.return_value.get_provider.return_value = strategy
+
+        user_service.delete(db, user.id)
+
+        db.refresh(linked_connection)
+        assert linked_connection.status == ConnectionStatus.ACTIVE
+        strategy.oauth.deregister_user.assert_called_once()
 
 
 class TestUserServiceGetCountInRange:

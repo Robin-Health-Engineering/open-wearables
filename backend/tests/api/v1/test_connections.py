@@ -11,12 +11,15 @@ Tests the /api/v1/users/{user_id}/connections endpoint including:
 
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.api.routes.v1.connections import delete_provider_data_endpoint
 from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, User, UserConnection, WorkoutDetails
 from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import ProviderName
 from tests.factories import (
     ApiKeyFactory,
     DataPointSeriesFactory,
@@ -476,6 +479,28 @@ class TestDisconnectEndpoint:
 
 class TestDeleteProviderDataEndpoint:
     """Test suite for DELETE /api/v1/users/{user_id}/connections/{provider}/data."""
+
+    def test_delete_data_runs_provider_teardown_before_purging(self) -> None:
+        """Teardown runs while the connection's tokens are still valid.
+
+        What a provider does in ``on_disconnect`` is its own concern; the default is
+        a no-op, covered in tests/providers/test_base_strategy.py.
+        """
+        db = MagicMock(spec=Session)
+        user_id = uuid4()
+        strategy = MagicMock()
+
+        with (
+            patch("app.api.routes.v1.connections.ProviderFactory") as provider_factory,
+            patch("app.api.routes.v1.connections.user_connection_service.purge_provider_data") as purge,
+        ):
+            provider_factory.return_value.get_provider.return_value = strategy
+
+            response = delete_provider_data_endpoint(user_id, ProviderName.WITHINGS, db, MagicMock())
+
+        assert response.status_code == 204
+        strategy.on_disconnect.assert_called_once_with(db, user_id)
+        purge.assert_called_once_with(db, user_id, ProviderName.WITHINGS.value, oauth=strategy.oauth)
 
     def _seed_provider_data(self, user: User, provider: str) -> DataSource:
         """Create a data_source with a workout (+details), a time series and a health score."""

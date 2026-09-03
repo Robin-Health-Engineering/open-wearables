@@ -38,6 +38,32 @@ def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
         )
 
 
+def _log_provider_sync_failure(
+    e: Exception, *, component: str, provider_name: str, user_id: str, trace_id: str
+) -> None:
+    """Report a component failure without inspecting provider-specific exceptions."""
+    message = f"{component} sync failed for {provider_name}: {e}"
+    log_structured(
+        logger,
+        "warning",
+        message,
+        provider=provider_name,
+        task="sync_vendor_data",
+        user_id=user_id,
+    )
+    log_and_capture_error(
+        e,
+        logger,
+        message,
+        extra={
+            "user_id": user_id,
+            "provider": provider_name,
+            "task": "sync_vendor_data",
+            "trace_id": trace_id,
+        },
+    )
+
+
 def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is_historical: bool) -> bool:
     """True if the provider should be included in this REST pull run.
 
@@ -127,14 +153,14 @@ def sync_vendor_data(
             # Only sync providers in pull mode. Push-only providers (Garmin, Apple SDK)
             # deliver data via webhooks/SDK and must not be polled here.
             # Historical backfill always uses REST regardless of live_sync_mode.
+            strategies = {c.provider: factory.get_provider(c.provider) for c in connections}
             connections = [
                 c
                 for c in connections
                 if _include_in_periodic_pull(
-                    factory.get_provider(c.provider).capabilities,
-                    provider_settings[c.provider].live_sync_mode
-                    if c.provider in provider_settings
-                    else LiveSyncMode.PULL,
+                    strategies[c.provider].capabilities,
+                    (provider_settings[c.provider].live_sync_mode if c.provider in provider_settings else None)
+                    or strategies[c.provider].default_live_sync_mode,
                     is_historical,
                 )
             ]
@@ -299,24 +325,12 @@ def sync_vendor_data(
                             success = strategy.workouts.load_data(db, user_uuid, **params)
                             provider_result.params["workouts"] = {"success": success, **params}
                         except Exception as e:
-                            log_structured(
-                                logger,
-                                "warning",
-                                f"Workouts sync failed for {provider_name}: {e}",
-                                provider=provider_name,
-                                task="sync_vendor_data",
-                                user_id=user_id,
-                            )
-                            log_and_capture_error(
+                            _log_provider_sync_failure(
                                 e,
-                                logger,
-                                f"Workouts sync failed for {provider_name}: {e}",
-                                extra={
-                                    "user_id": user_id,
-                                    "provider": provider_name,
-                                    "task": "sync_vendor_data",
-                                    "trace_id": trace_id,
-                                },
+                                component="Workouts",
+                                provider_name=provider_name,
+                                user_id=user_id,
+                                trace_id=trace_id,
                             )
                             provider_result.params["workouts"] = {"success": False, "error": str(e)}
 
@@ -375,24 +389,12 @@ def sync_vendor_data(
                                 user_id=user_id,
                             )
                         except Exception as e:
-                            log_structured(
-                                logger,
-                                "warning",
-                                f"247 data sync failed for {provider_name}: {e}",
-                                provider=provider_name,
-                                task="sync_vendor_data",
-                                user_id=user_id,
-                            )
-                            log_and_capture_error(
+                            _log_provider_sync_failure(
                                 e,
-                                logger,
-                                f"247 data sync failed for {provider_name}: {e}",
-                                extra={
-                                    "user_id": user_id,
-                                    "provider": provider_name,
-                                    "task": "sync_vendor_data",
-                                    "trace_id": trace_id,
-                                },
+                                component="247 data",
+                                provider_name=provider_name,
+                                user_id=user_id,
+                                trace_id=trace_id,
                             )
                             provider_result.params["data_247"] = {"success": False, "error": str(e)}
 

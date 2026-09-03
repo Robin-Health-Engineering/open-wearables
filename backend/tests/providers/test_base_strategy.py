@@ -10,6 +10,8 @@ Tests cover:
 """
 
 from abc import ABC
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -22,6 +24,7 @@ from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.garmin.strategy import GarminStrategy
 from app.services.providers.polar.strategy import PolarStrategy
 from app.services.providers.suunto.strategy import SuuntoStrategy
+from app.services.providers.withings.strategy import WithingsStrategy
 
 
 class TestBaseProviderStrategy:
@@ -111,6 +114,20 @@ class TestBaseProviderStrategy:
         # Assert
         assert strategy.has_cloud_api is False
         assert strategy.oauth is None
+
+    def test_withings_tears_down_subscriptions_on_disconnect(self) -> None:
+        """A per-user provider overrides on_disconnect to revoke at the vendor."""
+        strategy = WithingsStrategy()
+        db, user_id = MagicMock(), uuid4()
+
+        with patch.object(strategy.webhook_service, "remove_user") as remove_user:
+            strategy.on_disconnect(db, user_id)
+
+        remove_user.assert_called_once_with(db, user_id)
+
+    def test_on_disconnect_is_a_no_op_by_default(self) -> None:
+        """Providers holding no per-connection vendor state inherit a no-op."""
+        assert AppleStrategy().on_disconnect(MagicMock(), uuid4()) is None
 
     def test_icon_url_generation(self) -> None:
         """Should generate correct icon URL path."""

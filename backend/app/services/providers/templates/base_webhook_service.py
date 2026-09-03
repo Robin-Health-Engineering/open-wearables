@@ -1,6 +1,9 @@
 """Abstract base class for provider webhook subscription management services."""
 
 from typing import Any
+from uuid import UUID
+
+from app.database import DbSession
 
 
 class BaseWebhookService:
@@ -28,3 +31,11 @@ class BaseWebhookService:
 
     async def update_subscription(self, subscription_id: str, callback_url: str) -> Any:
         raise NotImplementedError("This provider does not support updating a webhook subscription")
+
+    def reconcile_user_subscriptions(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
+        """Reconcile one user's subscriptions against the provider's current live-sync mode.
+
+        Only implemented by providers declaring ``webhook_subscription_per_user``;
+        it is the entry point of the ``sync_provider_user_subscription`` task.
+        """
+        raise NotImplementedError("This provider does not support per-user webhook subscription management")

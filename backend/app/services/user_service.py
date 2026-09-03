@@ -75,6 +75,9 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
                 continue
             try:
                 strategy = provider_factory.get_provider(connection.provider)
+                # Teardown first: revoking the grant below invalidates the token that
+                # provider-side cleanup needs.
+                strategy.on_disconnect(db_session, user.id)
                 if oauth := strategy.oauth:
                     oauth.deregister_user(connection.access_token, provider_user_id=connection.provider_user_id)
             except Exception as e:

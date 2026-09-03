@@ -1,0 +1,94 @@
+name: Publish Robin backend image
+
+# Robin-specific: publishes the PATCHED backend image to our own ECR so the staging box
+# can run the Withings connector, which exists only in an unmerged upstream PR.
+#
+# Deliberately separate from publish-images.yml (upstream's Docker Hub workflow) rather
+# than a matrix entry in it: that file belongs to upstream and we want it to keep merging
+# cleanly on every rebase. Nothing here is upstreamable.
+#
+# Actions are pinned by commit SHA, matching ow-infra's convention: a tag is mutable, and
+# this workflow mints AWS credentials, so a repointed tag would run attacker code with them.
+#
+# Auth is OIDC into ow-ci-publish-image, whose trust policy names the `staging-images`
+# environment - not a branch - so connector work on feature branches can publish without
+# the IAM policy chasing branch names. Push only: the role cannot deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (defaults to the branch the run is started from)"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write # required to request the OIDC token
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REGISTRY: 535002861150.dkr.ecr.eu-central-1.amazonaws.com
+  ECR_REPOSITORY: ow-backend
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Gates the OIDC trust. Adding required reviewers to this environment in repo
+    # settings is what turns publishing into a reviewed action, without touching IAM.
+    environment: staging-images
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      # github.sha is the SHA of github.ref — the branch selected when the run is started —
+      # NOT of whatever `ref` checked out. Tagging with it would let sha-<x> name a tree that
+      # is not in the image, which defeats the one job an immutable tag has. Read it back from
+      # the working tree instead.
+      - name: Resolve the SHA actually checked out
+        id: resolved
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: arn:aws:iam::535002861150:role/ow-ci-publish-image
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Two tags: a moving `staging` for humans, and an immutable sha tag so a deploy can
+      # always name the exact build. The compose file pins the DIGEST regardless, which is
+      # what actually decides the running bytes.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:staging
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${{ steps.resolved.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The digest is the whole point: ow-infra's docker-compose.yml pins tag@digest, so a
+      # retag can never change what staging runs. Print it where whoever bumps compose can
+      # copy it without going digging in ECR.
+      - name: Report the image reference to pin
+        run: |
+          {
+            echo "### Image published"
+            echo
+            echo '```'
+            echo "${ECR_REGISTRY}/${ECR_REPOSITORY}:staging@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Pin this in \`ow-infra/docker-compose.yml\` (tag@digest), then merge to"
+            echo "ow-infra main to release it to the staging box."
+          } >> "$GITHUB_STEP_SUMMARY"

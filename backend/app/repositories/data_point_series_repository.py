@@ -1,4 +1,5 @@
 import contextlib
+from collections.abc import Iterable
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from typing import LiteralString, NamedTuple
@@ -57,7 +58,7 @@ DataSourceIdentity = tuple[UUID, str | None, str | None]
 
 
 class WriteCounts(int):
-    """Result of a bulk upsert: total rows written, split into new vs updated.
+    """Result of a write: total rows written, split into new vs updated.
 
     Behaves as ``inserted + updated`` so existing int-based callers (sums,
     ``records_saved`` logging, ``dict[str, int]`` results) keep working
@@ -65,16 +66,59 @@ class WriteCounts(int):
     ``.inserted`` (rows that did not exist) and ``.updated`` (rows refreshed
     in place via ON CONFLICT). Distinguishing the two is what stops a pure
     upsert-in-place from looking like newly arrived data.
+
+    ``skipped`` and ``failed`` count rows that were *not* written, for writers
+    that tolerate a bad row instead of failing the batch; both default to 0.
+    Writers with no new-vs-updated split use ``unsplit``, which keeps the total
+    exact and sets ``split_known`` False so reporters can omit the split.
     """
 
     inserted: int
     updated: int
+    skipped: int
+    failed: int
+    split_known: bool
 
-    def __new__(cls, inserted: int, updated: int) -> "WriteCounts":
-        obj = super().__new__(cls, inserted + updated)
+    def __new__(cls, inserted: int, updated: int, *, skipped: int = 0, failed: int = 0) -> "WriteCounts":
+        return cls._build(inserted + updated, inserted, updated, skipped, failed, split_known=True)
+
+    @classmethod
+    def unsplit(cls, written: int, *, skipped: int = 0, failed: int = 0) -> "WriteCounts":
+        """Rows written by a path with no new-vs-updated split available."""
+        return cls._build(written, 0, 0, skipped, failed, split_known=False)
+
+    @classmethod
+    def _build(
+        cls, written: int, inserted: int, updated: int, skipped: int, failed: int, *, split_known: bool
+    ) -> "WriteCounts":
+        if min(written, inserted, updated, skipped, failed) < 0:
+            raise ValueError("WriteCounts must not be negative")
+        obj = super().__new__(cls, written)
         obj.inserted = inserted
         obj.updated = updated
+        obj.skipped = skipped
+        obj.failed = failed
+        obj.split_known = split_known
         return obj
+
+    @classmethod
+    def coerce(cls, value: int) -> "WriteCounts":
+        """Adopt a plain int count from a writer that does not report a split."""
+        return value if isinstance(value, cls) else cls.unsplit(int(value))
+
+    @classmethod
+    def combine(cls, counts: "Iterable[WriteCounts]") -> "WriteCounts":
+        """Total several writes, keeping the split only when every part reports one."""
+        parts = [cls.coerce(count) for count in counts]
+        split_known = bool(parts) and all(part.split_known for part in parts)
+        return cls._build(
+            sum(int(part) for part in parts),
+            sum(part.inserted for part in parts) if split_known else 0,
+            sum(part.updated for part in parts) if split_known else 0,
+            sum(part.skipped for part in parts),
+            sum(part.failed for part in parts),
+            split_known=split_known,
+        )
 
 
 class DataPointSeriesRepository(
