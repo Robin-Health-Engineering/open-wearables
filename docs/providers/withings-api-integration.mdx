@@ -230,7 +230,7 @@ WITHINGS_API_REQUESTS_PER_MINUTE=120
 | `user.info` | Account information, linked devices, and goals |
 | `user.metrics` | Body measurements (weight, body composition, blood pressure, heart rate, etc.) |
 | `user.activity` | Physical activity and sleep data, including Sleep v2 - Getsummary |
-| `user.sleepevents` | Bed-sensor event notifications (bed in/out, inflate completion) - not requested by default; Open Wearables doesn't subscribe to those notification categories |
+| `user.sleepevents` | Bed-sensor event notifications (bed in/out, inflate completion) - **requested by default, but not yet consumed**: Open Wearables does not subscribe to appli 50/51/52. It is requested because OAuth scope is fixed at authorization time, so adding it later would force every already-connected member to re-authorize |
 
 <Note>
 The scopes requested by Open Wearables are controlled by `WITHINGS_DEFAULT_SCOPE`, a **comma-separated** list - see the warning in the configuration step above.

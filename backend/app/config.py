@@ -234,6 +234,10 @@ class Settings(BaseSettings):
     email_from_address: str | None = None
     email_from_name: str = "Open Wearables"
     frontend_url: str = "http://localhost:3000"
+    # Extra prefixes accepted as post-OAuth redirect targets, comma-separated. frontend_url is
+    # always allowed on top of these. Native apps add their custom scheme (e.g. "robin://").
+    # See app/utils/redirect_allowlist.py for why this is enforced.
+    oauth_allowed_redirect_prefixes: list[str] = []
     invitation_expire_days: int = 7
     email_max_retries: int = 5
 
@@ -341,6 +345,13 @@ class Settings(BaseSettings):
             self.google_webhook_secret = SecretStr(self.secret_key)
         return self
 
+    @field_validator("oauth_allowed_redirect_prefixes", mode="before")
+    @classmethod
+    def split_redirect_prefixes(cls, v: str | list[str]) -> list[str]:
+        if isinstance(v, str):
+            return [p.strip() for p in v.split(",") if p.strip()]
+        return v
+
     @field_validator("cors_origins", mode="after")
     @classmethod
     def assemble_cors_origins(cls, v: str | list[str]) -> list[str] | str:
@@ -434,3 +445,8 @@ def _get_settings() -> Settings:
 
 
 settings = _get_settings()
+
+
+def allowed_redirect_prefixes() -> list[str]:
+    """Redirect prefixes this deployment accepts: the configured ones plus frontend_url."""
+    return [*settings.oauth_allowed_redirect_prefixes, settings.frontend_url]

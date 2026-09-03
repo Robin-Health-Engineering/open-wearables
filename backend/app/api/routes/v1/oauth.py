@@ -7,7 +7,7 @@ from celery import current_app as celery_app
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
-from app.config import settings
+from app.config import allowed_redirect_prefixes, settings
 from app.database import DbSession
 from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
 from app.schemas.auth import LiveSyncMode
@@ -22,6 +22,7 @@ from app.services import DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.utils.redirect_allowlist import is_allowed_redirect_uri
 from app.utils.structured_logging import log_structured
 
 router = APIRouter()
@@ -59,6 +60,15 @@ def authorize_provider(
 
     Returns authorization URL where user should be redirected to log in.
     """
+    # Reject before the value reaches Redis. This endpoint has no API-key dependency, so an
+    # unvalidated redirect_uri here is an open redirect on our own origin.
+    if not is_allowed_redirect_uri(redirect_uri, allowed_redirect_prefixes()):
+        # Deliberately does not echo the rejected value back to the caller.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="redirect_uri is not an allowed redirect target",
+        )
+
     strategy = get_oauth_strategy(provider)
 
     assert strategy.oauth
@@ -147,9 +157,19 @@ def oauth_callback(
             error=str(e),
         )
 
-    # If a specific redirect_uri was requested (e.g. by frontend), redirect there
+    # If a specific redirect_uri was requested (e.g. by frontend), redirect there.
+    # Re-checked rather than trusted: this state may predate the check on authorize, and the
+    # cost of being wrong here is a redirect off our own origin.
     if oauth_state.redirect_uri:
-        return RedirectResponse(url=oauth_state.redirect_uri, status_code=303)
+        if is_allowed_redirect_uri(oauth_state.redirect_uri, allowed_redirect_prefixes()):
+            return RedirectResponse(url=oauth_state.redirect_uri, status_code=303)
+        log_structured(
+            logger,
+            "warning",
+            "Stored redirect_uri is not allowlisted; falling back to the success page",
+            provider=provider.value,
+            user_id=str(oauth_state.user_id),
+        )
 
     # Otherwise, redirect to internal success page
     return RedirectResponse(
