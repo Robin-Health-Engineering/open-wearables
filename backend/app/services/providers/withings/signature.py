@@ -1,25 +1,30 @@
-"""HMAC request signing for Withings service-level calls.
+"""HMAC request signing for Withings' partner ("Pro Solutions") surface.
 
-Withings does not authenticate these calls with the client secret in the request body.
-The secret is the **HMAC key** and is never transmitted: you fetch a single-use ``nonce``,
-concatenate an agreed set of parameter *values* sorted by key name, join them with commas,
-and send the HMAC-SHA256 hex digest as ``signature``.
+NOT used on the OAuth token path. `requesttoken` takes `client_secret` in the body, and the
+API reference declares that form co-equally rather than as a legacy fallback; nonce+HMAC belongs
+to the contract-gated surface — `dropshipmentv2-*`, `devicev2-*`, `listusers`, `createclient` —
+where it SUBSTITUTES for a user access token on calls made in the application's own name.
+`notify subscribe` states it outright: signature/nonce are "DO NOT USE WITH FOLLOWING PARAMS:
+[access_token]". Wiring it into the OAuth exchange also bought a real cost — a second HTTP call
+ahead of the token POST, inside the 30-second lifetime of the authorization code.
+
+This lives here for **phase 2**: `POST /v2/sdk action=createuser` provisions a Withings account
+in our own name and does require it. Deliberately free of any dependency on BaseOAuthTemplate,
+because that call is not an OAuth flow.
+
+The scheme: fetch a single-use `nonce`, concatenate an agreed set of parameter *values* sorted by
+key name, join with commas, and send the HMAC-SHA256 hex digest as `signature`. The secret is the
+key and is never transmitted.
 
 Two different key sets are in play, which is the easy thing to get wrong:
 
 * ``getnonce`` has no nonce yet, so it signs ``action, client_id, timestamp``.
 * every other signed call signs ``action, client_id, nonce``.
 
-Only those keys are signed even when the request carries more fields - ``requesttoken``
-also sends ``grant_type``, ``code``/``refresh_token`` and ``redirect_uri``, none of which
-enter the digest.
+Only those keys are signed even when the request carries more fields.
 
-This module is deliberately free of any dependency on ``BaseOAuthTemplate``: phase 2 of the
-Withings integration needs the exact same primitive for ``POST /v2/sdk action=createuser``
-(partner-provisioned accounts), and that call has nothing to do with OAuth.
-
-Verified against the live API on 2026-09-02: a ``getnonce`` signed this way returns
-``status: 0`` with our production credentials.
+Verified against the live API on 2026-09-02: a ``getnonce`` signed this way returns ``status: 0``
+with our production credentials.
 """
 
 import hashlib

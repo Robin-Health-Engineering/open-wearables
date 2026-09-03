@@ -1,7 +1,6 @@
 """Handle Withings OAuth token RPC envelopes and provider user identity."""
 
 import logging
-from datetime import UTC, datetime
 from uuid import UUID
 
 import httpx
@@ -18,10 +17,7 @@ from app.schemas.model_crud.credentials import (
     ProviderEndpoints,
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
-from app.services.providers.withings._client import WITHINGS_API_BASE_URL
-from app.services.providers.withings.refresh_lock import single_flight_refresh
 from app.services.providers.withings.request_budget import acquire_request_slot
-from app.services.providers.withings.signature import sign_payload
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -101,53 +97,7 @@ class WithingsOAuth(BaseOAuthTemplate):
         }
         return self._request_token(payload, task="exchange_token", max_wait_seconds=_EXCHANGE_MAX_WAIT_SECONDS)
 
-    def _already_rotated(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse | None:
-        """Return another worker's freshly rotated token, if there is one.
-
-        Withings invalidates ``refresh_token`` the moment a rotation happens, so a stored
-        refresh token that differs from the one we were handed is proof that somebody
-        else has already refreshed. Reusing their result is not an optimisation - issuing
-        our own requesttoken with the dead ``refresh_token`` would fail, and issuing it
-        with the live one would orphan their rotation.
-        """
-        db.expire_all()  # drop the identity-map copy; another worker wrote this row
-        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
-        if not connection or not connection.access_token or not connection.refresh_token:
-            return None
-        if connection.refresh_token == refresh_token:
-            return None  # nothing rotated while we waited
-
-        expires_at = connection.token_expires_at
-        expires_in = int((expires_at - datetime.now(UTC)).total_seconds()) if expires_at else 0
-        if expires_in <= 0:
-            return None  # rotated, but already stale - refresh properly
-
-        log_structured(
-            logger,
-            "info",
-            "Withings token already refreshed by another worker",
-            provider=self.provider_name,
-            task="refresh_access_token",
-            user_id=str(user_id),
-        )
-        return OAuthTokenResponse(
-            access_token=connection.access_token,
-            token_type="Bearer",
-            refresh_token=connection.refresh_token,
-            expires_in=expires_in,
-        )
-
     def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
-        # Serialised per user: Withings rotates the refresh token on every call, so two
-        # concurrent refreshes leave the connection holding an already-invalidated token.
-        # See refresh_lock.py for the interleaving this prevents.
-        with single_flight_refresh(user_id):
-            reused = self._already_rotated(db, user_id, refresh_token)
-            if reused:
-                return reused
-            return self._do_refresh(db, user_id, refresh_token)
-
-    def _do_refresh(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
         payload = {
             "action": "requesttoken",
             "grant_type": "refresh_token",
@@ -182,29 +132,10 @@ class WithingsOAuth(BaseOAuthTemplate):
         )
         return token_response
 
-    def _authenticate_payload(self, payload: dict[str, str]) -> dict[str, str]:
-        """Apply the configured token-auth scheme.
-
-        In "signature" mode the client secret never leaves our process: it keys an HMAC
-        over a freshly fetched nonce. In "secret" mode the payload is passed through with
-        client_secret in the body, which is what the upstream branch did.
-        """
-        if settings.withings_auth_mode != "signature":
-            return payload
-        client_id = self.credentials.client_id
-        client_secret = self.credentials.client_secret
-        if not client_id or not client_secret:
-            raise HTTPException(
-                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Withings credentials are not configured",
-            )
-        return sign_payload(payload, client_id, client_secret, api_base_url=WITHINGS_API_BASE_URL)
-
     def _request_token(
         self, payload: dict[str, str], *, task: str, max_wait_seconds: float | None = None
     ) -> OAuthTokenResponse:
         """POST a token request and unwrap the Withings ``{status, body}`` envelope."""
-        payload = self._authenticate_payload(payload)
         if max_wait_seconds is not None:
             acquire_request_slot(max_wait_seconds=max_wait_seconds)
         else:
@@ -227,10 +158,13 @@ class WithingsOAuth(BaseOAuthTemplate):
                 task=task,
                 status_code=e.response.status_code,
             )
+            # The body is LOGGED above, never returned: WithingsTokenError subclasses
+            # HTTPException, so `detail` is serialised to our own API caller — and this is the
+            # response to a requesttoken whose payload carried client_secret and refresh_token.
             raise WithingsTokenError(
                 task=task,
                 http_status=e.response.status_code,
-                detail=f"Withings token request failed: {e.response.text}",
+                detail=f"Withings token request failed (HTTP {e.response.status_code})",
             ) from e
         except Exception as e:
             log_structured(
@@ -240,9 +174,11 @@ class WithingsOAuth(BaseOAuthTemplate):
                 provider=self.provider_name,
                 task=task,
             )
+            # Same reasoning: an arbitrary exception's str() can embed a response fragment
+            # (httpx errors quote the request URL, and a JSON parse error quotes the body).
             raise HTTPException(
                 status_code=HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Withings token request failed: {e}",
+                detail="Withings token request failed",
             ) from e
 
         status = envelope.get("status")

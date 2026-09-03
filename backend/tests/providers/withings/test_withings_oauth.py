@@ -1,13 +1,11 @@
-from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi import HTTPException
-from pydantic import SecretStr
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.models import User
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
@@ -15,30 +13,6 @@ from app.schemas.auth import AuthenticationMethod, ConnectionStatus
 from app.schemas.model_crud.credentials import OAuthTokenResponse
 from app.services.providers.withings.oauth import WithingsOAuth, WithingsTokenError
 from tests.factories import UserConnectionFactory, UserFactory
-
-
-@pytest.fixture(autouse=True)
-def _stub_withings_nonce() -> Iterator[None]:
-    """Stop the default signature auth mode reaching the network in these tests.
-
-    WITHINGS_AUTH_MODE defaults to "signature", so every token request first fetches a
-    single-use nonce over HTTP. These tests patch ``httpx.post`` with a single canned
-    token envelope, which the nonce call would consume instead - so without this stub they
-    fail on a missing nonce rather than on anything they mean to assert.
-
-    Credentials are set for the same reason: signature mode refuses to sign with an empty
-    secret (an empty key yields a plausible digest that Withings rejects opaquely), and CI
-    has no Withings environment configured.
-
-    Only the network hop is stubbed: sign_payload still runs, so the real signing path is
-    exercised and ``mock_post`` still sees exactly one call, the token request.
-    """
-    with (
-        patch("app.services.providers.withings.signature.get_nonce", return_value="test-nonce"),
-        patch.object(settings, "withings_client_id", "test-client-id"),
-        patch.object(settings, "withings_client_secret", SecretStr("test-client-secret")),
-    ):
-        yield
 
 
 @pytest.fixture
@@ -318,49 +292,22 @@ def test_deregister_user_does_not_duplicate_notify_teardown(
     mock_post.assert_not_called()
 
 
-class TestTokenAuthMode:
-    """WITHINGS_AUTH_MODE selects how a token request proves it is us."""
+@patch("httpx.post")
+def test_upstream_error_body_never_reaches_the_api_caller(mock_post: MagicMock, withings_oauth: WithingsOAuth) -> None:
+    """WithingsTokenError is an HTTPException, so `detail` is serialised to OUR caller.
 
-    @patch("httpx.post")
-    def test_signature_mode_replaces_the_secret_with_a_nonce_and_digest(
-        self, mock_post: MagicMock, withings_oauth: WithingsOAuth
-    ) -> None:
-        mock_post.return_value = MagicMock(
-            raise_for_status=MagicMock(),
-            json=MagicMock(
-                return_value={
-                    "status": 0,
-                    "body": {"access_token": "at", "token_type": "Bearer", "refresh_token": "rt", "expires_in": 10800},
-                }
-            ),
-        )
-        with patch.object(settings, "withings_auth_mode", "signature"):
-            withings_oauth._exchange_token("the_code", None)
+    The body it would carry is the response to a requesttoken whose payload held client_secret
+    and refresh_token, so it must be logged and not returned.
+    """
+    secret_body = "error: invalid client_secret=abc123 for refresh_token=rt_xyz"
+    response = MagicMock(status_code=400, text=secret_body)
+    mock_post.return_value = MagicMock(
+        raise_for_status=MagicMock(side_effect=httpx.HTTPStatusError("400", request=MagicMock(), response=response))
+    )
 
-        sent = mock_post.call_args.kwargs["data"]
-        # The secret is the HMAC key, so it must never travel in the body.
-        assert "client_secret" not in sent
-        assert sent["nonce"] == "test-nonce"
-        assert len(sent["signature"]) == 64
-        # Non-signed parameters still have to be sent.
-        assert sent["grant_type"] == "authorization_code"
-        assert sent["code"] == "the_code"
+    with pytest.raises(HTTPException) as exc:
+        withings_oauth._exchange_token("the_code", None)
 
-    @patch("httpx.post")
-    def test_secret_mode_keeps_the_legacy_body_form(self, mock_post: MagicMock, withings_oauth: WithingsOAuth) -> None:
-        mock_post.return_value = MagicMock(
-            raise_for_status=MagicMock(),
-            json=MagicMock(
-                return_value={
-                    "status": 0,
-                    "body": {"access_token": "at", "token_type": "Bearer", "refresh_token": "rt", "expires_in": 10800},
-                }
-            ),
-        )
-        with patch.object(settings, "withings_auth_mode", "secret"):
-            withings_oauth._exchange_token("the_code", None)
-
-        sent = mock_post.call_args.kwargs["data"]
-        assert "client_secret" in sent
-        assert "signature" not in sent
-        assert "nonce" not in sent
+    assert "abc123" not in str(exc.value.detail)
+    assert "rt_xyz" not in str(exc.value.detail)
+    assert "400" in str(exc.value.detail)
