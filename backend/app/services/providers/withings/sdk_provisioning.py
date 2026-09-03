@@ -25,7 +25,12 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate
 from app.services.outgoing_webhooks.events import on_connection_created
-from app.services.providers.withings.sdk_users import SdkTokens, create_sdk_user, exchange_sdk_code
+from app.services.providers.withings.sdk_users import (
+    SdkTokens,
+    WithingsSdkUserError,
+    create_sdk_user,
+    exchange_sdk_code,
+)
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -150,6 +155,12 @@ def provision_sdk_account(
                 scope=tokens.scope,
             ),
         )
+        if connection is None:
+            # The repository types create() as Optional. base_oauth silences that with a
+            # checker-suppression comment; here it is handled instead, because a provisioning
+            # that reached this point has already created a real Withings account —
+            # continuing without a connection row would strand it, reachable by nothing.
+            raise WithingsSdkUserError(detail="the Withings account was created but its connection could not be stored")
         on_connection_created(
             user_id=user_id,
             provider=provider,
