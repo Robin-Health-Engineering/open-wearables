@@ -65,9 +65,9 @@ class SdkUser:
 def _measures_payload(weight_kg: float, height_m: float) -> str:
     """Withings takes measures as JSON, with a value/unit pair per measure.
 
-    ``unit`` is a power of ten: value * 10^unit is the real quantity. 75.4 kg is therefore
-    {value: 754, unit: -1}, not {value: 75.4}. Sending a float here is accepted and then
-    silently misread, which is the worst of both.
+    ``unit`` is a power of ten: value * 10^unit is the real quantity. At the milli precision
+    used here, 75.4 kg is {value: 75400, unit: -3}, not {value: 75.4}. Sending a float is
+    accepted and then silently misread, which is the worst of both.
     """
     return json.dumps(
         [
@@ -100,17 +100,15 @@ def create_sdk_user(
 ) -> SdkUser:
     """Provision a Withings account for one member and return its authorization code.
 
-    The returned ``code`` is short-lived and must be exchanged for tokens. That exchange is
-    deliberately NOT done here — see the module docstring in the follow-up work — because two
-    of its properties are unverified against a real SDK code: whether ``redirect_uri`` is
-    required for a code that never came from a redirect, and how ``csrf_token`` (which the
-    SDK WebViews need) is returned. Guessing either would bake an untested assumption into
-    the token store.
+    The returned ``code`` is short-lived and must be exchanged for tokens. That exchange is a
+    follow-up rather than an unknown: Withings documents it as ``requesttoken`` with
+    ``grant_type=authorization_code``, ``redirect_uri`` REQUIRED even though this code never
+    came from a redirect, and nonce+signature rather than client_secret-in-body — so
+    ``signature.py`` covers it too. The response carries ``csrf_token`` alongside the token
+    pair, which is why ``withings_sdk_account`` exists to hold it.
     """
     if not _SHORTNAME_RE.match(shortname):
-        raise ValueError(
-            f"shortname must match {_SHORTNAME_RE.pattern} (Withings renders it on the device screen)"
-        )
+        raise ValueError(f"shortname must match {_SHORTNAME_RE.pattern} (Withings renders it on the device screen)")
     if gender not in (0, 1):
         raise ValueError("gender must be 0 (male) or 1 (female) per the Withings API")
     if mailingpref not in (0, 1):
@@ -161,9 +159,7 @@ def create_sdk_user(
             task="createuser",
             status_code=e.response.status_code,
         )
-        raise WithingsSdkUserError(
-            detail=f"Withings createuser failed (HTTP {e.response.status_code})"
-        ) from e
+        raise WithingsSdkUserError(detail=f"Withings createuser failed (HTTP {e.response.status_code})") from e
     except Exception as e:
         log_structured(
             logger,

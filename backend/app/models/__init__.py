@@ -20,6 +20,7 @@ from .sleep_details import SleepDetails
 from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
+from .withings_sdk_account import WithingsSdkAccount
 from .workout_details import WorkoutDetails
 
 # Single source of truth mapping detail_type -> concrete model, derived from the
@@ -30,6 +31,7 @@ DETAIL_MODELS: dict[DetailType, type[EventRecordDetail]] = {
 }
 
 __all__ = [
+    "WithingsSdkAccount",
     "ApiKey",
     "Application",
     "ArchivalSetting",
