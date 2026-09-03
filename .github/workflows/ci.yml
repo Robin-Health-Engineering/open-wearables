@@ -23,7 +23,10 @@ jobs:
       mcp: ${{ steps.filter.outputs.mcp }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      # SHA-pinned: a floating tag on a personal-account action is mutable, and this one
+      # runs on every PR with the branch checked out. Robin-specific divergence from
+      # upstream; keep it on rebase.
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: filter
         with:
           filters: |
