@@ -129,10 +129,16 @@ class TestOAuthAuthorizeEndpoint:
 
         assert response.status_code == 401
 
-    def test_authorize_missing_user_id(self, client: TestClient, db: Session) -> None:
-        """Test authorization without user_id parameter."""
+    def test_authorize_missing_user_id(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """Test authorization without user_id parameter.
+
+        Authenticated on purpose: without headers this now returns 401 before validation
+        runs, which would assert the auth rather than the validation.
+        """
         # Act
-        response = client.get("/api/v1/oauth/garmin/authorize")
+        response = client.get("/api/v1/oauth/garmin/authorize", headers=developer_headers)
 
         # Assert
         assert response.status_code == 400
@@ -151,8 +157,14 @@ class TestOAuthAuthorizeEndpoint:
         # Assert
         assert response.status_code == 400
 
-    def test_authorize_invalid_provider(self, client: TestClient, db: Session) -> None:
-        """Test authorization with non-existent provider."""
+    def test_authorize_invalid_provider(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """Test authorization with non-existent provider.
+
+        Authenticated on purpose: auth runs before path validation, so without headers this
+        asserts the 401 rather than the 400 it is about.
+        """
         # Arrange
         user_id = uuid4()
 
@@ -160,13 +172,21 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/invalid-provider/authorize",
             params={"user_id": str(user_id)},
+            headers=developer_headers,
         )
 
         # Assert
         assert response.status_code == 400
 
-    def test_authorize_non_oauth_provider(self, client: TestClient, db: Session) -> None:
-        """Test authorization with provider that doesn't support OAuth."""
+    def test_authorize_non_oauth_provider(
+        self, client: TestClient, db: Session, developer_headers: dict[str, str]
+    ) -> None:
+        """Test authorization with provider that doesn't support OAuth.
+
+        Authenticated deliberately. The assertion accepts a set of codes that now includes
+        the 401 auth returns, so an unauthenticated call would pass this test without ever
+        reaching the provider check it is named for.
+        """
         # Arrange
         user_id = uuid4()
 
@@ -174,10 +194,12 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/apple/authorize",
             params={"user_id": str(user_id)},
+            headers=developer_headers,
         )
 
-        # Assert - Should fail because apple doesn't have OAuth
-        assert response.status_code in [400, 401, 422]
+        # Assert - Should fail because apple doesn't have OAuth, NOT because of auth
+        assert response.status_code != 401
+        assert response.status_code in [400, 422]
 
 
 class TestOAuthProvidersEndpoint:
