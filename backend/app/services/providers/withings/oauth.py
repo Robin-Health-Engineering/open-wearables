@@ -27,8 +27,13 @@ logger = logging.getLogger(__name__)
 # client_secret and refresh_token, and providers do echo submitted values back in error text.
 # The caller-facing leak is closed by never putting the body in `detail`; this is the other
 # half — the log. Bounded, because an HTML error page is not a useful log line either.
+# Matches a credential-shaped key/value in every form this body arrives in: form encoding
+# (client_secret=x), JSON ("client_secret": "x") — which is what this API actually returns —
+# and a Python dict repr ('client_secret': 'x'), which is what str(e) can carry. The earlier
+# version required the separator to follow the key name immediately, so any quoted key missed
+# and JSON passed through in the clear.
 _SECRET_IN_BODY = re.compile(
-    r"((?:client_secret|refresh_token|access_token|code)\s*[=:]\s*)([^\s,&\"\'}]+)",
+    r"""(["']?(?:client_secret|refresh_token|access_token|csrf_token|code)["']?\s*[=:]\s*)(["']?)([^\s,&"'}\]]+)""",
     re.IGNORECASE,
 )
 _MAX_LOGGED_BODY = 500
@@ -36,7 +41,7 @@ _MAX_LOGGED_BODY = 500
 
 def redact_body(text: str) -> str:
     """Mask credential-shaped values in an upstream body before it reaches the log."""
-    redacted = _SECRET_IN_BODY.sub(r"\1<redacted>", text or "")
+    redacted = _SECRET_IN_BODY.sub(r"\1\2<redacted>", text or "")
     if len(redacted) > _MAX_LOGGED_BODY:
         return redacted[:_MAX_LOGGED_BODY] + "…[truncated]"
     return redacted

@@ -333,11 +333,39 @@ def test_generic_exception_branch_also_leaks_nothing(mock_post: MagicMock, withi
     assert "rt_xyz" not in str(exc.value.detail)
 
 
-def test_redact_body_masks_credentials_and_bounds_length() -> None:
-    """The log half of the same contract: the body is logged, so it must be redacted there."""
-    out = redact_body("error: invalid client_secret=abc123 for refresh_token=rt_xyz")
-    assert "abc123" not in out
-    assert "rt_xyz" not in out
-    assert "client_secret=<redacted>" in out
+@pytest.mark.parametrize(
+    "body",
+    [
+        # form encoding
+        "error: invalid client_secret=abc123 for refresh_token=rt_xyz",
+        "client_secret=abc123&refresh_token=rt_xyz&grant_type=refresh_token",
+        # JSON — the form this API actually replies in, and the one the first version of
+        # this redaction missed entirely because the key's closing quote broke the match.
+        '{"error":"invalid_client","client_secret":"abc123"}',
+        '{ "client_secret" : "abc123", "refresh_token" : "rt_xyz" }',
+        '{"status":401,"error":"invalid_grant","refresh_token":"rt_xyz"}',
+        '{"body":{"access_token":"at_live_9f2","expires_in":10800}}',
+        # a dict repr, which is what str(e) can carry
+        "{'client_secret': 'abc123'}",
+    ],
+)
+def test_redact_body_masks_credentials_in_every_wire_form(body: str) -> None:
+    """The log half of the contract, across the shapes this body actually arrives in.
+
+    The first version of this test pinned only the form-encoded case, which is the one the
+    regex happened to handle — so it passed while JSON leaked in the clear.
+    """
+    out = redact_body(body)
+    for secret in ("abc123", "rt_xyz", "at_live_9f2"):
+        assert secret not in out, f"{secret!r} leaked from {body!r} -> {out!r}"
+
+
+def test_redact_body_bounds_length() -> None:
     # An HTML error page is not a useful log line either.
     assert len(redact_body("x" * 5000)) < 600
+
+
+def test_redact_body_redacts_before_truncating() -> None:
+    # Truncating first could cut a secret in half and leave the prefix in the log.
+    padded = "y" * 480 + ' {"client_secret":"abc123"}'
+    assert "abc123" not in redact_body(padded)
