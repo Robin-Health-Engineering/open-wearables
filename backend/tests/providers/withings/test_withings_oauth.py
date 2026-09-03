@@ -360,6 +360,30 @@ def test_redact_body_masks_credentials_in_every_wire_form(body: str) -> None:
         assert secret not in out, f"{secret!r} leaked from {body!r} -> {out!r}"
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "status_code=401 error_code: 503",
+        '{"status_code":401,"error_code":"503"}',
+    ],
+)
+def test_redact_body_keeps_diagnostics(body: str) -> None:
+    """The mask must not eat the values the body is logged FOR.
+
+    Without a word boundary the bare `code` alternative also matches inside `status_code`
+    and `error_code`, so redaction destroyed exactly the two numbers a reader needs.
+    """
+    out = redact_body(body)
+    assert "401" in out
+    assert "503" in out
+
+
+@pytest.mark.parametrize("body", ["code=auth_code_9f2", '{"code": "auth_code_9f2"}'])
+def test_redact_body_still_masks_a_standalone_code(body: str) -> None:
+    # The boundary must not cost us the real thing: an OAuth authorization code.
+    assert "auth_code_9f2" not in redact_body(body)
+
+
 def test_redact_body_bounds_length() -> None:
     # An HTML error page is not a useful log line either.
     assert len(redact_body("x" * 5000)) < 600

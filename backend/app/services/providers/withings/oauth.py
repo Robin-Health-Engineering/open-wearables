@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 # and a Python dict repr ('client_secret': 'x'), which is what str(e) can carry. The earlier
 # version required the separator to follow the key name immediately, so any quoted key missed
 # and JSON passed through in the clear.
+#
+# The lookbehind matters in the other direction: without it the bare `code` alternative also
+# matches inside `status_code=401` and `error_code: 503` — the two values an error body is
+# logged FOR — so the mask ate the diagnostics it exists to preserve.
 _SECRET_IN_BODY = re.compile(
-    r"""(["']?(?:client_secret|refresh_token|access_token|csrf_token|code)["']?\s*[=:]\s*)(["']?)([^\s,&"'}\]]+)""",
+    r"""(?<![\w-])(["']?(?:client_secret|refresh_token|access_token|csrf_token|code)["']?\s*[=:]\s*)(["']?)([^\s,&"'}\]]+)""",
     re.IGNORECASE,
 )
 _MAX_LOGGED_BODY = 500
