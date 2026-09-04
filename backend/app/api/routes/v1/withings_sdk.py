@@ -4,8 +4,20 @@ Deliberately NOT tagged "External: Mobile SDK". That tag already means Open Wear
 mobile SDK — the one that ingests data from a partner's app — and conflating it with
 Withings' device SDK would make the API reference actively misleading.
 
-Everything here is authenticated with the org API key: it provisions a real Withings account
-against our partner credentials, so it must never be reachable by an end user.
+Everything here is behind ``ApiKeyDep``, which is this codebase's house standard (thirteen route
+files use it, ``connections``, ``users``, ``events`` and ``timeseries`` among them) and which
+means the org API key **or any authenticated developer JWT** — not the org key alone. What it
+rules out is an end user reaching these routes, which is the point: they act against our partner
+credentials and provision real Withings accounts.
+
+Worth stating plainly rather than leaving as an implication, because ``GET .../sdk/session`` is
+the first route in this codebase to vend a raw provider ``access_token``. That is a bearer
+credential for a THIRD PARTY, usable outside Open Wearables entirely, against an account that may
+hold more than we ever sync. On a data-read route "an authenticated developer counts as
+authorised" is unremarkable; here it means anyone who can authenticate to this deployment can
+obtain a live Withings token for any member. That is the boundary as built — and if it is ever
+narrowed, it should be narrowed on purpose and not by someone reading a docstring that already
+claimed it was.
 """
 
 from logging import getLogger

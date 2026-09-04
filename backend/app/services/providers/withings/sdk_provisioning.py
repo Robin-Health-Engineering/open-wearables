@@ -130,13 +130,25 @@ def provision_sdk_account(
             previous_provider_user_id=existing.provider_user_id,
             new_provider_user_id=tokens.userid,
         )
+        # Set BEFORE the update, and not through it: ``update_connection_info`` only fills
+        # ``provider_user_id`` in when the row has none (``if provider_user_id and not
+        # connection.provider_user_id``), which is right for a refresh and wrong for a
+        # replacement. Left stale, the row would carry the OLD Withings userid alongside the NEW
+        # account's tokens — and ``provider_user_id`` is the routing key for inbound Withings
+        # notifications, so every one of them would be matched to the wrong connection or to
+        # none. The log line just above anticipates exactly this case; it must not also be the
+        # only thing that happens about it.
+        #
+        # Assigning here rather than after means the change rides ``update_connection_info``'s
+        # own commit, so there is no window in which the new tokens are durable and the userid
+        # they belong to is not.
+        existing.provider_user_id = tokens.userid
         repo.update_connection_info(
             db,
             existing,
             access_token=tokens.access_token,
             refresh_token=tokens.refresh_token,
             expires_in=tokens.expires_in,
-            provider_user_id=tokens.userid,
             provider_username=None,
             scope=tokens.scope,
         )

@@ -9,6 +9,17 @@ These are control-flow tests with a mock session on purpose: the two branches th
 "there is nothing to persist" and "there is nowhere to persist it", and both must leave the
 session untouched rather than raise. A refresh is not worth failing over an SDK detail that
 does not apply to the connection being refreshed.
+
+The write branch asserts ``commit``, not ``flush``, and that distinction is the bug this file
+exists to keep out: ``update_tokens`` has already committed by the time this runs, so a flushed
+csrf write sits in a new uncommitted transaction, and the read-only session endpoint that needs
+it never commits — the request session is closed without one and the write is discarded.
+
+Deliberately NOT also covered by an integration test, because one would not discriminate. The
+``db`` fixture (tests/conftest.py) wraps each test in a savepoint that is restarted after every
+commit and rolled back at the end, and the route under test shares that same session — so a
+flush and a commit are equally visible to it. A test that passes either way is worse than no
+test, because it reads like the invariant is pinned.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ class TestPersistRotatedCsrfToken:
 
         db.query.assert_not_called()
         db.flush.assert_not_called()
+        db.commit.assert_not_called()
 
     def test_does_nothing_when_no_token_request_has_been_made(self) -> None:
         # _last_token_body is only set by _request_token. A refresh that failed before that
@@ -56,6 +68,7 @@ class TestPersistRotatedCsrfToken:
         strategy._persist_rotated_csrf_token(db, uuid4())
 
         db.flush.assert_not_called()
+        db.commit.assert_not_called()
 
     def test_writes_the_new_csrf_token_and_stamps_updated_at(self) -> None:
         strategy = _strategy()
@@ -69,4 +82,5 @@ class TestPersistRotatedCsrfToken:
 
         assert account.csrf_token == "fresh"
         assert account.updated_at is not None
-        db.flush.assert_called_once()
+        # The rotation has to be DURABLE, not merely flushed — see the module docstring.
+        db.commit.assert_called_once()

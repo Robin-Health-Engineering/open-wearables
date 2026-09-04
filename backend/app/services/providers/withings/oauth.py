@@ -187,7 +187,13 @@ class WithingsOAuth(BaseOAuthTemplate):
 
         account.csrf_token = csrf_token
         account.updated_at = datetime.now(timezone.utc)
-        db.flush()
+        # COMMIT, not flush. ``update_tokens`` above has already committed, so this write opens a
+        # fresh unit of work of its own — and the caller that needs it most, the read-only
+        # ``GET /providers/withings/sdk/session``, never commits. The request-scoped session is
+        # closed without one (``_get_db_dependency``: ``finally: db.close()``), which discards it.
+        # The result would be precisely the failure this method exists to prevent: Withings has
+        # rotated the csrf_token, our copy is the old one, and the WebView refuses to open.
+        db.commit()
 
     def _request_token(
         self, payload: dict[str, str], *, task: str, max_wait_seconds: float | None = None
