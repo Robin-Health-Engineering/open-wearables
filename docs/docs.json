@@ -199,7 +199,11 @@
               "GET /api/v1/oauth/providers",
               "GET /api/v1/oauth/{provider}/authorize",
               "POST /api/v1/providers/withings/sdk/accounts",
-              "GET /api/v1/providers/withings/sdk/session"
+              "GET /api/v1/providers/withings/sdk/session",
+              "POST /api/v1/providers/withings/sdk/devices",
+              "GET /api/v1/providers/withings/sdk/devices",
+              "POST /api/v1/providers/withings/sdk/devices/sync",
+              "DELETE /api/v1/providers/withings/sdk/devices/{device_id}"
             ]
           },
           {

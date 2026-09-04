@@ -20,6 +20,7 @@ from .sleep_details import SleepDetails
 from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
+from .withings_device import WithingsDevice
 from .withings_sdk_account import WithingsSdkAccount
 from .workout_details import WorkoutDetails
 
@@ -31,6 +32,7 @@ DETAIL_MODELS: dict[DetailType, type[EventRecordDetail]] = {
 }
 
 __all__ = [
+    "WithingsDevice",
     "WithingsSdkAccount",
     "ApiKey",
     "Application",

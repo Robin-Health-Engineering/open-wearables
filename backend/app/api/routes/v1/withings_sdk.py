@@ -1,4 +1,4 @@
-"""Withings Mobile SDK provisioning endpoints.
+"""Withings Mobile SDK endpoints: account provisioning, WebView sessions, and devices.
 
 Deliberately NOT tagged "External: Mobile SDK". That tag already means Open Wearables' own
 mobile SDK — the one that ingests data from a partner's app — and conflating it with
@@ -20,21 +20,30 @@ narrowed, it should be narrowed on purpose and not by someone reading a docstrin
 claimed it was.
 """
 
+from datetime import datetime
 from logging import getLogger
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.config import settings
 from app.database import DbSession
 from app.models.user_connection import UserConnection
+from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName
 from app.services.api_key_service import ApiKeyDep
 from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.withings.sdk_devices import (
+    WithingsDeviceError,
+    list_devices,
+    mark_dissociated,
+    record_installed_device,
+    sync_devices_from_withings,
+)
 from app.services.providers.withings.sdk_provisioning import provision_sdk_account
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 
@@ -212,3 +221,170 @@ def get_withings_sdk_session(
         )
 
     return SdkSessionResponse(access_token=access_token, csrf_token=account.csrf_token)
+
+
+class SdkDeviceResponse(BaseModel):
+    """One of the member's devices, as the app needs it.
+
+    ``advertise_key`` is included on purpose. It is what the native SDK's background sync
+    service takes to talk to the device over BLE, so withholding it would leave the app able
+    to list devices and unable to sync them — and it is a device pairing token, not a
+    credential for the member's Withings account.
+    """
+
+    # ``model_id`` trips Pydantic's protected "model_" namespace. Safe to disable: nothing
+    # here shadows BaseModel's own API, it is only a field whose name starts with those six
+    # characters. Stated rather than left bare so the next person does not remove it as
+    # unexplained — same as SdkDeviceInstallRequest and WithingsDeviceEntry.
+    model_config = ConfigDict(protected_namespaces=())
+
+    device_id: str
+    model_id: int | None
+    model: str | None
+    device_type: str | None
+    advertise_key: str | None
+    last_session_at: datetime | None
+    dissociated_at: datetime | None
+
+    @classmethod
+    def of(cls, device: WithingsDevice) -> "SdkDeviceResponse":
+        return cls(
+            device_id=device.device_id,
+            model_id=device.model_id,
+            model=device.model,
+            device_type=device.device_type,
+            advertise_key=device.advertise_key,
+            last_session_at=device.last_session_at,
+            dissociated_at=device.dissociated_at,
+        )
+
+
+class SdkDeviceInstallRequest(BaseModel):
+    """What the SDK's install-success notification gave the app.
+
+    Only ``user_id`` and ``device_id`` are required. The rest is reported as Withings reported
+    it: a notification that carries no ``advertise_key`` is a real case (a Wi-Fi device that
+    never fell back to BLE), and refusing it would lose the device record along with it.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    user_id: UUID
+    device_id: str = Field(max_length=64)
+    model_id: int | None = None
+    model: str | None = Field(default=None, max_length=64)
+    advertise_key: str | None = Field(default=None, max_length=255)
+
+
+@router.post(
+    "/withings/sdk/devices",
+    summary="Record a device from the SDK's install-success notification",
+    status_code=status.HTTP_201_CREATED,
+    tags=["External: Providers"],
+)
+def record_withings_device(
+    payload: SdkDeviceInstallRequest,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> SdkDeviceResponse:
+    """Store the device the member just finished setting up.
+
+    The FIRST of the two sources Withings requires for ``advertise_key``, and frequently the
+    only one that will ever carry this device's: ``getdevice`` may not list a just-installed
+    device yet, and the notification is not repeated.
+
+    Idempotent on ``(member, device_id)`` — the app may retry, and a member may re-run setup
+    on a device they already own.
+    """
+    try:
+        device = record_installed_device(
+            db,
+            user_id=payload.user_id,
+            device_id=payload.device_id,
+            model_id=payload.model_id,
+            model=payload.model,
+            advertise_key=payload.advertise_key,
+        )
+    except WithingsDeviceError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return SdkDeviceResponse.of(device)
+
+
+@router.get(
+    "/withings/sdk/devices",
+    summary="List a member's Withings devices",
+    tags=["External: Providers"],
+)
+def list_withings_devices(
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+    include_dissociated: bool = False,
+) -> list[SdkDeviceResponse]:
+    """Return what we hold, without calling Withings.
+
+    A pure read of our own rows, so it is safe to call on every render of the device hub. Use
+    the sync endpoint when the answer needs to be current — after the settings WebView closes,
+    for instance, where the member may have dissociated something.
+    """
+    try:
+        devices = list_devices(db, user_id=user_id, include_dissociated=include_dissociated)
+    except WithingsDeviceError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return [SdkDeviceResponse.of(d) for d in devices]
+
+
+@router.post(
+    "/withings/sdk/devices/sync",
+    summary="Reconcile a member's devices against Withings",
+    tags=["External: Providers"],
+)
+def sync_withings_devices(
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> list[SdkDeviceResponse]:
+    """Fetch ``User v2 - Getdevice`` and reconcile it into our rows.
+
+    The SECOND source of ``advertise_key``, and the only one that survives an app reinstall —
+    which loses every notification the app ever received. Also the only way to learn about a
+    dissociation the member performed inside Withings' settings WebView.
+
+    A POST because it writes: it upserts every listed device and marks the ones Withings no
+    longer lists as dissociated. It never erases an ``advertise_key`` it cannot replace.
+    """
+    strategy = ProviderFactory().get_provider(ProviderName.WITHINGS.value)
+    if not strategy.oauth:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Withings OAuth is not available on this deployment",
+        )
+    try:
+        devices = sync_devices_from_withings(db, user_id=user_id, oauth=strategy.oauth)
+    except WithingsDeviceError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return [SdkDeviceResponse.of(d) for d in devices]
+
+
+@router.delete(
+    "/withings/sdk/devices/{device_id}",
+    summary="Record that a device was dissociated",
+    tags=["External: Providers"],
+)
+def dissociate_withings_device(
+    device_id: str,
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> SdkDeviceResponse | None:
+    """Mark a device removed, from the SDK's dissociation-success notification.
+
+    A soft marker, not a delete — see the model. Returns ``null`` when we hold no such device,
+    which is not an error: the member may have dissociated one set up before we started
+    recording them, or from another phone.
+    """
+    try:
+        device = mark_dissociated(db, user_id=user_id, device_id=device_id)
+    except WithingsDeviceError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    return SdkDeviceResponse.of(device) if device else None
