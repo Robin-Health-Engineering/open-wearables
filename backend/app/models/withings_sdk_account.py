@@ -47,8 +47,16 @@ class WithingsSdkAccount(BaseDbModel):
     external_id: Mapped[str_64] = mapped_column(unique=True)
 
     # Reissued on every token refresh, so it is as short-lived as the access token and must
-    # be rewritten alongside it. Nullable because a row can exist between createuser and the
-    # code exchange.
+    # be rewritten alongside it.
+    #
+    # NULLABLE, and no path in today's code produces a null: ``provision_sdk_account`` only
+    # writes this row after ``exchange_sdk_code`` has returned, and that exchange rejects a
+    # response missing ``csrf_token`` outright. The looseness is deliberate anyway, for the
+    # path being measured right now — if Withings issues a csrf_token on the refresh of a
+    # connection we did NOT create (see the probe in ``oauth._persist_rotated_csrf_token``),
+    # then an OAuth-linked member gets a row at link time and a token at the next refresh,
+    # with a real gap in between. The 409 on the session route and the guard on the
+    # provisioning route cover that gap; they are not dead code waiting on a bug.
     csrf_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     updated_at: Mapped[datetime]

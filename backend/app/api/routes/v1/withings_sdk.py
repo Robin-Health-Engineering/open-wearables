@@ -24,7 +24,7 @@ from logging import getLogger
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 from app.config import settings
 from app.database import DbSession
@@ -52,7 +52,10 @@ class SdkAccountRequest(BaseModel):
 
     user_id: UUID = Field(description="Open Wearables user to attach the connection to")
     external_id: str = Field(max_length=64, description="Our own id for this member; the join key")
-    email: str
+    # Validated here rather than left to Withings, for the same reason shortname and the enum
+    # ranges are: Withings answers bad input with an opaque non-zero status, which surfaces to
+    # the caller as a 502 they can do nothing with. A 422 naming the field is the useful answer.
+    email: EmailStr
     shortname: str = Field(
         min_length=3,
         max_length=3,
