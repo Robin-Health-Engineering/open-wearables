@@ -15,6 +15,10 @@ The FK is NOT NULL with ON DELETE CASCADE, unlike the shared FKUserConnection al
 (nullable, SET NULL): a csrf_token belongs to one token pair, so an orphaned row is
 never a state worth keeping.
 
+Both timestamps are timestamptz, matching what the model declares: BaseDbModel's
+type_annotation_map maps datetime to DateTime(timezone=True), so a naive column here
+would silently discard the offset on every write.
+
 Reversible: downgrade drops the table. Nothing else references it, and the data is
 recoverable — a csrf_token is reissued on every token refresh.
 """
@@ -38,8 +42,8 @@ def upgrade() -> None:
         sa.Column("user_connection_id", sa.Uuid(), nullable=False),
         sa.Column("external_id", sa.String(length=64), nullable=False),
         sa.Column("csrf_token", sa.String(length=255), nullable=True),
-        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["user_connection_id"], ["user_connection.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("external_id"),
