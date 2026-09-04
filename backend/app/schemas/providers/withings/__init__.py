@@ -1,3 +1,4 @@
+from app.schemas.providers.withings.devices import WithingsDeviceEntry, WithingsGetdeviceBody
 from app.schemas.providers.withings.imports import (
     WithingsActivity,
     WithingsMeasure,
@@ -11,6 +12,8 @@ from app.schemas.providers.withings.notification import WithingsNotification, Wi
 
 __all__ = [
     "WithingsActivity",
+    "WithingsDeviceEntry",
+    "WithingsGetdeviceBody",
     "WithingsMeasure",
     "WithingsMeasureGroup",
     "WithingsNotification",
