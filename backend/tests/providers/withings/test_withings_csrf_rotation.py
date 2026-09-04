@@ -34,8 +34,15 @@ from app.services.providers.withings.oauth import WithingsOAuth
 
 
 def _strategy() -> WithingsOAuth:
-    """A strategy instance without running __init__, which wants live credentials."""
-    return WithingsOAuth.__new__(WithingsOAuth)
+    """A strategy instance without running __init__, which wants live credentials.
+
+    ``provider_name`` is set by hand because __init__ is what normally sets it, and the
+    structured logging in this method reads it. A bare __new__ instance is a real instance in
+    every way the code under test cares about — except the attributes nobody had needed yet.
+    """
+    strategy = WithingsOAuth.__new__(WithingsOAuth)
+    strategy.provider_name = "withings"
+    return strategy
 
 
 class TestPersistRotatedCsrfToken:
@@ -105,7 +112,6 @@ class TestCsrfProbe:
 
     def _run(self, capsys: pytest.CaptureFixture[str], body: dict) -> dict:
         strategy = _strategy()
-        strategy.provider_name = "withings"
         strategy._last_token_body = body
         db = MagicMock()
         db.query.return_value.filter.return_value.one_or_none.return_value = None
@@ -130,7 +136,6 @@ class TestCsrfProbe:
     def test_never_logs_the_token_itself(self, capsys: pytest.CaptureFixture[str]) -> None:
         # The point of the probe is the boolean. The value is a live credential.
         strategy = _strategy()
-        strategy.provider_name = "withings"
         strategy._last_token_body = {"csrf_token": "super-secret-csrf"}
         db = MagicMock()
         db.query.return_value.filter.return_value.one_or_none.return_value = None

@@ -228,7 +228,7 @@ class TestProvisioningRoute:
             ("height_m", -1),
         ],
     )
-    def test_422_on_input_withings_would_reject_opaquely(
+    def test_400_on_input_withings_would_reject_opaquely(
         self,
         client: TestClient,
         api_key_header: dict[str, str],
@@ -238,9 +238,14 @@ class TestProvisioningRoute:
     ) -> None:
         # Every one of these comes back from Withings as a non-zero status with no field name
         # attached, surfacing as a 502 the caller can do nothing with. Caught here instead.
+        #
+        # 400 and not FastAPI's default 422: this app registers its own RequestValidationError
+        # handler (main.py:91, utils/exceptions.py:88-95) which remaps it. Asserting 422 here
+        # would be asserting the framework's contract instead of this deployment's, and the
+        # robin-backend proxy reads the status.
         with patch(_PROVISION) as provision:
             response = client.post(_ACCOUNTS_URL, json=_valid_payload(**{field: value}), headers=api_key_header)
 
-        assert response.status_code == 422
+        assert response.status_code == 400
         # A rejected request must not reach Withings.
         provision.assert_not_called()
