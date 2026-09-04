@@ -2,6 +2,7 @@
 
 import logging
 import re
+from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
@@ -10,6 +11,7 @@ from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 from app.config import settings
 from app.database import DbSession
+from app.models.withings_sdk_account import WithingsSdkAccount
 from app.schemas.auth import AuthenticationMethod
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.credentials import (
@@ -151,6 +153,11 @@ class WithingsOAuth(BaseOAuthTemplate):
                 token_response.refresh_token or refresh_token,
                 token_response.expires_in,
             )
+            # csrf_token rotates with the token pair. Only SDK-provisioned connections have
+            # somewhere to put it, and for everyone else this is a no-op — but for those that
+            # do, skipping it leaves a stale token that fails at WebView-open time, far from
+            # the refresh that caused it.
+            self._persist_rotated_csrf_token(db, connection.id)
         log_structured(
             logger,
             "info",
@@ -160,6 +167,60 @@ class WithingsOAuth(BaseOAuthTemplate):
             user_id=str(user_id),
         )
         return token_response
+
+    def _persist_rotated_csrf_token(self, db: DbSession, connection_id: UUID) -> None:
+        """Update the SDK account's csrf_token from the last token response, if there is one.
+
+        Deliberately tolerant: a connection with no ``withings_sdk_account`` row is the normal
+        case (phase-1 consumer OAuth), and a token response without ``csrf_token`` is not an
+        error either. Neither is worth failing a refresh over.
+        """
+        csrf_token = (getattr(self, "_last_token_body", None) or {}).get("csrf_token")
+
+        account = (
+            db.query(WithingsSdkAccount).filter(WithingsSdkAccount.user_connection_id == connection_id).one_or_none()
+        )
+        if account is None:
+            # PROBE, and a deliberate one — it answers a question the documentation does not.
+            #
+            # Withings' SDK docs say two things that do not sit together: that the WebViews use
+            # "the access_token and csrf_token provided during the User Creation process", and
+            # that "the CSRF token is provided when retrieving a new access_token using the
+            # refresh service". If the second is the real mechanism, then a connection we did
+            # NOT create through createuser — a member who linked an account they already owned
+            # — also receives a csrf_token, and the SDK WebViews are open to them too. That
+            # decides whether "I already have a Withings account" is a full path or a
+            # data-sync-only one, which is a product question, not an implementation detail.
+            #
+            # This is the only place in the system where a non-SDK connection's token body is
+            # in scope, so it is the only place the question can be answered without asking
+            # Withings. The VALUE is never logged, only whether one arrived.
+            #
+            # Costs one indexed lookup per Withings refresh that previously returned early.
+            # Remove this branch — and restore the early return above — once the answer is in.
+            log_structured(
+                logger,
+                "info",
+                "Withings token refreshed for a connection with no SDK account",
+                provider=self.provider_name,
+                task="csrf_probe",
+                connection_id=str(connection_id),
+                has_csrf_token=bool(csrf_token),
+            )
+            return
+
+        if not csrf_token:
+            return
+
+        account.csrf_token = csrf_token
+        account.updated_at = datetime.now(timezone.utc)
+        # COMMIT, not flush. ``update_tokens`` above has already committed, so this write opens a
+        # fresh unit of work of its own — and the caller that needs it most, the read-only
+        # ``GET /providers/withings/sdk/session``, never commits. The request-scoped session is
+        # closed without one (``_get_db_dependency``: ``finally: db.close()``), which discards it.
+        # The result would be precisely the failure this method exists to prevent: Withings has
+        # rotated the csrf_token, our copy is the old one, and the WebView refuses to open.
+        db.commit()
 
     def _request_token(
         self, payload: dict[str, str], *, task: str, max_wait_seconds: float | None = None
@@ -222,7 +283,13 @@ class WithingsOAuth(BaseOAuthTemplate):
             )
             raise WithingsTokenError(task=task, withings_status=status)
 
-        return OAuthTokenResponse.model_validate(envelope.get("body", {}))
+        body = envelope.get("body", {})
+        # Stash the raw body for callers that need a field OAuthTokenResponse does not model.
+        # Withings returns csrf_token on every token response, and the SDK WebViews cannot
+        # open without a CURRENT one — dropping it here is what would leave the stored copy
+        # stale after any refresh.
+        self._last_token_body = body
+        return OAuthTokenResponse.model_validate(body)
 
     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
         """Return the Withings ``userid`` from the token body — the key for inbound notifications."""

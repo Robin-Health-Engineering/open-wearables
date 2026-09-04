@@ -1,0 +1,324 @@
+"""Partner-hosted User Creation for the Withings Mobile SDK.
+
+Phase 2 of the Withings integration provisions a Withings account on the member's behalf,
+rather than linking one they already own (which is phase 1's consumer OAuth flow). Both
+flows ship, but a member holds only ONE connection: ``user_connection`` has a unique
+``(user_id, provider)`` index, so the two cannot coexist on one member. Provisioning wins and
+overwrites — see ``sdk_provisioning``. ``external_id`` is what ties the provisioned account
+back to our member.
+
+This lives in Open Wearables and not in robin-backend, deliberately. ``createuser`` must be
+signed with ``client_secret``, and the ``code`` it returns becomes tokens that OW then owns
+and refreshes. Putting it in robin-backend would mean a second copy of the secret and a
+second refresher against a token Withings rotates on every use — which is the documented
+way to end up with a dead connection.
+
+Reference: https://developer.withings.com/sdk/v2/tree/sdk-webviews/required-web-services/
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from app.services.providers.withings._client import WITHINGS_API_BASE_URL
+from app.services.providers.withings.oauth import redact_body
+from app.services.providers.withings.request_budget import acquire_request_slot
+from app.services.providers.withings.signature import sign_payload
+from app.utils.structured_logging import log_structured
+
+logger = logging.getLogger(__name__)
+
+_SDK_PATH = "/v2/sdk"
+_TOKEN_PATH = "/v2/oauth2"
+_TIMEOUT_SECONDS = 30.0
+
+# Withings' own constraint, quoted from the docs: /^[a-zA-Z0-9]{3}$/. Enforced here rather
+# than left to the API because the failure comes back as an opaque non-zero status, and this
+# value is rendered on the device screen — a wrong one is visible on the hardware.
+_SHORTNAME_RE = re.compile(r"^[a-zA-Z0-9]{3}$")
+
+# Withings encodes success as status 0 inside an HTTP 200 body. Every other value is a
+# failure that `raise_for_status` will never catch.
+_STATUS_OK = 0
+
+
+class WithingsSdkUserError(RuntimeError):
+    """Raised when Withings declines to create the SDK user."""
+
+    def __init__(self, *, withings_status: int | None = None, detail: str | None = None) -> None:
+        self.withings_status = withings_status
+        super().__init__(detail or f"Withings createuser failed (status={withings_status})")
+
+
+@dataclass(frozen=True)
+class SdkTokens:
+    """The token triple an SDK user is provisioned with.
+
+    ``csrf_token`` is the reason this is not just an OAuthTokenResponse: the hosted SDK
+    WebViews take the access token as a secure cookie AND this value as a URL parameter, and
+    without it neither setup nor settings will open.
+    """
+
+    userid: str
+    access_token: str
+    refresh_token: str
+    csrf_token: str
+    expires_in: int
+    scope: str | None
+
+
+@dataclass(frozen=True)
+class SdkUser:
+    """What ``createuser`` returns: a short-lived code, and our own id echoed back."""
+
+    code: str
+    external_id: str
+
+
+def _measures_payload(weight_kg: float, height_m: float) -> str:
+    """Withings takes measures as JSON, with a value/unit pair per measure.
+
+    ``unit`` is a power of ten: value * 10^unit is the real quantity. At the milli precision
+    used here, 75.4 kg is {value: 75400, unit: -3}, not {value: 75.4}. Sending a float is
+    accepted and then silently misread, which is the worst of both.
+    """
+    return json.dumps(
+        [
+            {"value": int(round(weight_kg * 1000)), "unit": -3, "type": 1},
+            {"value": int(round(height_m * 1000)), "unit": -3, "type": 4},
+        ]
+    )
+
+
+def create_sdk_user(
+    *,
+    client_id: str,
+    client_secret: str,
+    external_id: str,
+    email: str,
+    shortname: str,
+    birthdate: int,
+    gender: int,
+    weight_kg: float,
+    height_m: float,
+    preflang: str,
+    timezone: str,
+    mailingpref: int,
+    unit_pref: dict[str, Any] | None = None,
+    firstname: str | None = None,
+    lastname: str | None = None,
+    phonenumber: str | None = None,
+    recovery_code: str | None = None,
+    api_base_url: str = WITHINGS_API_BASE_URL,
+) -> SdkUser:
+    """Provision a Withings account for one member and return its authorization code.
+
+    The returned ``code`` is short-lived and must be exchanged for tokens. That exchange is a
+    follow-up rather than an unknown: Withings documents it as ``requesttoken`` with
+    ``grant_type=authorization_code``, ``redirect_uri`` REQUIRED even though this code never
+    came from a redirect, and nonce+signature rather than client_secret-in-body — so
+    ``signature.py`` covers it too. The response carries ``csrf_token`` alongside the token
+    pair, which is why ``withings_sdk_account`` exists to hold it.
+    """
+    if not _SHORTNAME_RE.match(shortname):
+        raise ValueError(f"shortname must match {_SHORTNAME_RE.pattern} (Withings renders it on the device screen)")
+    if gender not in (0, 1):
+        raise ValueError("gender must be 0 (male) or 1 (female) per the Withings API")
+    if mailingpref not in (0, 1):
+        raise ValueError("mailingpref must be 0 (refused) or 1 (accepted)")
+
+    payload: dict[str, str] = {
+        "action": "createuser",
+        "birthdate": str(birthdate),
+        "email": email,
+        "external_id": external_id,
+        "gender": str(gender),
+        "mailingpref": str(mailingpref),
+        "measures": _measures_payload(weight_kg, height_m),
+        "preflang": preflang,
+        "shortname": shortname,
+        "timezone": timezone,
+        "unit_pref": json.dumps(unit_pref if unit_pref is not None else {}),
+    }
+    for key, value in (
+        ("firstname", firstname),
+        ("lastname", lastname),
+        ("phonenumber", phonenumber),
+        ("recovery_code", recovery_code),
+    ):
+        if value:
+            payload[key] = value
+
+    # Adds client_id, a fresh single-use nonce and the HMAC signature, and drops any secret.
+    signed = sign_payload(payload, client_id, client_secret, api_base_url=api_base_url)
+
+    acquire_request_slot()
+    try:
+        response = httpx.post(
+            f"{api_base_url}{_SDK_PATH}",
+            data=signed,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        envelope = response.json()
+    except httpx.HTTPStatusError as e:
+        # Redacted: the request body carried a signature, and the response may echo it back.
+        log_structured(
+            logger,
+            "error",
+            f"Withings createuser HTTP error: {redact_body(e.response.text)}",
+            provider="withings",
+            task="createuser",
+            status_code=e.response.status_code,
+        )
+        raise WithingsSdkUserError(detail=f"Withings createuser failed (HTTP {e.response.status_code})") from e
+    except Exception as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings createuser request failed: {type(e).__name__}",
+            provider="withings",
+            task="createuser",
+        )
+        raise WithingsSdkUserError(detail="Withings createuser request failed") from e
+
+    status = envelope.get("status")
+    if status != _STATUS_OK:
+        # No body echo: it is the response to a signed request and may repeat our parameters.
+        log_structured(
+            logger,
+            "error",
+            "Withings createuser returned a non-zero status",
+            provider="withings",
+            task="createuser",
+            withings_status=status,
+        )
+        raise WithingsSdkUserError(withings_status=status)
+
+    user = (envelope.get("body") or {}).get("user") or {}
+    code = user.get("code")
+    if not code:
+        # status 0 with no code is a contract change, not a user-facing condition.
+        raise WithingsSdkUserError(detail="Withings createuser returned no code")
+
+    log_structured(
+        logger,
+        "info",
+        "Withings SDK user created",
+        provider="withings",
+        task="createuser",
+        external_id=external_id,
+    )
+    # Return OUR external_id, never the echo. The caller keys the member off the value we
+    # sent, so echoing back a different one would silently attach the account to the wrong
+    # person. A mismatch is not fatal — the account exists and the code is valid — but it is
+    # an anomaly worth seeing, so it is logged rather than swallowed.
+    echoed = user.get("external_id")
+    if echoed and echoed != external_id:
+        log_structured(
+            logger,
+            "warning",
+            "Withings echoed a different external_id than the one sent",
+            provider="withings",
+            task="createuser",
+            sent_external_id=external_id,
+            echoed_external_id=echoed,
+        )
+    return SdkUser(code=code, external_id=external_id)
+
+
+def exchange_sdk_code(
+    *,
+    client_id: str,
+    client_secret: str,
+    code: str,
+    redirect_uri: str,
+    api_base_url: str = WITHINGS_API_BASE_URL,
+) -> SdkTokens:
+    """Exchange a ``createuser`` code for the access/refresh/csrf triple.
+
+    Three things differ from the phase-1 consumer exchange, all documented:
+
+    * ``redirect_uri`` is REQUIRED even though this code never came from a redirect. Omitting
+      it fails, which is unintuitive enough to be worth stating here.
+    * Authentication is nonce+signature, not ``client_secret`` in the body — so this reuses
+      ``sign_payload`` rather than the OAuth strategy's ``_request_token``.
+    * The response carries ``csrf_token``, which ``OAuthTokenResponse`` does not model. That
+      is why this returns its own type.
+
+    Withings rotates the refresh token on every use; the previous one survives 8 hours, which
+    is a grace period rather than a licence to keep it.
+    """
+    payload = {
+        "action": "requesttoken",
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+    signed = sign_payload(payload, client_id, client_secret, api_base_url=api_base_url)
+
+    acquire_request_slot()
+    try:
+        response = httpx.post(
+            f"{api_base_url}{_TOKEN_PATH}",
+            data=signed,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        envelope = response.json()
+    except httpx.HTTPStatusError as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings SDK token HTTP error: {redact_body(e.response.text)}",
+            provider="withings",
+            task="sdk_exchange_code",
+            status_code=e.response.status_code,
+        )
+        raise WithingsSdkUserError(detail=f"Withings SDK token exchange failed (HTTP {e.response.status_code})") from e
+    except Exception as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings SDK token request failed: {type(e).__name__}",
+            provider="withings",
+            task="sdk_exchange_code",
+        )
+        raise WithingsSdkUserError(detail="Withings SDK token exchange failed") from e
+
+    status = envelope.get("status")
+    if status != _STATUS_OK:
+        # HTTP 200 with a non-zero status is how Withings reports failure here too.
+        log_structured(
+            logger,
+            "error",
+            "Withings SDK token exchange returned a non-zero status",
+            provider="withings",
+            task="sdk_exchange_code",
+            withings_status=status,
+        )
+        raise WithingsSdkUserError(withings_status=status)
+
+    body = envelope.get("body") or {}
+    missing = [f for f in ("userid", "access_token", "refresh_token", "csrf_token") if not body.get(f)]
+    if missing:
+        # Partial success is worse than failure: a connection stored without csrf_token looks
+        # healthy and then cannot open a WebView.
+        raise WithingsSdkUserError(detail=f"Withings SDK token response missing: {sorted(missing)}")
+
+    return SdkTokens(
+        userid=str(body["userid"]),
+        access_token=body["access_token"],
+        refresh_token=body["refresh_token"],
+        csrf_token=body["csrf_token"],
+        expires_in=int(body.get("expires_in") or 0),
+        scope=body.get("scope"),
+    )
