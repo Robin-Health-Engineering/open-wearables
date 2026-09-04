@@ -151,10 +151,10 @@ class TestSyncDevicesFromWithings:
         assert devices[0].advertise_key_source == SOURCE_GETDEVICE
 
     def test_marks_devices_withings_no_longer_lists(self, db: Session) -> None:
-        # How a dissociation performed inside Withings' settings WebView reaches us.
+        # How a dissociation performed inside Withings' settings WebView reaches us. Both
+        # devices are listed once first, so both are things Getdevice has actually seen.
         user_id = _member(db)
-        record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-1")
-        record_installed_device(db, user_id=user_id, device_id="device-2", advertise_key="adv-2")
+        _sync(db, user_id, _entry(deviceid="device-1"), _entry(deviceid="device-2", advertise_key="adv-2"))
 
         _sync(db, user_id, _entry(deviceid="device-1"))
 
@@ -164,19 +164,51 @@ class TestSyncDevicesFromWithings:
         # install notification ever carried.
         assert gone.advertise_key == "adv-2"
 
-    def test_an_empty_response_marks_everything_dissociated(self, db: Session) -> None:
+    def test_never_dissociates_a_device_getdevice_has_not_listed_yet(self, db: Session) -> None:
+        # The freshly-paired case, and the reason last_getdevice_at exists. A member pairs a
+        # scale, the app syncs before Withings' own list catches up — and this device must
+        # NOT be swept, because its absence says nothing. record_installed_device's docstring
+        # asserts exactly this lag; the sweep used to ignore it.
+        user_id = _member(db)
+        record_installed_device(db, user_id=user_id, device_id="just-paired", advertise_key="adv-new")
+
+        _sync(db, user_id)
+
+        device = db.query(WithingsDevice).filter(WithingsDevice.device_id == "just-paired").one()
+        assert device.dissociated_at is None, "a device Getdevice has never listed cannot be judged by its absence"
+        assert list_devices(db, user_id=user_id)[0].device_id == "just-paired"
+
+    def test_the_guard_is_not_advertise_key_source(self, db: Session) -> None:
+        # The field that looks right is not: a Getdevice entry carrying NO advertise_key
+        # leaves advertise_key_source saying "notification", so a sweep keyed on it would
+        # still refuse to sweep a device Getdevice knows perfectly well about.
         user_id = _member(db)
         record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-1")
+        _sync(db, user_id, _entry(deviceid="device-1", advertise_key=None))
+
+        listed = db.query(WithingsDevice).filter(WithingsDevice.device_id == "device-1").one()
+        assert listed.advertise_key_source == SOURCE_NOTIFICATION, "the key still came from the notification"
+        assert listed.last_getdevice_at is not None, "but Getdevice has listed it, and that is the sweep's fact"
+
+        _sync(db, user_id)
+
+        db.refresh(listed)
+        assert listed.dissociated_at is not None
+
+    def test_an_empty_response_marks_previously_listed_devices_dissociated(self, db: Session) -> None:
+        user_id = _member(db)
+        _sync(db, user_id, _entry(deviceid="device-1"))
 
         assert _sync(db, user_id) == []
 
         device = db.query(WithingsDevice).one()
         assert device.dissociated_at is not None
-        assert device.advertise_key == "adv-1"
+        assert device.advertise_key == "adv-from-getdevice"
 
     def test_seeing_a_device_again_undissociates_it(self, db: Session) -> None:
         user_id = _member(db)
         record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-1")
+        _sync(db, user_id, _entry(deviceid="device-1", advertise_key=None))
         _sync(db, user_id)
 
         devices = _sync(db, user_id, _entry(advertise_key=None))

@@ -21,6 +21,11 @@ Getdevice response that transiently omits a device would otherwise destroy an
 advertise_key that only the install notification ever carried and that nothing can
 re-derive.
 
+last_getdevice_at records when a Getdevice response last listed a device, and is what
+makes that sweep safe: a device Getdevice has NEVER listed says nothing by being absent
+from it — it may simply be newer than Getdevice's view — so only devices it has listed
+before are candidates for dissociation.
+
 Reversible: downgrade drops the table. Nothing references it, and both writers can
 repopulate it — the install notification on the next setup, Getdevice on demand.
 """
@@ -49,6 +54,7 @@ def upgrade() -> None:
         sa.Column("advertise_key", sa.String(length=255), nullable=True),
         sa.Column("advertise_key_source", sa.String(length=32), nullable=True),
         sa.Column("last_session_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_getdevice_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("dissociated_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import UUID, uuid4
 
 from app.database import DbSession
@@ -36,8 +37,15 @@ logger = logging.getLogger(__name__)
 
 # Recorded on the row so that "where did this key come from" is answerable when a device
 # stops syncing. Diagnostic only — neither source outranks the other, the later write wins.
-SOURCE_NOTIFICATION = "notification"
-SOURCE_GETDEVICE = "getdevice"
+#
+# A Literal rather than a bare str so every call site is checked, and NOT a SQLAlchemy Enum
+# column: mapping one would mean an entry in ``BaseDbModel.type_annotation_map``, which lives
+# in ``app/database.py`` — an upstream file this fork has to keep rebasing onto cleanly. The
+# column stays a plain String; the constraint is enforced where the values are written.
+DeviceKeySource = Literal["notification", "getdevice"]
+
+SOURCE_NOTIFICATION: DeviceKeySource = "notification"
+SOURCE_GETDEVICE: DeviceKeySource = "getdevice"
 
 
 class WithingsDeviceError(RuntimeError):
@@ -61,7 +69,7 @@ def _upsert(
     *,
     connection_id: UUID,
     device_id: str,
-    source: str,
+    source: DeviceKeySource,
     model_id: int | None = None,
     model: str | None = None,
     device_type: str | None = None,
@@ -101,6 +109,14 @@ def _upsert(
         device.advertise_key_source = source
     if last_session_at is not None:
         device.last_session_at = last_session_at
+
+    # Stamped for a Getdevice write and ONLY a Getdevice write — it records that Withings'
+    # own list has seen this device, which is what makes the dissociation sweep safe. It is
+    # deliberately not derived from ``advertise_key_source``: a Getdevice entry carrying no
+    # advertise_key leaves that field saying "notification", and a sweep keyed on it would
+    # still sweep devices Getdevice knows about.
+    if source == SOURCE_GETDEVICE:
+        device.last_getdevice_at = now
 
     # Seeing a device again is what un-dissociates it. A member who re-pairs a device they had
     # removed gets the row they had, key included, rather than a second one.
@@ -208,13 +224,20 @@ def sync_devices_from_withings(
     stale = db.query(WithingsDevice).filter(
         WithingsDevice.user_connection_id == connection.id,
         WithingsDevice.dissociated_at.is_(None),
+        # ONLY devices Getdevice has listed before are candidates. A device it has never
+        # listed says nothing by being absent — it may simply be newer than Getdevice's view,
+        # which is exactly the case ``record_installed_device`` exists for and which its own
+        # docstring describes. Without this, a member pairs a scale, the app syncs before
+        # Withings catches up, and the device they just paired is marked dissociated and
+        # drops out of the hub until some later sync happens to rescue it.
+        WithingsDevice.last_getdevice_at.isnot(None),
     )
     if seen:
         stale = stale.filter(WithingsDevice.device_id.notin_(seen))
-    # An EMPTY response marks everything dissociated, deliberately. "Withings lists no devices
-    # for this member" is a real answer and the only one they give for a member who removed
-    # their last device — and the marker is soft, so a later sync that lists them again clears
-    # it and the advertise_keys were never at risk.
+    # An EMPTY response still marks previously-listed devices dissociated, deliberately.
+    # "Withings lists no devices for this member" is a real answer and the only one they give
+    # for a member who removed their last device — and the marker is soft, so a later sync
+    # that lists them again clears it and the advertise_keys were never at risk.
     missing = stale.all()
     for device in missing:
         device.dissociated_at = now

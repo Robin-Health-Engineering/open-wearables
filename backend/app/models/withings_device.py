@@ -68,6 +68,18 @@ class WithingsDevice(BaseDbModel):
     # from, and the honest answer to "why has nothing arrived from my scale in a week".
     last_session_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
+    # When a Getdevice response last LISTED this device. Null means it never has.
+    #
+    # This is what makes the dissociation sweep safe. A device Getdevice has never listed
+    # says nothing by being absent from it — Getdevice may not list a just-installed device
+    # yet, which is the whole reason the install notification is a separate source. Sweeping
+    # on absence alone marks a scale the member paired seconds ago as dissociated.
+    #
+    # It needs its own column rather than a reading of ``advertise_key_source``: a Getdevice
+    # entry that carries no ``advertise_key`` leaves that field saying "notification", so a
+    # sweep keyed on it would still sweep devices Getdevice knows perfectly well about.
+    last_getdevice_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
     # Set when the member dissociates the device in Withings' settings WebView, and when a
     # Getdevice sync stops listing a device we hold.
     #

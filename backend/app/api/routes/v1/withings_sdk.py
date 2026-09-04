@@ -232,6 +232,12 @@ class SdkDeviceResponse(BaseModel):
     credential for the member's Withings account.
     """
 
+    # ``model_id`` trips Pydantic's protected "model_" namespace. Safe to disable: nothing
+    # here shadows BaseModel's own API, it is only a field whose name starts with those six
+    # characters. Stated rather than left bare so the next person does not remove it as
+    # unexplained — same as SdkDeviceInstallRequest and WithingsDeviceEntry.
+    model_config = ConfigDict(protected_namespaces=())
+
     device_id: str
     model_id: int | None
     model: str | None
