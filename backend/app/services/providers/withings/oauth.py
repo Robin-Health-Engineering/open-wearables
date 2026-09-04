@@ -176,13 +176,40 @@ class WithingsOAuth(BaseOAuthTemplate):
         error either. Neither is worth failing a refresh over.
         """
         csrf_token = (getattr(self, "_last_token_body", None) or {}).get("csrf_token")
-        if not csrf_token:
-            return
 
         account = (
             db.query(WithingsSdkAccount).filter(WithingsSdkAccount.user_connection_id == connection_id).one_or_none()
         )
         if account is None:
+            # PROBE, and a deliberate one — it answers a question the documentation does not.
+            #
+            # Withings' SDK docs say two things that do not sit together: that the WebViews use
+            # "the access_token and csrf_token provided during the User Creation process", and
+            # that "the CSRF token is provided when retrieving a new access_token using the
+            # refresh service". If the second is the real mechanism, then a connection we did
+            # NOT create through createuser — a member who linked an account they already owned
+            # — also receives a csrf_token, and the SDK WebViews are open to them too. That
+            # decides whether "I already have a Withings account" is a full path or a
+            # data-sync-only one, which is a product question, not an implementation detail.
+            #
+            # This is the only place in the system where a non-SDK connection's token body is
+            # in scope, so it is the only place the question can be answered without asking
+            # Withings. The VALUE is never logged, only whether one arrived.
+            #
+            # Costs one indexed lookup per Withings refresh that previously returned early.
+            # Remove this branch — and restore the early return above — once the answer is in.
+            log_structured(
+                logger,
+                "info",
+                "Withings token refreshed for a connection with no SDK account",
+                provider=self.provider_name,
+                task="csrf_probe",
+                connection_id=str(connection_id),
+                has_csrf_token=bool(csrf_token),
+            )
+            return
+
+        if not csrf_token:
             return
 
         account.csrf_token = csrf_token

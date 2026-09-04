@@ -24,8 +24,11 @@ test, because it reads like the invariant is pinned.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 from uuid import uuid4
+
+import pytest
 
 from app.services.providers.withings.oauth import WithingsOAuth
 
@@ -43,7 +46,6 @@ class TestPersistRotatedCsrfToken:
 
         strategy._persist_rotated_csrf_token(db, uuid4())
 
-        db.query.assert_not_called()
         db.flush.assert_not_called()
         db.commit.assert_not_called()
 
@@ -55,7 +57,8 @@ class TestPersistRotatedCsrfToken:
 
         strategy._persist_rotated_csrf_token(db, uuid4())
 
-        db.query.assert_not_called()
+        db.flush.assert_not_called()
+        db.commit.assert_not_called()
 
     def test_does_nothing_for_a_connection_with_no_sdk_account(self) -> None:
         # The normal case: phase-1 consumer OAuth connections have no SDK account row, and
@@ -84,3 +87,54 @@ class TestPersistRotatedCsrfToken:
         assert account.updated_at is not None
         # The rotation has to be DURABLE, not merely flushed — see the module docstring.
         db.commit.assert_called_once()
+
+
+class TestCsrfProbe:
+    """The probe that answers whether a non-provisioned account can open the SDK WebViews.
+
+    Withings' docs say both that the WebView tokens come "during the User Creation process"
+    and that "the CSRF token is provided when retrieving a new access_token using the refresh
+    service". If the latter is the mechanism, a member who linked an account they already
+    owned gets one too — and the "I already have a Withings account" path is a full path
+    rather than data-sync-only. A refresh of a non-SDK connection is the only place in the
+    system where that token body is in scope.
+
+    Asserted against STDOUT, not caplog: ``log_structured`` prints single-line JSON straight
+    to stdout and never touches the logger, so caplog sees nothing at all.
+    """
+
+    def _run(self, capsys: pytest.CaptureFixture[str], body: dict) -> dict:
+        strategy = _strategy()
+        strategy.provider_name = "withings"
+        strategy._last_token_body = body
+        db = MagicMock()
+        db.query.return_value.filter.return_value.one_or_none.return_value = None
+
+        strategy._persist_rotated_csrf_token(db, uuid4())
+
+        entries = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+        probes = [e for e in entries if e.get("task") == "csrf_probe"]
+        assert len(probes) == 1, f"expected exactly one probe line, got {probes}"
+        return probes[0]
+
+    def test_reports_that_a_csrf_token_arrived(self, capsys: pytest.CaptureFixture[str]) -> None:
+        probe = self._run(capsys, {"access_token": "at", "csrf_token": "fresh"})
+
+        assert probe["has_csrf_token"] is True
+
+    def test_reports_that_none_arrived(self, capsys: pytest.CaptureFixture[str]) -> None:
+        probe = self._run(capsys, {"access_token": "at"})
+
+        assert probe["has_csrf_token"] is False
+
+    def test_never_logs_the_token_itself(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # The point of the probe is the boolean. The value is a live credential.
+        strategy = _strategy()
+        strategy.provider_name = "withings"
+        strategy._last_token_body = {"csrf_token": "super-secret-csrf"}
+        db = MagicMock()
+        db.query.return_value.filter.return_value.one_or_none.return_value = None
+
+        strategy._persist_rotated_csrf_token(db, uuid4())
+
+        assert "super-secret-csrf" not in capsys.readouterr().out
