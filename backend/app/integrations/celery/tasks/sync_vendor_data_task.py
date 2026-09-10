@@ -322,7 +322,14 @@ def sync_vendor_data(
                             message=f"Fetching workouts from {provider_name}",
                         )
                         try:
-                            success = strategy.workouts.load_data(db, user_uuid, **params)
+                            # Passed alongside params rather than inside it: params is echoed
+                            # into the sync-log payload below, and the connection is plumbing
+                            # rather than something a reader of that log asked for. Providers
+                            # read kwargs by name, so the extra key is inert for the twelve
+                            # that cannot have a second connection.
+                            success = strategy.workouts.load_data(
+                                db, user_uuid, connection_id=connection.id, **params
+                            )
                             provider_result.params["workouts"] = {"success": success, **params}
                         except Exception as e:
                             _log_provider_sync_failure(
@@ -361,12 +368,20 @@ def sync_vendor_data(
                             # Otherwise fallback to load_all_247_data (just returns data)
                             provider_any = cast(Any, strategy.data_247)
                             if hasattr(provider_any, "load_and_save_all"):
+                                # connection_id names WHICH connection this pass syncs. The loop
+                                # above already iterates every active connection, but everything
+                                # below it re-resolves from user_id alone — so without this a
+                                # member with two Withings accounts has the first read twice and
+                                # the second never. Only Withings implements load_and_save_all,
+                                # which is why the other providers' load_all_247_data below is
+                                # untouched: they can hold one connection each.
                                 results_247 = provider_any.load_and_save_all(
                                     db,
                                     user_uuid,
                                     start_time=start_dt,
                                     end_time=end_dt,
                                     is_first_sync=is_first_sync,
+                                    connection_id=connection.id,
                                 )
                                 provider_result.params["data_247"] = {"success": True, "saved": True, **results_247}
                                 for _count in results_247.values():

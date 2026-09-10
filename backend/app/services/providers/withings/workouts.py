@@ -38,6 +38,10 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
         )
 
     def get_workouts_from_api(self, db: DbSession, user_id: UUID, **kwargs: Any) -> list[dict]:
+        # connection_id, when the caller supplies one, says WHICH of the member's Withings
+        # connections to read as — their own account, or one of the ones we provisioned with a
+        # cellular device. Absent, the request falls back to the member's primary connection.
+        connection_id = kwargs.get("connection_id")
         # Accept Withings-native ymd keys or the generic ISO keys the sync task emits.
         start_ymd = kwargs.get("startdateymd") or self._to_ymd(kwargs.get("start_date"))
         end_ymd = kwargs.get("enddateymd") or self._to_ymd(kwargs.get("end_date"))
@@ -59,6 +63,7 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
             oauth=self.oauth,
             service_path=WORKOUTS.service_path,
             action=WORKOUTS.action,
+            connection_id=connection_id,
             params={
                 "startdateymd": start_ymd,
                 "enddateymd": end_ymd,
@@ -147,8 +152,10 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
         return record, detail
 
     def load_data(self, db: DbSession, user_id: UUID, **kwargs: Any) -> WriteCounts:
-        connection = self.connection_repo.get_active_connection(db, user_id, self.provider_name)
-        user_connection_id = connection.id if connection is not None and isinstance(connection.id, UUID) else None
+        user_connection_id = kwargs.get("connection_id")
+        if user_connection_id is None:
+            connection = self.connection_repo.get_active_connection(db, user_id, self.provider_name)
+            user_connection_id = connection.id if connection is not None and isinstance(connection.id, UUID) else None
         raw_workouts = self.get_workouts_from_api(db, user_id, **kwargs)
         processed = 0
         skipped = 0

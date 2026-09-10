@@ -69,11 +69,17 @@ def withings_request(
     action: str,
     params: dict[str, Any],
     api_base_url: str = WITHINGS_API_BASE_URL,
+    connection_id: UUID | None = None,
 ) -> dict[str, Any]:
     """POST an action to a Withings service and return the unwrapped ``body``.
 
     Raises ``HTTPException`` on a non-zero ``status`` (Withings reports
     errors in the envelope, not via the HTTP status or an ``error`` field).
+
+    ``connection_id`` names WHICH of the member's Withings connections to authenticate as. A
+    member can hold their own account plus one per cellular device we ship them, and without it
+    every call resolves to the primary connection — so a sync loop iterating two connections
+    would read the same account twice and never touch the second.
     """
     request_params = {"action": action, **params}
     envelope = make_authenticated_request(
@@ -87,6 +93,7 @@ def withings_request(
         method="POST",
         form_data=request_params,
         acquire_slot=acquire_request_slot,
+        connection_id=connection_id,
     )
 
     status = envelope.get("status") if isinstance(envelope, dict) else None
@@ -123,8 +130,12 @@ def paginate(
     params: dict[str, Any],
     list_key: str,
     api_base_url: str = WITHINGS_API_BASE_URL,
+    connection_id: UUID | None = None,
 ) -> PaginatedResult:
-    """Follow Withings ``more``/``offset`` pagination, collecting ``body[list_key]``."""
+    """Follow Withings ``more``/``offset`` pagination, collecting ``body[list_key]``.
+
+    Every page is fetched as the same connection — see ``withings_request``.
+    """
     collected: list[dict[str, Any]] = []
     envelope: dict[str, Any] | None = None
     offset = 0
@@ -141,6 +152,7 @@ def paginate(
             action=action,
             params=page_params,
             api_base_url=api_base_url,
+            connection_id=connection_id,
         )
         if envelope is None:
             envelope = {key: value for key, value in body.items() if key != list_key}
