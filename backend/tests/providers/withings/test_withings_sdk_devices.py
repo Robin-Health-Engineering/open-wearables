@@ -1,13 +1,17 @@
-"""Two sources for one advertise_key, and the rule that keeps them from destroying each other.
+"""Two writers of one device row, and the rule that keeps them from destroying each other.
 
-Background BLE sync does not start without a per-device ``advertise_key``, and Withings hands
-it out two ways — the SDK's install-success notification, and ``User v2 - Getdevice``. Neither
-is complete: the notification is the only source for a device Getdevice has not caught up with,
-and Getdevice is the only source after an app reinstall, which loses every notification.
+A member's devices are reported by ``User v2 - Getdevice`` and, slightly sooner, by an
+install-success notification. Getdevice is authoritative and the only source that survives an
+app reinstall; the notification merely gets the row in before the next sweep.
 
-So the invariant these tests exist for is the one that is easy to break by writing the obvious
-code: **a write never erases a key it cannot replace.** A Getdevice entry with no
-``advertise_key`` must leave the stored one alone.
+The invariant these tests exist for is the one that is easy to break by writing the obvious
+code: **a write never erases what it cannot replace.** Getdevice shapes its response by what
+each device reports, so an entry omitting ``battery`` means "this device did not say", not
+"there is no battery level" — and the stored value must survive it.
+
+That rule was originally about ``advertise_key``, the Mobile SDK's background-BLE token. That
+integration is abandoned and the column is gone; the rule outlived it, because the response is
+still shaped by what each device reports.
 
 Real session fixture rather than mocks, because every one of these is a claim about the row
 that is left behind.
@@ -23,8 +27,6 @@ from sqlalchemy.orm import Session
 
 from app.models.withings_device import WithingsDevice
 from app.services.providers.withings.sdk_devices import (
-    SOURCE_GETDEVICE,
-    SOURCE_NOTIFICATION,
     list_devices,
     mark_dissociated,
     record_installed_device,
@@ -48,7 +50,7 @@ def _entry(**overrides: object) -> dict:
         "model": "Body+",
         "model_id": 6,
         "type": "Scale",
-        "advertise_key": "adv-from-getdevice",
+        "battery": "high",
         "last_session_date": 1_756_000_000,
     }
     entry.update(overrides)
@@ -70,12 +72,11 @@ class TestRecordInstalledDevice:
             device_id="device-1",
             model_id=6,
             model="Body+",
-            advertise_key="adv-1",
         )
 
         assert device.device_id == "device-1"
-        assert device.advertise_key == "adv-1"
-        assert device.advertise_key_source == SOURCE_NOTIFICATION
+        assert device.model_id == 6
+        assert device.model == "Body+"
         assert device.dissociated_at is None
 
     def test_is_idempotent_on_the_same_device(self, db: Session) -> None:
@@ -83,22 +84,23 @@ class TestRecordInstalledDevice:
         # unique (connection, device_id) index means the second write has to find the first.
         user_id = _member(db)
 
-        first = record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-1")
-        second = record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-2")
+        first = record_installed_device(db, user_id=user_id, device_id="device-1", model="Body+")
+        second = record_installed_device(db, user_id=user_id, device_id="device-1", model="Body Pro")
 
         assert second.id == first.id
-        assert second.advertise_key == "adv-2"
+        assert second.model == "Body Pro"
         assert db.query(WithingsDevice).count() == 1
 
-    def test_records_a_device_that_reported_no_key(self, db: Session) -> None:
-        # A Wi-Fi device that never fell back to BLE. Refusing it would lose the device record
-        # along with the key it legitimately does not have.
+    def test_records_a_device_that_reported_nothing_but_its_id(self, db: Session) -> None:
+        # Every field but deviceid is optional. Refusing a sparse notification would lose the
+        # device record along with the detail it legitimately does not have.
         user_id = _member(db)
 
-        device = record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key=None)
+        device = record_installed_device(db, user_id=user_id, device_id="device-1")
 
-        assert device.advertise_key is None
-        assert device.advertise_key_source is None
+        assert device.device_id == "device-1"
+        assert device.model is None
+        assert device.battery is None
 
 
 class TestSyncDevicesFromWithings:
@@ -111,8 +113,7 @@ class TestSyncDevicesFromWithings:
         device = devices[0]
         assert device.model_id == 6
         assert device.device_type == "Scale"
-        assert device.advertise_key == "adv-from-getdevice"
-        assert device.advertise_key_source == SOURCE_GETDEVICE
+        assert device.battery == "high"
         assert device.last_session_at == datetime.fromtimestamp(1_756_000_000, tz=timezone.utc)
 
     def test_accepts_the_older_modelid_spelling(self, db: Session) -> None:
@@ -128,41 +129,38 @@ class TestSyncDevicesFromWithings:
 
         assert devices[0].model_id == 45
 
-    def test_never_erases_a_key_getdevice_did_not_carry(self, db: Session) -> None:
-        # THE invariant. The notification is often the only source of a just-installed
-        # device's key, and nothing can re-derive it.
+    def test_never_erases_a_field_getdevice_did_not_carry(self, db: Session) -> None:
+        # THE invariant. An omitted field means "this device did not report one", and reading
+        # it as "no value" would wipe what an earlier response did carry.
         user_id = _member(db)
-        record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-from-notification")
+        _sync(db, user_id, _entry(battery="high"))
 
-        devices = _sync(db, user_id, _entry(advertise_key=None))
+        devices = _sync(db, user_id, _entry(battery=None))
 
-        assert devices[0].advertise_key == "adv-from-notification"
-        assert devices[0].advertise_key_source == SOURCE_NOTIFICATION
+        assert devices[0].battery == "high"
 
-    def test_a_later_key_wins_over_an_earlier_one(self, db: Session) -> None:
-        # Preserving a key is not the same as freezing it: when Getdevice DOES carry one, it
-        # is the current one.
+    def test_a_later_value_wins_over_an_earlier_one(self, db: Session) -> None:
+        # Preserving a value is not the same as freezing it: when Getdevice DOES carry one, it
+        # is the current one, and a battery that fell from high to low must be readable.
         user_id = _member(db)
-        record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-old")
+        _sync(db, user_id, _entry(battery="high"))
 
-        devices = _sync(db, user_id, _entry(advertise_key="adv-new"))
+        devices = _sync(db, user_id, _entry(battery="low"))
 
-        assert devices[0].advertise_key == "adv-new"
-        assert devices[0].advertise_key_source == SOURCE_GETDEVICE
+        assert devices[0].battery == "low"
 
     def test_marks_devices_withings_no_longer_lists(self, db: Session) -> None:
         # How a dissociation performed inside Withings' settings WebView reaches us. Both
         # devices are listed once first, so both are things Getdevice has actually seen.
         user_id = _member(db)
-        _sync(db, user_id, _entry(deviceid="device-1"), _entry(deviceid="device-2", advertise_key="adv-2"))
+        _sync(db, user_id, _entry(deviceid="device-1"), _entry(deviceid="device-2", battery="low"))
 
         _sync(db, user_id, _entry(deviceid="device-1"))
 
         gone = db.query(WithingsDevice).filter(WithingsDevice.device_id == "device-2").one()
         assert gone.dissociated_at is not None
-        # Soft, so the key survives: a transient omission must not destroy what only the
-        # install notification ever carried.
-        assert gone.advertise_key == "adv-2"
+        # Soft, so the row survives whole: a transient omission must not destroy its history.
+        assert gone.battery == "low"
 
     def test_never_dissociates_a_device_getdevice_has_not_listed_yet(self, db: Session) -> None:
         # The freshly-paired case, and the reason last_getdevice_at exists. A member pairs a
@@ -170,7 +168,7 @@ class TestSyncDevicesFromWithings:
         # NOT be swept, because its absence says nothing. record_installed_device's docstring
         # asserts exactly this lag; the sweep used to ignore it.
         user_id = _member(db)
-        record_installed_device(db, user_id=user_id, device_id="just-paired", advertise_key="adv-new")
+        record_installed_device(db, user_id=user_id, device_id="just-paired", model="Body+")
 
         _sync(db, user_id)
 
@@ -178,16 +176,16 @@ class TestSyncDevicesFromWithings:
         assert device.dissociated_at is None, "a device Getdevice has never listed cannot be judged by its absence"
         assert list_devices(db, user_id=user_id)[0].device_id == "just-paired"
 
-    def test_the_guard_is_not_advertise_key_source(self, db: Session) -> None:
-        # The field that looks right is not: a Getdevice entry carrying NO advertise_key
-        # leaves advertise_key_source saying "notification", so a sweep keyed on it would
-        # still refuse to sweep a device Getdevice knows perfectly well about.
+    def test_a_sparse_getdevice_entry_still_counts_as_listed(self, db: Session) -> None:
+        # The sweep's fact is "Getdevice has listed this device", and nothing else. An entry
+        # that carries only a deviceid still says that, so a device known first from the
+        # notification becomes sweepable once Getdevice mentions it at all.
         user_id = _member(db)
-        record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-1")
-        _sync(db, user_id, _entry(deviceid="device-1", advertise_key=None))
+        record_installed_device(db, user_id=user_id, device_id="device-1", model="Body+")
+        _sync(db, user_id, {"deviceid": "device-1"})
 
         listed = db.query(WithingsDevice).filter(WithingsDevice.device_id == "device-1").one()
-        assert listed.advertise_key_source == SOURCE_NOTIFICATION, "the key still came from the notification"
+        assert listed.model == "Body+", "the sparse entry did not erase what the notification gave"
         assert listed.last_getdevice_at is not None, "but Getdevice has listed it, and that is the sweep's fact"
 
         _sync(db, user_id)
@@ -203,18 +201,17 @@ class TestSyncDevicesFromWithings:
 
         device = db.query(WithingsDevice).one()
         assert device.dissociated_at is not None
-        assert device.advertise_key == "adv-from-getdevice"
+        assert device.battery == "high"
 
     def test_seeing_a_device_again_undissociates_it(self, db: Session) -> None:
         user_id = _member(db)
-        record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-1")
-        _sync(db, user_id, _entry(deviceid="device-1", advertise_key=None))
+        _sync(db, user_id, _entry(deviceid="device-1", battery="high"))
         _sync(db, user_id)
 
-        devices = _sync(db, user_id, _entry(advertise_key=None))
+        devices = _sync(db, user_id, _entry(battery=None))
 
         assert devices[0].dissociated_at is None
-        assert devices[0].advertise_key == "adv-1", "the row came back whole, not as a new one"
+        assert devices[0].battery == "high", "the row came back whole, not as a new one"
         assert db.query(WithingsDevice).count() == 1
 
     def test_one_members_devices_do_not_reach_another(self, db: Session) -> None:
@@ -222,18 +219,18 @@ class TestSyncDevicesFromWithings:
         # same model, and Withings device ids are not ours to assume unique across accounts.
         first = _member(db)
         second = _member(db)
-        record_installed_device(db, user_id=first, device_id="device-1", advertise_key="adv-first")
+        _sync(db, first, _entry(deviceid="device-1", battery="high"))
 
-        _sync(db, second, _entry(deviceid="device-1", advertise_key="adv-second"))
+        _sync(db, second, _entry(deviceid="device-1", battery="low"))
 
-        assert list_devices(db, user_id=first)[0].advertise_key == "adv-first"
-        assert list_devices(db, user_id=second)[0].advertise_key == "adv-second"
+        assert list_devices(db, user_id=first)[0].battery == "high"
+        assert list_devices(db, user_id=second)[0].battery == "low"
 
 
 class TestMarkDissociatedAndList:
     def test_marks_the_device_and_drops_it_from_the_default_list(self, db: Session) -> None:
         user_id = _member(db)
-        record_installed_device(db, user_id=user_id, device_id="device-1", advertise_key="adv-1")
+        record_installed_device(db, user_id=user_id, device_id="device-1", model="Body+")
 
         assert mark_dissociated(db, user_id=user_id, device_id="device-1") is not None
 

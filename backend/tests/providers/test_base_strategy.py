@@ -123,7 +123,7 @@ class TestBaseProviderStrategy:
         with patch.object(strategy.webhook_service, "remove_user") as remove_user:
             strategy.on_disconnect(db, user_id)
 
-        remove_user.assert_called_once_with(db, user_id)
+        remove_user.assert_called_once_with(db, user_id, connection_id=None)
 
     def test_on_disconnect_is_a_no_op_by_default(self) -> None:
         """Providers holding no per-connection vendor state inherit a no-op."""
