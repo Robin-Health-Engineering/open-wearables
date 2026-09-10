@@ -72,11 +72,19 @@ def disconnect_provider_endpoint(
     provider: ProviderName,
     db: DbSession,
     _api_key: ApiKeyDep,
+    connection_id: UUID | None = None,
 ) -> Response:
-    """Disconnect a user from a provider, revoking the connection and clearing tokens."""
+    """Disconnect a user from a provider, revoking the connection and clearing tokens.
+
+    ``connection_id`` removes ONE connection rather than every one the member holds with this
+    provider. It exists for Withings, where a member can hold their own linked account
+    alongside an account we created for each cellular device we shipped them — removing one
+    device must not revoke the rest. Omit it and this is the wide disconnect it has always
+    been, which is what the other twelve providers will always want.
+    """
     strategy = ProviderFactory().get_provider(provider.value)
-    strategy.on_disconnect(db, user_id)
-    user_connection_service.disconnect(db, user_id, provider.value, oauth=strategy.oauth)
+    strategy.on_disconnect(db, user_id, connection_id=connection_id)
+    user_connection_service.disconnect(db, user_id, provider.value, oauth=strategy.oauth, connection_id=connection_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -87,7 +95,12 @@ def delete_provider_data_endpoint(
     db: DbSession,
     _api_key: ApiKeyDep,
 ) -> Response:
-    """Delete all of a user's data for a provider and revoke the connection."""
+    """Delete all of a user's data for a provider and revoke every connection to it.
+
+    Provider-wide on purpose, unlike the disconnect above — see ``purge_provider_data``:
+    health scores are not attributable to one connection, so there is no honest way to purge
+    just one of a member's Withings accounts.
+    """
     strategy = ProviderFactory().get_provider(provider.value)
     strategy.on_disconnect(db, user_id)
     user_connection_service.purge_provider_data(db, user_id, provider.value, oauth=strategy.oauth)

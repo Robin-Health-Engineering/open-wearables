@@ -341,7 +341,12 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         )
 
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
-        """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
+        """Revoke EVERY connection a member has with a provider, in one UPDATE.
+
+        "Disconnect Withings" in its widest sense. For a member who holds several Withings
+        accounts — their own, plus one per cellular device we shipped — this revokes all of
+        them; use ``disconnect_connection`` to remove just one.
+        """
         result = cast(
             CursorResult[tuple[()]],
             db_session.execute(
@@ -350,6 +355,37 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     and_(
                         UserConnection.user_id == user_id,
                         UserConnection.provider == provider,
+                        UserConnection.status != ConnectionStatus.REVOKED,
+                    ),
+                )
+                .values(
+                    status=ConnectionStatus.REVOKED,
+                    access_token=None,
+                    refresh_token=None,
+                    token_expires_at=None,
+                    updated_at=datetime.now(timezone.utc),
+                ),
+            ),
+        )
+        db_session.commit()
+        return result.rowcount
+
+    def disconnect_connection(self, db_session: DbSession, connection: UserConnection) -> int:
+        """Revoke ONE connection and clear its tokens. Returns rows updated (0 or 1).
+
+        The sibling ``disconnect`` above revokes every connection a member has with a provider,
+        which is right for "disconnect Withings entirely" and wrong for "remove this device":
+        a member's own linked account and an account we created to ship them hardware are
+        separately revocable things, and collapsing them is the destructive move this whole
+        change exists to remove.
+        """
+        result = cast(
+            CursorResult[tuple[()]],
+            db_session.execute(
+                update(UserConnection)
+                .where(
+                    and_(
+                        UserConnection.id == connection.id,
                         UserConnection.status != ConnectionStatus.REVOKED,
                     ),
                 )

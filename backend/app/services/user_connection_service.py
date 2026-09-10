@@ -95,19 +95,41 @@ class UserConnectionService(
 
     @handle_exceptions
     def disconnect(
-        self, db_session: DbSession, user_id: UUID, provider: str, oauth: BaseOAuthTemplate | None = None
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        oauth: BaseOAuthTemplate | None = None,
+        *,
+        connection_id: UUID | None = None,
     ) -> None:
         """Disconnect a user from a provider. Raises 404 if connection not found.
 
         If oauth is provided, calls the provider's deregistration API before clearing tokens.
         Deregistration failures are logged but do not block the disconnect.
+
+        ``connection_id`` disconnects ONE connection instead of every one the member has with
+        this provider. It matters only for Withings, where a member can hold their own linked
+        account alongside an account we created per cellular device: removing one device must
+        not silently revoke the others, or the member's own account. Omitted, this is the
+        wide disconnect it has always been, which is still the right answer for "disconnect
+        Withings" and the only possible one for the other twelve providers.
         """
         if oauth:
-            self._deregister_from_provider(db_session, user_id, provider, oauth)
+            self._deregister_from_provider(db_session, user_id, provider, oauth, connection_id=connection_id)
 
-        updated = self.crud.disconnect(db_session, user_id, provider)
+        if connection_id is not None:
+            target = self.crud.get(db_session, connection_id)
+            if target is None or target.user_id != user_id or target.provider != provider:
+                # Checked rather than trusted: connection_id arrives from the caller, and a row
+                # belonging to another member must not be revocable by naming its id.
+                raise ResourceNotFoundError("connection", connection_id)
+            updated = self.crud.disconnect_connection(db_session, target)
+        else:
+            updated = self.crud.disconnect(db_session, user_id, provider)
+
         if updated:
-            connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+            connection = self._target_connection(db_session, user_id, provider, connection_id)
             log_structured(
                 self.logger,
                 "info",
@@ -129,7 +151,7 @@ class UserConnectionService(
             return
 
         # Nothing updated - check if connection exists (already revoked) or not found
-        connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+        connection = self._target_connection(db_session, user_id, provider, connection_id)
         if not connection:
             raise ResourceNotFoundError("connection", user_id)
 
@@ -143,6 +165,13 @@ class UserConnectionService(
         deletes the user's data_source rows for the provider. ON DELETE CASCADE removes all
         dependent event records, series, details and health scores. Returns the number of
         data_source rows deleted. Safe to call on an already-revoked connection.
+
+        **Provider-wide, with no connection_id, deliberately.** ``disconnect`` above can remove
+        one of a member's several Withings connections, but purging cannot be scoped the same
+        way: ``health_score`` rows are keyed by ``(user_id, provider)`` with no connection
+        column, so a per-connection purge would either delete a sibling connection's scores or
+        leave scores derived from data it had just deleted. "Delete all my Withings data" is a
+        coherent request and this serves it; "remove this device" is the disconnect.
         """
         self.disconnect(db_session, user_id, provider, oauth=oauth)
         deleted = self.data_source_crud.delete_user_provider_data(db_session, user_id, ProviderName(provider))
@@ -161,11 +190,25 @@ class UserConnectionService(
         if connection:
             self.crud.update_last_synced_at(db_session, connection)
 
+    def _target_connection(
+        self, db_session: DbSession, user_id: UUID, provider: str, connection_id: UUID | None
+    ) -> UserConnection | None:
+        """The connection an operation is about: the named one, else the member's primary."""
+        if connection_id is not None:
+            return self.crud.get(db_session, connection_id)
+        return self.crud.get_by_user_and_provider(db_session, user_id, provider)
+
     def _deregister_from_provider(
-        self, db_session: DbSession, user_id: UUID, provider: str, oauth: BaseOAuthTemplate
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        oauth: BaseOAuthTemplate,
+        *,
+        connection_id: UUID | None = None,
     ) -> None:
         """Best-effort call to provider's deregistration API."""
-        connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+        connection = self._target_connection(db_session, user_id, provider, connection_id)
         if not connection or not connection.access_token:
             return
 

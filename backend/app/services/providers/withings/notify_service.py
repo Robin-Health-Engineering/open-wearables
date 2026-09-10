@@ -110,27 +110,44 @@ class WithingsNotifyService(BaseWebhookService):
             return [{"status": "skipped", "reason": "no_live_sync_mode"}]
         return self.sync_user(db, user_id, mode)
 
-    def remove_user(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
+    def remove_user(
+        self, db: DbSession, user_id: UUID, *, connection_id: UUID | None = None
+    ) -> list[dict[str, Any]]:
         """Revoke a user's subscriptions on disconnect, data purge or account deletion.
 
-        Subscriptions belong to the provider account rather than to one local profile,
-        so a sibling profile still linked to it keeps them. Reconciling toward PULL
+        Subscriptions belong to the provider ACCOUNT rather than to one local profile, so a
+        sibling profile still linked to the same account keeps them. Reconciling toward PULL
         prunes exactly the set this user owns.
-        """
-        if not self._is_last_active_link(db, user_id):
-            return [{"status": "skipped", "reason": "provider_account_still_linked"}]
-        return self.sync_user(db, user_id, LiveSyncMode.PULL)
 
-    def _is_last_active_link(self, db: DbSession, user_id: UUID) -> bool:
+        ``connection_id`` says which of the member's Withings accounts is being removed. Without
+        it this resolves the member's PRIMARY connection, which since a member can hold several
+        is quite possibly not the one being disconnected — and the subscriptions it would then
+        prune belong to an account that is staying.
+        """
+        if not self._is_last_active_link(db, user_id, connection_id=connection_id):
+            return [{"status": "skipped", "reason": "provider_account_still_linked"}]
+        return self.sync_user(db, user_id, LiveSyncMode.PULL, connection_id=connection_id)
+
+    def _is_last_active_link(self, db: DbSession, user_id: UUID, *, connection_id: UUID | None = None) -> bool:
         """Whether removing this connection leaves no active link to the same Withings account."""
-        connection = self.connection_repo.get_by_user_and_provider(db, user_id, "withings")
+        connection = (
+            self.connection_repo.get(db, connection_id)
+            if connection_id is not None
+            else self.connection_repo.get_by_user_and_provider(db, user_id, "withings")
+        )
         if connection is None or connection.provider_user_id is None:
             return True
         linked = self.connection_repo.get_all_by_provider_user_id(db, "withings", connection.provider_user_id)
         return not any(other.user_id != user_id for other in linked)
 
-    def sync_user(self, db: DbSession, user_id: UUID, mode: LiveSyncMode) -> list[dict[str, Any]]:
-        """Reconcile the desired appli set without modifying foreign callback endpoints."""
+    def sync_user(
+        self, db: DbSession, user_id: UUID, mode: LiveSyncMode, *, connection_id: UUID | None = None
+    ) -> list[dict[str, Any]]:
+        """Reconcile the desired appli set without modifying foreign callback endpoints.
+
+        Subscriptions live on a Withings ACCOUNT, so every call here has to be made as the
+        connection whose subscriptions are being reconciled — see ``remove_user``.
+        """
         try:
             callback_url = withings_callback_url()
         except WithingsWebhookTokenUnconfiguredError:
@@ -150,7 +167,7 @@ class WithingsNotifyService(BaseWebhookService):
             return [{"status": "skipped", "reason": "callback_url_invalid"}]
         desired_applis = set(SUBSCRIBED_APPLIS) if mode == LiveSyncMode.WEBHOOK else set()
         try:
-            existing = self._list_subscriptions(db, user_id)
+            existing = self._list_subscriptions(db, user_id, connection_id=connection_id)
         except WithingsTokenError as e:
             if e.invalid_grant:
                 # An invalid grant is terminal until the user reconnects.
@@ -204,7 +221,7 @@ class WithingsNotifyService(BaseWebhookService):
                 active_desired_applis.add(appli)
                 results.append({"appli": appli, "status": "unchanged"})
                 continue
-            result = self._apply("subscribe", "subscribed", db, user_id, callback_url, appli)
+            result = self._apply("subscribe", "subscribed", db, user_id, callback_url, appli, connection_id)
             results.append(result)
             if result["status"] == "subscribed":
                 active_desired_applis.add(appli)
@@ -217,15 +234,20 @@ class WithingsNotifyService(BaseWebhookService):
                     continue  # registered by a different host — not ours to touch
                 if appli in desired_applis and appli not in active_desired_applis:
                     continue  # replacement failed; retain the old profile until a retry succeeds
-                results.append(self._apply("revoke", "revoked", db, user_id, entry.callbackurl, appli))
+                results.append(
+                    self._apply("revoke", "revoked", db, user_id, entry.callbackurl, appli, connection_id)
+                )
 
         return results
 
-    def _list_subscriptions(self, db: DbSession, user_id: UUID) -> list[WithingsNotifyProfile]:
+    def _list_subscriptions(
+        self, db: DbSession, user_id: UUID, *, connection_id: UUID | None = None
+    ) -> list[WithingsNotifyProfile]:
         """List all applis and callback URLs in one request."""
         body = withings_request(
             db=db,
             user_id=user_id,
+            connection_id=connection_id,
             connection_repo=self.connection_repo,
             oauth=self.oauth,
             service_path="/notify",
@@ -258,6 +280,7 @@ class WithingsNotifyService(BaseWebhookService):
         user_id: UUID,
         callback_url: str,
         appli: int,
+        connection_id: UUID | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"callbackurl": callback_url, "appli": appli}
         if action == "subscribe":
@@ -271,6 +294,7 @@ class WithingsNotifyService(BaseWebhookService):
                 service_path="/notify",
                 action=action,
                 params=params,
+                connection_id=connection_id,
             )
             return {"appli": appli, "status": ok_status}
         except Exception as e:
