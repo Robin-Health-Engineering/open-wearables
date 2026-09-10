@@ -1,19 +1,21 @@
-"""The two writers of ``advertise_key``, and the reconciliation between them.
+"""A member's Withings devices, as reported by Withings and as the member is shown them.
 
-Background BLE sync is what makes a Withings device useful between Wi-Fi sessions, and the
-SDK cannot start it without a per-device ``advertise_key``. Withings hands that token out two
-ways and states plainly that **both must be implemented**:
+Two writers, and the reconciliation between them:
 
-* the SDK's **install-success notification**, which only the app ever sees, and
+* an **install-success notification**, which only the app ever sees, and
 * **``User v2 - Getdevice``**, a token-authenticated call only the server can make.
 
-Neither is complete on its own. The notification is the only source for a device installed
-while Getdevice had not caught up, and Getdevice is the only source after an app reinstall,
-which loses every notification the app ever received. So the rule throughout this module is:
-**a write never erases a key it cannot replace.** A Getdevice entry with no ``advertise_key``
-leaves the stored one alone; it does not null it.
+Getdevice is the authority and the only one that survives an app reinstall; the notification
+merely gets a device row in sooner, since Getdevice may not list a just-installed device yet.
 
-Reference: https://developer.withings.com/sdk/v2/tree/sdk-webviews/required-web-services/
+This module used to exist for ``advertise_key`` — the per-device token the Withings Mobile SDK
+needed to start background BLE sync, which Withings requires be collected from both sources.
+That integration is abandoned (cellular devices ship already connected, so there is nothing to
+pair) and the column is gone. The rule it motivated survives and still matters: **a write never
+erases what it cannot replace.** Getdevice shapes its response by what each device reports, so
+an entry omitting ``battery`` means "this device did not say", not "there is no battery level".
+
+Reference: https://developer.withings.com/api-reference/#tag/devices
 """
 
 from __future__ import annotations
@@ -35,17 +37,16 @@ from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
 
-# Recorded on the row so that "where did this key come from" is answerable when a device
-# stops syncing. Diagnostic only — neither source outranks the other, the later write wins.
+# Which writer produced an upsert. It is no longer stored — the column it fed
+# (``advertise_key_source``) went with the Mobile SDK — but it still decides whether a write
+# stamps ``last_getdevice_at``, which is what keeps the dissociation sweep from retiring a
+# device Withings' own list has simply not caught up with yet.
 #
-# A Literal rather than a bare str so every call site is checked, and NOT a SQLAlchemy Enum
-# column: mapping one would mean an entry in ``BaseDbModel.type_annotation_map``, which lives
-# in ``app/database.py`` — an upstream file this fork has to keep rebasing onto cleanly. The
-# column stays a plain String; the constraint is enforced where the values are written.
-DeviceKeySource = Literal["notification", "getdevice"]
+# A Literal rather than a bare str so every call site is checked.
+DeviceWriteSource = Literal["notification", "getdevice"]
 
-SOURCE_NOTIFICATION: DeviceKeySource = "notification"
-SOURCE_GETDEVICE: DeviceKeySource = "getdevice"
+SOURCE_NOTIFICATION: DeviceWriteSource = "notification"
+SOURCE_GETDEVICE: DeviceWriteSource = "getdevice"
 
 
 class WithingsDeviceError(RuntimeError):
@@ -69,18 +70,18 @@ def _upsert(
     *,
     connection_id: UUID,
     device_id: str,
-    source: DeviceKeySource,
+    source: DeviceWriteSource,
     model_id: int | None = None,
     model: str | None = None,
     device_type: str | None = None,
-    advertise_key: str | None = None,
+    battery: str | None = None,
     last_session_at: datetime | None = None,
 ) -> WithingsDevice:
-    """Create or update one device row, without ever losing what the other writer stored.
+    """Create or update one device row, without ever losing what an earlier write stored.
 
-    Every optional field is written only when a value is actually supplied. That is the whole
-    mechanism: a Getdevice entry carrying no ``advertise_key`` must leave the one the install
-    notification stored exactly where it is, because nothing else can re-derive it.
+    Every optional field is written only when a value is actually supplied. Getdevice shapes its
+    response by what a device reports, so an entry omitting ``battery`` means "this device did
+    not say" — not "the battery is unknown now" — and must leave the stored value alone.
     """
     now = datetime.now(timezone.utc)
     existing = (
@@ -104,17 +105,14 @@ def _upsert(
         device.model = model
     if device_type:
         device.device_type = device_type
-    if advertise_key:
-        device.advertise_key = advertise_key
-        device.advertise_key_source = source
+    if battery:
+        device.battery = battery
     if last_session_at is not None:
         device.last_session_at = last_session_at
 
-    # Stamped for a Getdevice write and ONLY a Getdevice write — it records that Withings'
-    # own list has seen this device, which is what makes the dissociation sweep safe. It is
-    # deliberately not derived from ``advertise_key_source``: a Getdevice entry carrying no
-    # advertise_key leaves that field saying "notification", and a sweep keyed on it would
-    # still sweep devices Getdevice knows about.
+    # Stamped for a Getdevice write and ONLY a Getdevice write — it records that Withings' own
+    # list has seen this device, which is what makes the dissociation sweep safe. A device
+    # Getdevice has never listed says nothing by being absent from it.
     if source == SOURCE_GETDEVICE:
         device.last_getdevice_at = now
 
@@ -136,13 +134,13 @@ def record_installed_device(
     device_id: str,
     model_id: int | None = None,
     model: str | None = None,
-    advertise_key: str | None = None,
 ) -> WithingsDevice:
-    """Store what the SDK's install-success notification reported.
+    """Store the device an install-success notification reported.
 
-    The first of the two sources, and often the only one that will ever carry this device's
-    ``advertise_key`` — Getdevice may not list a just-installed device immediately, and the
-    notification is not repeated.
+    Pre-registers a device ahead of Getdevice, which may not list a just-installed one
+    immediately. It used to carry ``advertise_key`` too — the token the Mobile SDK needed for
+    background BLE sync — and that was its real justification; with that integration abandoned
+    this writer only gets a device row in slightly sooner than the next sweep would.
     """
     connection = _connection(db, user_id)
     device = _upsert(
@@ -152,21 +150,17 @@ def record_installed_device(
         source=SOURCE_NOTIFICATION,
         model_id=model_id,
         model=model,
-        advertise_key=advertise_key,
     )
     db.commit()
 
     log_structured(
         logger,
-        "info" if advertise_key else "warning",
+        "info",
         "Withings device recorded from the install notification",
         provider=ProviderName.WITHINGS.value,
         task="record_installed_device",
         user_id=str(user_id),
         device_id=device_id,
-        # Worth a warning rather than an info: a BLE device installed without a key will not
-        # sync in the background, and this is the moment that becomes true.
-        has_advertise_key=bool(device.advertise_key),
     )
     return device
 
@@ -185,8 +179,8 @@ def sync_devices_from_withings(
     dissociate a device without our ever hearing about it.
 
     Devices Withings no longer lists are marked dissociated rather than deleted — see the
-    model. A response that transiently omits a device would otherwise destroy an
-    ``advertise_key`` that only the install notification ever carried.
+    model. A response that transiently omits a device would otherwise destroy that row's
+    history: when it last synced, and which order it shipped on.
     """
     connection = _connection(db, user_id)
 
@@ -215,7 +209,7 @@ def sync_devices_from_withings(
                 model_id=entry.model_id,
                 model=entry.model,
                 device_type=entry.type,
-                advertise_key=entry.advertise_key,
+                battery=entry.battery,
                 last_session_at=_from_unix(entry.last_session_date),
             )
         )
@@ -237,7 +231,7 @@ def sync_devices_from_withings(
     # An EMPTY response still marks previously-listed devices dissociated, deliberately.
     # "Withings lists no devices for this member" is a real answer and the only one they give
     # for a member who removed their last device — and the marker is soft, so a later sync
-    # that lists them again clears it and the advertise_keys were never at risk.
+    # that lists them again simply clears it, with no row lost in between.
     missing = stale.all()
     for device in missing:
         device.dissociated_at = now
@@ -254,7 +248,7 @@ def sync_devices_from_withings(
         user_id=str(user_id),
         listed=len(devices),
         newly_dissociated=len(missing),
-        without_advertise_key=sum(1 for d in devices if not d.advertise_key),
+        without_battery=sum(1 for d in devices if not d.battery),
     )
     return devices
 

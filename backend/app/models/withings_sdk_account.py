@@ -16,9 +16,8 @@ class WithingsSdkAccount(BaseDbModel):
     * ``user_connection`` is an upstream table and this fork has to keep rebasing onto
       upstream cleanly; widening it invites a conflict on every rebase.
     * None of this means anything to the other twelve providers.
-    * ``csrf_token`` is only the first field. Device ``advertise_key``s land here next —
-      Withings requires both sources of them (the install notification AND ``Getdevice``),
-      and background BLE sync does not work without one.
+    * ``external_id`` is the identifier WE minted for this account, and the join back to the
+      member; nothing in the other twelve providers has an equivalent.
 
     Hangs off whichever ``user_connection`` the member has for Withings. There is only ever
     one: that table's unique ``(user_id, provider)`` index means a personally-linked account
