@@ -35,9 +35,7 @@ def _provisioned_connection_ids(db: DbSession, connection_ids: list[UUID]) -> se
     if not connection_ids:
         return set()
     rows = db.execute(
-        select(WithingsSdkAccount.user_connection_id).where(
-            WithingsSdkAccount.user_connection_id.in_(connection_ids)
-        )
+        select(WithingsSdkAccount.user_connection_id).where(WithingsSdkAccount.user_connection_id.in_(connection_ids))
     ).all()
     return {row[0] for row in rows}
 

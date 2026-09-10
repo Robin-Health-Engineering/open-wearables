@@ -327,9 +327,7 @@ def sync_vendor_data(
                             # rather than something a reader of that log asked for. Providers
                             # read kwargs by name, so the extra key is inert for the twelve
                             # that cannot have a second connection.
-                            success = strategy.workouts.load_data(
-                                db, user_uuid, connection_id=connection.id, **params
-                            )
+                            success = strategy.workouts.load_data(db, user_uuid, connection_id=connection.id, **params)
                             provider_result.params["workouts"] = {"success": success, **params}
                         except Exception as e:
                             _log_provider_sync_failure(

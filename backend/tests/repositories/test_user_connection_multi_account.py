@@ -71,9 +71,9 @@ class TestTheRelaxedUniqueIndex:
         user = UserFactory()
         _add(db, user.id, "withings-same")
 
-        _add(db, user.id, "withings-same")
+        # Inside the raises block: ``_add`` flushes, so this is where the constraint fires.
         with pytest.raises(IntegrityError):
-            db.flush()
+            _add(db, user.id, "withings-same")
 
     def test_two_connections_with_no_account_id_are_rejected(self, db: Session) -> None:
         # NULLS NOT DISTINCT, and the reason it is not decoration. provider_user_id is nullable
@@ -84,9 +84,8 @@ class TestTheRelaxedUniqueIndex:
         user = UserFactory()
         _add(db, user.id, None, provider="apple")
 
-        _add(db, user.id, None, provider="apple")
         with pytest.raises(IntegrityError):
-            db.flush()
+            _add(db, user.id, None, provider="apple")
 
     def test_the_same_account_on_two_members_is_allowed(self, db: Session) -> None:
         # The inverse fan-out, which has always been supported: one provider account shared by

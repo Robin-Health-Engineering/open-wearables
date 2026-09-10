@@ -22,6 +22,7 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -185,8 +186,17 @@ class TestProvisionSdkAccount:
         # Relaxing the index did not make it meaningless. Two rows describing ONE Withings
         # account for one member is a bug, and it is also the guard if Withings ever adopts an
         # existing account instead of creating a new one.
+        #
+        # Surfaces as a 400 rather than a raw IntegrityError: the connection is written through
+        # the repository, whose @handle_exceptions turns an integrity violation into
+        # "entity already exists". That is the right shape for a caller — a duplicate account is
+        # a bad request, not a server fault — and it is what the API actually returns, so it is
+        # what this pins. Contrast the external_id case above, which is written with a bare
+        # flush and therefore raises IntegrityError unwrapped.
         user = UserFactory()
         _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}#order-1")
 
-        with pytest.raises(IntegrityError):
+        with pytest.raises(HTTPException) as exc:
             _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}#order-2")
+
+        assert exc.value.status_code == 400

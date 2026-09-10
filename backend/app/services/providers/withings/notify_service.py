@@ -110,9 +110,7 @@ class WithingsNotifyService(BaseWebhookService):
             return [{"status": "skipped", "reason": "no_live_sync_mode"}]
         return self.sync_user(db, user_id, mode)
 
-    def remove_user(
-        self, db: DbSession, user_id: UUID, *, connection_id: UUID | None = None
-    ) -> list[dict[str, Any]]:
+    def remove_user(self, db: DbSession, user_id: UUID, *, connection_id: UUID | None = None) -> list[dict[str, Any]]:
         """Revoke a user's subscriptions on disconnect, data purge or account deletion.
 
         Subscriptions belong to the provider ACCOUNT rather than to one local profile, so a
@@ -234,9 +232,7 @@ class WithingsNotifyService(BaseWebhookService):
                     continue  # registered by a different host — not ours to touch
                 if appli in desired_applis and appli not in active_desired_applis:
                     continue  # replacement failed; retain the old profile until a retry succeeds
-                results.append(
-                    self._apply("revoke", "revoked", db, user_id, entry.callbackurl, appli, connection_id)
-                )
+                results.append(self._apply("revoke", "revoked", db, user_id, entry.callbackurl, appli, connection_id))
 
         return results
 

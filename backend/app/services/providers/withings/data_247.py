@@ -79,9 +79,7 @@ class Withings247Data(Base247DataTemplate):
 
     # ---------------------- Body measures (getmeas) ----------------------
 
-    def _active_connection_id(
-        self, db: DbSession, user_id: UUID, connection_id: UUID | None = None
-    ) -> UUID | None:
+    def _active_connection_id(self, db: DbSession, user_id: UUID, connection_id: UUID | None = None) -> UUID | None:
         """Which connection this sync is reading — the named one, else the member's primary.
 
         A member can hold several Withings connections (their own account, plus one per cellular
