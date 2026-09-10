@@ -15,6 +15,7 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_5
 
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.models import UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import AuthenticationMethod, ConnectionStatus
@@ -133,8 +134,21 @@ class BaseOAuthTemplate(ABC):
 
         return oauth_state
 
-    def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
-        """Refreshes the access token using the refresh token."""
+    def refresh_access_token(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        refresh_token: str,
+        *,
+        connection_id: UUID | None = None,
+    ) -> OAuthTokenResponse:
+        """Refreshes the access token using the refresh token.
+
+        ``connection_id`` names WHICH of the member's connections the new tokens belong to.
+        Twelve of the thirteen providers only ever have one and pass nothing; Withings can have
+        several — a member's own account plus one per cellular device we ship them — and writing
+        a refreshed pair onto the wrong row would silently hand one account the other's tokens.
+        """
         data, headers = self._prepare_refresh_request(refresh_token)
 
         try:
@@ -147,7 +161,7 @@ class BaseOAuthTemplate(ABC):
             response.raise_for_status()
             token_response = OAuthTokenResponse.model_validate(response.json())
 
-            connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+            connection = self._connection_for(db, user_id, connection_id)
             if connection:
                 self.connection_repo.update_tokens(
                     db,
@@ -180,7 +194,7 @@ class BaseOAuthTemplate(ABC):
             )
             # 400/401 = refresh token is dead so revoke + notify
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
-                self._revoke_connection(db, user_id, reason="refresh_failed")
+                self._revoke_connection(db, user_id, reason="refresh_failed", connection_id=connection_id)
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
                     detail=f"Refresh token rejected for {self.provider_name}; reconnection required",
@@ -197,9 +211,21 @@ class BaseOAuthTemplate(ABC):
             )
             raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Token refresh failed: {str(e)}")
 
-    def _revoke_connection(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
+    def _connection_for(self, db: DbSession, user_id: UUID, connection_id: UUID | None) -> UserConnection | None:
+        """The named connection, or the member's primary one for this provider.
+
+        One place rather than four, so "which connection did we mean" cannot answer differently
+        in the refresh, the revoke and the callback.
+        """
+        if connection_id is not None:
+            return self.connection_repo.get(db, connection_id)
+        return self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+
+    def _revoke_connection(
+        self, db: DbSession, user_id: UUID, *, reason: str, connection_id: UUID | None = None
+    ) -> None:
         """Mark the connection revoked and emit a connection.revoked webhook."""
-        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        connection = self._connection_for(db, user_id, connection_id)
         if not connection or connection.status == ConnectionStatus.REVOKED:
             return
         self.connection_repo.mark_as_revoked(db, connection)
@@ -384,10 +410,15 @@ class BaseOAuthTemplate(ABC):
 
         token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=token_response.expires_in)
 
-        existing_connection = self.connection_repo.get_by_user_and_provider(
+        # Keyed on the provider ACCOUNT, not just the provider. A member can hold more than one
+        # connection with the same provider (Withings: their own account, plus one per cellular
+        # device we ship them), and the question here is "have I seen THIS account before" —
+        # anything looser would overwrite a sibling connection's tokens on an ordinary re-link.
+        existing_connection = self.connection_repo.get_by_user_provider_and_account(
             db,
             user_id,
             self.provider_name,
+            provider_user_id,
         )
 
         if existing_connection:

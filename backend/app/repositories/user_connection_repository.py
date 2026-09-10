@@ -153,6 +153,43 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .first()
         )
 
+    def get_by_user_provider_and_account(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        provider_user_id: str | None,
+    ) -> UserConnection | None:
+        """The member's connection for ONE SPECIFIC provider account, whatever its status.
+
+        This is the OAuth callback's question — "have I seen this exact account for this member
+        before?" — and it is the natural key of ``ix_user_connection_user_provider``, so at most
+        one row can ever match.
+
+        Asking ``get_by_user_and_provider`` instead is a live hazard once a member can hold two
+        Withings accounts: that returns the member's PRIMARY connection, which may well be the
+        device account we provisioned, and the callback would then overwrite its tokens with the
+        personal account's. That is the same destructive collapse the provisioning overwrite is
+        being deleted for, arriving from the other direction.
+
+        A ``None`` ``provider_user_id`` falls back to the primary lookup. Providers that report no
+        account id can only ever have one row for a member — the unique index is NULLS NOT
+        DISTINCT — so the two questions coincide there, and today's behaviour is preserved.
+        """
+        if provider_user_id is None:
+            return self.get_by_user_and_provider(db_session, user_id, provider)
+        return (
+            db_session.query(self.model)
+            .filter(
+                and_(
+                    self.model.user_id == user_id,
+                    self.model.provider == provider,
+                    self.model.provider_user_id == provider_user_id,
+                ),
+            )
+            .one_or_none()
+        )
+
     def _active_by_provider_external_id(
         self, db_session: DbSession, provider: str, provider_user_id: str
     ) -> Query[UserConnection]:
