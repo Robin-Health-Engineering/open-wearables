@@ -5,12 +5,17 @@ and storing what came back. Split across callers they can half-succeed, and a ha
 provisioning is the bad case — a connection with no ``csrf_token`` looks healthy and then
 cannot open a WebView.
 
-One connection per member per provider is enforced by ``user_connection``'s unique
-``(user_id, provider)`` index, so a member cannot hold both a personally-linked Withings
-account and an SDK-provisioned one. Where both happen, **the SDK account wins**: provisioning
-overwrites the tokens on the existing row (Francesco's call). The consequence is real and the
-UI must say so before provisioning — a personally-linked account stops syncing, keeping its
-history but gaining nothing new.
+A member may hold SEVERAL Withings connections at once, and provisioning adds one rather than
+replacing what is there. Two facts force it: Withings creates an account on every provisioning
+path they offer, and a cellular device cannot be activated onto an account the partner did not
+create. So a member who has linked their own Withings account and is then shipped a device
+holds two, and another for every later order.
+
+This used to overwrite instead, because the unique index was ``(user_id, provider)`` and there
+was nowhere to put a second row — which meant shipping someone a blood-pressure monitor
+silently stopped their own scale and watch from syncing. The index now includes
+``provider_user_id``; provisioning the SAME Withings account twice still fails there, which is
+the bug worth keeping a constraint for.
 """
 
 from __future__ import annotations
@@ -115,70 +120,40 @@ def provision_sdk_account(
 
     repo = UserConnectionRepository()
     provider = ProviderName.WITHINGS.value
-    existing = repo.get_by_user_and_provider(db, user_id, provider)
-
-    if existing:
-        # SDK wins. This may be overwriting a personally-linked account — see the module
-        # docstring; the warning belongs in the UI, not in a silent branch here.
-        log_structured(
-            logger,
-            "warning" if existing.provider_user_id != tokens.userid else "info",
-            "Withings SDK provisioning is replacing an existing connection",
-            provider=provider,
-            task="provision_sdk_account",
-            user_id=str(user_id),
-            previous_provider_user_id=existing.provider_user_id,
-            new_provider_user_id=tokens.userid,
-        )
-        # Set BEFORE the update, and not through it: ``update_connection_info`` only fills
-        # ``provider_user_id`` in when the row has none (``if provider_user_id and not
-        # connection.provider_user_id``), which is right for a refresh and wrong for a
-        # replacement. Left stale, the row would carry the OLD Withings userid alongside the NEW
-        # account's tokens — and ``provider_user_id`` is the routing key for inbound Withings
-        # notifications, so every one of them would be matched to the wrong connection or to
-        # none. The log line just above anticipates exactly this case; it must not also be the
-        # only thing that happens about it.
-        #
-        # Assigning here rather than after means the change rides ``update_connection_info``'s
-        # own commit, so there is no window in which the new tokens are durable and the userid
-        # they belong to is not.
-        existing.provider_user_id = tokens.userid
-        repo.update_connection_info(
-            db,
-            existing,
-            access_token=tokens.access_token,
-            refresh_token=tokens.refresh_token,
-            expires_in=tokens.expires_in,
-            provider_username=None,
-            scope=tokens.scope,
-        )
-        connection = existing
-    else:
-        connection = repo.create(
-            db,
-            UserConnectionCreate(
-                user_id=user_id,
-                provider=provider,
-                provider_user_id=tokens.userid,
-                provider_username=None,
-                access_token=tokens.access_token,
-                refresh_token=tokens.refresh_token,
-                token_expires_at=datetime.now(timezone.utc) + timedelta(seconds=tokens.expires_in),
-                scope=tokens.scope,
-            ),
-        )
-        if connection is None:
-            # The repository types create() as Optional. base_oauth silences that with a
-            # checker-suppression comment; here it is handled instead, because a provisioning
-            # that reached this point has already created a real Withings account —
-            # continuing without a connection row would strand it, reachable by nothing.
-            raise WithingsSdkUserError(detail="the Withings account was created but its connection could not be stored")
-        on_connection_created(
+    # CREATE, never replace. A member can hold several Withings accounts — their own, linked
+    # through consumer OAuth, plus one for every cellular order, because Withings creates an
+    # account on every provisioning path and a device cannot be added to an account that
+    # already exists.
+    #
+    # This branch used to find any existing Withings connection and overwrite it, which meant
+    # shipping someone a blood-pressure monitor silently stopped their own scale and watch from
+    # syncing. The unique index now keys on (user_id, provider, provider_user_id), so the two
+    # coexist; provisioning the SAME Withings account twice still fails there, which is right.
+    connection = repo.create(
+        db,
+        UserConnectionCreate(
             user_id=user_id,
             provider=provider,
-            connection_id=connection.id,
-            connected_at=connection.created_at.isoformat(),
-        )
+            provider_user_id=tokens.userid,
+            provider_username=None,
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            token_expires_at=datetime.now(timezone.utc) + timedelta(seconds=tokens.expires_in),
+            scope=tokens.scope,
+        ),
+    )
+    if connection is None:
+        # The repository types create() as Optional. base_oauth silences that with a
+        # checker-suppression comment; here it is handled instead, because a provisioning
+        # that reached this point has already created a real Withings account —
+        # continuing without a connection row would strand it, reachable by nothing.
+        raise WithingsSdkUserError(detail="the Withings account was created but its connection could not be stored")
+    on_connection_created(
+        user_id=user_id,
+        provider=provider,
+        connection_id=connection.id,
+        connected_at=connection.created_at.isoformat(),
+    )
 
     account = _upsert_sdk_account(
         db,

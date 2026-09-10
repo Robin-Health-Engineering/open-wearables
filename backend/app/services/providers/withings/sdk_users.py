@@ -1,11 +1,10 @@
 """Partner-hosted User Creation for the Withings Mobile SDK.
 
-Phase 2 of the Withings integration provisions a Withings account on the member's behalf,
-rather than linking one they already own (which is phase 1's consumer OAuth flow). Both
-flows ship, but a member holds only ONE connection: ``user_connection`` has a unique
-``(user_id, provider)`` index, so the two cannot coexist on one member. Provisioning wins and
-overwrites — see ``sdk_provisioning``. ``external_id`` is what ties the provisioned account
-back to our member.
+Provisions a Withings account on the member's behalf, rather than linking one they already
+own (which is the consumer OAuth flow). Both ship, and both can be true of the same member at
+once: a cellular device cannot be activated onto an account the partner did not create, so
+someone who has linked their own account and is then shipped a device holds two. See
+``sdk_provisioning``. ``external_id`` is what ties a provisioned account back to our member.
 
 This lives in Open Wearables and not in robin-backend, deliberately. ``createuser`` must be
 signed with ``client_secret``, and the ``code`` it returns becomes tokens that OW then owns
