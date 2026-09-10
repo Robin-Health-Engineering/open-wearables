@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, func, select, tuple_, update
+from sqlalchemy import CursorResult, and_, case, func, select, tuple_, update
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
@@ -86,7 +86,33 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         user_id: UUID,
         provider: str,
     ) -> UserConnection | None:
-        """Get connection for specific user and provider."""
+        """The member's PRIMARY connection for a provider: active before revoked, then oldest.
+
+        **Twelve of the thirteen providers only ever have one row, and for them this is what it
+        has always been.** Withings can have several — a member may link their own account and
+        also be shipped cellular devices, each of which creates an account we provision — so this
+        needs a stated rule rather than an accident of query planning. Seventeen call sites
+        depend on the answer.
+
+        The rule: ACTIVE before revoked, then ``created_at`` ascending, then ``id``. It is
+        deliberately the same ordering ``_active_by_provider_external_id`` documents a few methods
+        down, so the repository carries ONE notion of "primary" rather than two.
+
+        Two properties are load-bearing:
+
+        * **Ordered, not filtered.** Revoked rows are ranked last but still returned, because
+          ``base_oauth._save_connection`` looks a connection up in order to REACTIVATE it. Filter
+          them out and that path stops finding the row it means to revive and creates a duplicate
+          instead.
+        * **``.first()``, not ``.one_or_none()``.** This used to end in ``one_or_none``, which
+          raises ``MultipleResultsFound`` the moment a member has two connections for a provider —
+          i.e. every Withings call site would have started throwing when the unique index was
+          relaxed.
+
+        Callers that must act on a SPECIFIC connection rather than the primary one should not use
+        this at all: pass a ``connection_id`` (the token and data paths take one) or ask
+        ``withings.connections`` which connections a member has.
+        """
         return (
             db_session.query(self.model)
             .filter(
@@ -95,7 +121,12 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     self.model.provider == provider,
                 ),
             )
-            .one_or_none()
+            .order_by(
+                case((self.model.status == ConnectionStatus.ACTIVE, 0), else_=1),
+                self.model.created_at.asc(),
+                self.model.id.asc(),
+            )
+            .first()
         )
 
     def get_active_connection(
@@ -104,7 +135,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         user_id: UUID,
         provider: str,
     ) -> UserConnection | None:
-        """Get active connection for specific user and provider."""
+        """The member's primary ACTIVE connection for a provider — see ``get_by_user_and_provider``.
+
+        Same rule minus the status term, which the filter has already settled: ordering by status
+        here would be a no-op implying a distinction this query cannot make.
+        """
         return (
             db_session.query(self.model)
             .filter(
@@ -114,7 +149,8 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     self.model.status == ConnectionStatus.ACTIVE,
                 ),
             )
-            .one_or_none()
+            .order_by(self.model.created_at.asc(), self.model.id.asc())
+            .first()
         )
 
     def _active_by_provider_external_id(
