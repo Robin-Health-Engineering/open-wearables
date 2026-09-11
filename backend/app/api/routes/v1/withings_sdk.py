@@ -26,6 +26,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import DbSession
@@ -232,12 +233,54 @@ def create_withings_cellular_order(
     Called only from robin-backend's ``fulfillWithingsDeviceOrder``, after Stripe confirms the
     payment. That ordering is the caller's to keep: this route ships a parcel, and nothing here
     knows whether it was paid for.
+
+    **WHO MAY CALL THIS, stated here rather than inherited.** ``ApiKeyDep`` admits the org API key
+    OR any authenticated developer JWT, with no per-member, per-org or per-scope narrowing, and
+    ``payload.user_id`` is never checked against the caller. The module docstring already concedes
+    that shape — but it is reasoning about READING data and vending tokens. This route spends money
+    and ships a physical parcel to an address the CALLER chooses, which is a different blast radius
+    under the same sentence, so it is restated: ordering authority is trusted to any principal that
+    can authenticate to this deployment. If that is ever too wide, the credential is what to narrow
+    — not this docstring (Lucas, #12).
+
+    **RETRIES ARE NOT SAFE, and this route cannot make them safe.** ``createuserorder`` is not
+    idempotent at Withings and we hold no idempotency key they honour, so a second call with the
+    same ``external_id`` creates a second account and places a SECOND ORDER before anything here
+    can object. The pre-flight check below turns the ordinary sequential retry into a 409 before
+    any Withings call, which is the case that actually occurs — robin-backend retries
+    ``fulfillWithingsDeviceOrder`` after a timeout, and it sends the same
+    ``{customerProfileId}#{orderRef}``.
+
+    Two gaps remain, deliberately un-papered-over:
+
+    * it is a TOCTOU narrowing, not a fix. Two SIMULTANEOUS retries can both pass the check and
+      both ship. Closing that needs a reservation row written before the Withings call, which
+      ``withings_sdk_account`` cannot hold today (``user_connection_id`` is NOT NULL), or an
+      idempotency key Withings honours.
+    * it does nothing about a crash BETWEEN Withings accepting and our commit.
+
+    A 409 therefore means "a real Withings account exists for this external_id, and on this path an
+    order was placed with it". The caller must treat it as terminal and reconcile, NOT retry —
+    retrying can only ship again.
     """
     if not settings.withings_client_id or not settings.withings_client_secret:
         # An operator condition, not a bad request — the same 503 the SDK route answers.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Withings credentials are not configured on this deployment",
+        )
+
+    # PRE-FLIGHT, before any Withings call — see the docstring. Cheap, and it is the difference
+    # between a retry costing a 409 and a retry costing a second parcel. Reached only on the
+    # sequential retry; the concurrent one falls through to the IntegrityError handler below,
+    # which says the same thing after the fact.
+    if (
+        db.query(WithingsSdkAccount).filter(WithingsSdkAccount.external_id == payload.external_id).one_or_none()
+        is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account already exists for this external_id; the order was already placed",
         )
 
     try:
@@ -267,17 +310,74 @@ def create_withings_cellular_order(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except WithingsSdkUserError as e:
+        # The CODE EXCHANGE, which runs AFTER createuserorder has already placed the order. Without
+        # this the exception escapes both handlers and the caller gets a bare 500 with a device on
+        # its way — the failure mode the SDK route has always handled and this one inherited none
+        # of, because it catches the dropshipment error and the exchange raises a different type.
+        #
+        # No disclosure: FastAPI's generic handler answers a plain "Internal Server Error" and the
+        # message reaches the structured log only. What the 500 cost was the stranded order and an
+        # uninterpretable status, not a leak (Lucas verified this correction, #12).
+        logger.error(
+            "Withings cellular order: the code exchange failed AFTER the order was placed",
+            extra={"external_id": payload.external_id, "withings_status": e.withings_status},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Withings placed the order but the code exchange failed (status={e.withings_status})",
+        ) from e
+    except IntegrityError as e:
+        # Two concurrent provisionings for the same external_id: both passed the pre-flight, both
+        # reached Withings, and this one lost the UNIQUE race. `_store_provisioned_account` now
+        # writes the connection and the SDK row in ONE transaction, so nothing is left half-written
+        # — but a real account and a real order exist upstream either way. Same meaning as the
+        # pre-flight 409, reached the other way round.
+        logger.error(
+            "Withings cellular order: external_id already stored — a concurrent provisioning won",
+            extra={"external_id": payload.external_id},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account already exists for this external_id; the order was already placed",
+        ) from e
     except WithingsDropshipmentError as e:
         # NEVER the upstream body. It answers a signed payload that, on this route, carries the
         # member's home address as well as their email, birth date and weight.
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Withings declined the cellular order (status={e.withings_status})",
-        ) from e
+        #
+        # `withings_status` is set only on the non-zero-envelope branch (dropshipment.py:199); the
+        # HTTPStatusError branch and the four detail-only raises leave it None, and
+        # "status=None" reads as though Withings answered without a status rather than as a
+        # transport or contract failure. Fall back to the exception's own message (Lucas, #12).
+        #
+        # Safe to echo, and audited rather than assumed: every `detail=` handed to
+        # WithingsDropshipmentError is a fixed string this codebase writes — the six raises in
+        # dropshipment.py (lines 169, 180, 185, 207, 246, 254) plus the store failure in
+        # sdk_provisioning.py. None interpolates a response body or a payload field. A future
+        # `detail=f"...{response.text}"` would turn this line into the leak the 277 branch exists
+        # to prevent, so keep that invariant when adding a raise.
+        detail = (
+            f"Withings declined the cellular order (status={e.withings_status})"
+            if e.withings_status is not None
+            else f"Withings cellular order failed: {e}"
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from e
 
     if not result.account.csrf_token:
         # Same invariant as the SDK route, and worse to discover late here: the order is already
         # placed, so a null hands the caller an account it can never open a WebView against.
+        #
+        # The orders are logged FIRST because raising discards them, and this fork stores nothing
+        # about an order by design — so the order ids exist in this value and nowhere else. Losing
+        # them leaves a shipment that nothing can track and that `end_program` can never terminate.
+        logger.error(
+            "Withings cellular order placed but no csrf_token came back — order ids logged so the "
+            "shipment stays recoverable",
+            extra={
+                "external_id": result.account.external_id,
+                "orders": [o.model_dump(mode="json") for o in result.orders],
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Withings returned no csrf_token; the account cannot open a WebView",

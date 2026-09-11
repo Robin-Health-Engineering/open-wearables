@@ -19,6 +19,7 @@ was broken.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
@@ -26,6 +27,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -246,6 +248,115 @@ class TestProvisioningRoute:
         assert response.status_code == 502
         assert "member@example.com" not in response.json()["detail"]
         assert "status=503" in response.json()["detail"]
+
+    def test_400_when_unit_pref_is_empty(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Lucas's finding on #12: the PR claimed three rejection cases were verified and only two
+        # were pinned. Worth pinning specifically because this one's failure mode is the only one
+        # in the payload whose consequence is a SUCCESS — dropshipment.py:111, "a successful order
+        # for a device that renders the wrong units on its own screen, and nothing downstream ever
+        # flags it". If a refactor drops the Field(...) for a plain dict annotation, min_length
+        # silently stops applying and nothing else here notices.
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(unit_pref={}), headers=api_key_header)
+
+        assert response.status_code == 400
+        provision.assert_not_called()
+
+    def test_502_when_the_code_exchange_fails_after_the_order_was_placed(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # `exchange_sdk_code` raises WithingsSdkUserError, and it runs AFTER createuserorder has
+        # placed the order. Before this handler existed the exception escaped both `except`
+        # clauses and the caller got a bare 500 with a device already shipping.
+        error = WithingsSdkUserError(withings_status=401, detail="signature invalid for Via Roma 1")
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "status=401" in response.json()["detail"]
+        # The 500 this replaced did not leak either — FastAPI answers a bare "Internal Server
+        # Error" — but the detail we now choose ourselves must not start leaking what that did not.
+        assert "Via Roma" not in response.text
+
+    def test_409_when_the_external_id_was_already_provisioned(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # THE RETRY CASE, and the reason the check runs before any Withings call. robin-backend
+        # retries fulfillWithingsDeviceOrder after a timeout with the SAME
+        # {customerProfileId}#{orderRef}; without this, that ordinary retry creates a second
+        # Withings account and places a SECOND ORDER — a real parcel — before anything here can
+        # object. `provision.assert_not_called()` is the whole point of the test.
+        connection = UserConnectionFactory(provider="withings", provider_user_id="withings-first")
+        db.add(
+            WithingsSdkAccount(
+                id=uuid4(),
+                user_connection_id=connection.id,
+                external_id=_EXTERNAL_ID,
+                csrf_token="csrf-first",
+            )
+        )
+        db.commit()
+
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 409
+        provision.assert_not_called()
+
+    def test_409_when_a_concurrent_provisioning_won_the_unique_race(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The pre-flight is a TOCTOU narrowing, not a fix: two simultaneous retries can both pass
+        # it and both reach Withings. The loser must still get an answer that means "already
+        # placed, do not retry" rather than a 500 the caller cannot interpret.
+        error = IntegrityError("INSERT", {}, Exception("duplicate key value violates unique constraint"))
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 409
+
+    def test_a_dropshipment_error_with_no_status_does_not_render_status_none(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # `withings_status` is set only on the non-zero-envelope branch; the transport branch and
+        # the detail-only raises leave it None. "status=None" reads as though Withings answered
+        # without a status, which is the wrong diagnosis for a transport failure — and the first
+        # real exercise of this route is exactly when that distinction matters.
+        error = WithingsDropshipmentError(detail="the request to Withings could not be completed")
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "status=None" not in response.json()["detail"]
+        assert "could not be completed" in response.json()["detail"]
+
+    def test_the_placed_orders_are_logged_before_a_missing_csrf_token_discards_them(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+        withings_configured: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Raising throws `result.orders` away, and this fork stores nothing about an order by
+        # design — so the order ids exist in that value and nowhere else. Losing them leaves a
+        # shipment nothing can track and that end_program can never terminate.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token=None
+            ),
+            orders=[DropshipOrderResult(orderid="WO-STRANDED", status="PENDING")],
+        )
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning), caplog.at_level(logging.ERROR):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert any("WO-STRANDED" in str(record.orders) for record in caplog.records if hasattr(record, "orders"))
 
     def test_502_when_withings_returned_no_csrf_token(
         self, client: TestClient, api_key_header: dict[str, str], withings_configured: None

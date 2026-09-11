@@ -25,9 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
+from sqlalchemy.exc import IntegrityError
+
 from app.database import DbSession
+from app.models.user_connection import UserConnection
 from app.models.withings_sdk_account import WithingsSdkAccount
-from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
@@ -106,7 +108,6 @@ def _store_provisioned_account(
     cellular path would mean a caller catching the dropshipment error never sees the one failure
     it most needs to hear about.
     """
-    repo = UserConnectionRepository()
     provider = ProviderName.WITHINGS.value
     # CREATE, never replace. A member can hold several Withings accounts — their own, linked
     # through consumer OAuth, plus one for every cellular order, because Withings creates an
@@ -117,9 +118,23 @@ def _store_provisioned_account(
     # shipping someone a blood-pressure monitor silently stopped their own scale and watch from
     # syncing. The unique index now keys on (user_id, provider, provider_user_id), so the two
     # coexist; provisioning the SAME Withings account twice still fails there, which is right.
-    connection = repo.create(
-        db,
-        UserConnectionCreate(
+    #
+    # ONE TRANSACTION, and NOT through ``UserConnectionRepository.create``, which is the whole
+    # point of building the row by hand here. ``CrudRepository.create`` COMMITS
+    # (``repositories.py:28``), so the connection became durable BEFORE the SDK-account row was
+    # written — and a UNIQUE violation on ``withings_sdk_account.external_id`` then rolled back
+    # only the uncommitted half. What survived was a committed connection holding live Withings
+    # tokens with no SDK row and therefore no ``csrf_token``: exactly the "half-succeeded
+    # provisioning" this module's docstring calls the bad case, reached by an ordinary retry
+    # rather than by anything exotic (Lucas, #12).
+    #
+    # Adding both rows and committing once makes that state unreachable: either the member has a
+    # connection WITH its csrf_token, or they have neither and the caller gets a clean error.
+    # What this does NOT fix is the Withings side — the account and any order it placed are
+    # already real by the time we get here, and no database transaction can undo them. That is
+    # what ``store_error`` is for, and why the caller answers 409 rather than retrying.
+    connection = UserConnection(
+        **UserConnectionCreate(
             user_id=user_id,
             provider=provider,
             provider_user_id=tokens.userid,
@@ -128,21 +143,27 @@ def _store_provisioned_account(
             refresh_token=tokens.refresh_token,
             token_expires_at=datetime.now(timezone.utc) + timedelta(seconds=tokens.expires_in),
             scope=tokens.scope,
-        ),
+        ).model_dump()
     )
-    if connection is None:
-        # The repository types create() as Optional. base_oauth silences that with a
-        # checker-suppression comment; here it is handled instead, because a provisioning
-        # that reached this point has already created a real Withings account —
-        # continuing without a connection row would strand it, reachable by nothing.
-        raise store_error(detail="the Withings account was created but its connection could not be stored")
-    account = _upsert_sdk_account(
-        db,
-        connection_id=connection.id,
-        external_id=external_id,
-        csrf_token=tokens.csrf_token,
-    )
-    db.commit()
+    db.add(connection)
+    try:
+        # flush, not commit: the id has to exist for the SDK row's FK, but nothing is durable
+        # until both rows are in.
+        db.flush()
+        account = _upsert_sdk_account(
+            db,
+            connection_id=connection.id,
+            external_id=external_id,
+            csrf_token=tokens.csrf_token,
+        )
+        db.commit()
+    except IntegrityError as e:
+        # Either unique index can fire: (user_id, provider, provider_user_id) if Withings handed
+        # back an account this member already holds, or external_id if this exact provisioning
+        # already ran. Both mean "a real Withings account exists for this request" — and on the
+        # cellular path, an order with it.
+        db.rollback()
+        raise store_error(detail="the Withings account was created but could not be stored: it already exists") from e
 
     # AFTER the commit, deliberately. It fired before the upsert and the commit, so a failure in
     # either announced a connection that never persisted — and robin-backend would then hold a
