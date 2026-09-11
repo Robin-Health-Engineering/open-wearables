@@ -27,7 +27,6 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -519,14 +518,24 @@ class TestCellularOrderRoute:
         self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
     ) -> None:
         # The pre-flight is a TOCTOU narrowing, not a fix: two simultaneous retries can both pass
-        # it and both reach Withings. The loser must still get an answer that means "already
-        # placed, do not retry" rather than a 500 the caller cannot interpret.
-        error = IntegrityError("INSERT", {}, Exception("duplicate key value violates unique constraint"))
+        # it and both reach Withings. The loser must still get an answer meaning "already placed,
+        # do not retry" rather than one a generic retry policy would act on.
+        #
+        # Raises what the SERVICE actually raises. This test used to inject a bare IntegrityError,
+        # which cannot happen: every write in `_store_provisioned_account` is inside a try that
+        # converts it to `store_error`. So it passed against a route branch nothing could reach
+        # while the real race answered 502 — found by Lucas measuring the live path on #12, not by
+        # this test, which is the definition of a false pin.
+        error = WithingsDropshipmentError(
+            detail="the Withings account was created but could not be stored: it already exists",
+            already_exists=True,
+        )
 
         with patch(_PROVISION_CELLULAR, side_effect=error):
             response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
 
         assert response.status_code == 409
+        assert "already exists" in response.json()["detail"]
 
     def test_a_dropshipment_error_with_no_status_does_not_render_status_none(
         self, client: TestClient, api_key_header: dict[str, str], withings_configured: None

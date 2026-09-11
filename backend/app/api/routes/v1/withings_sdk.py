@@ -26,7 +26,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import DbSession
@@ -279,7 +278,7 @@ def create_withings_cellular_order(
 
     # PRE-FLIGHT, before any Withings call — see the docstring. Cheap, and it is the difference
     # between a retry costing a 409 and a retry costing a second parcel. Reached only on the
-    # sequential retry; the concurrent one falls through to the IntegrityError handler below,
+    # sequential retry; the concurrent one falls through to the `already_exists` branch below,
     # which says the same thing after the fact.
     if (
         db.query(WithingsSdkAccount).filter(WithingsSdkAccount.external_id == payload.external_id).one_or_none()
@@ -334,24 +333,20 @@ def create_withings_cellular_order(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Withings placed the order but the code exchange failed (status={e.withings_status})",
         ) from e
-    except IntegrityError as e:
-        # Two concurrent provisionings for the same external_id: both passed the pre-flight, both
-        # reached Withings, and this one lost the UNIQUE race. `_store_provisioned_account` now
-        # writes the connection and the SDK row in ONE transaction, so nothing is left half-written
-        # — but a real account and a real order exist upstream either way. Same meaning as the
-        # pre-flight 409, reached the other way round.
-        logger.error(
-            "Withings cellular order: external_id already stored — a concurrent provisioning won",
-            extra={"external_id": payload.external_id},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account already exists for this external_id; the order was already placed",
-        ) from e
     except WithingsDropshipmentError as e:
         if e.already_exists:
-            # The store lost the UNIQUE race — same meaning as the pre-flight 409 and as the
-            # IntegrityError branch above, reached from inside the service instead.
+            # The store lost the UNIQUE race: two retries both passed the pre-flight, both reached
+            # Withings, and this one hit the constraint. Same meaning as the pre-flight 409,
+            # reached after the fact instead of before it.
+            #
+            # There is deliberately no `except IntegrityError` beside this. There was one until
+            # Lucas measured the real path on #12 and found it could not fire: every write in
+            # `_store_provisioned_account` is inside a try that converts IntegrityError to
+            # `store_error`, so nothing IntegrityError-shaped ever reaches this route. A handler
+            # for an exception that cannot arrive reads as protection and provides none — and the
+            # test I had written for it forced the exception in artificially, so it passed while
+            # the real concurrent race was answering 502, the one status a generic retry policy
+            # WOULD have retried.
             logger.error(
                 "Withings cellular order: the account already exists — a concurrent provisioning won",
                 extra={"external_id": payload.external_id},
