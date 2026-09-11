@@ -67,7 +67,6 @@ def upgrade() -> None:
         "user_connection",
         ["user_id", "provider", "provider_user_id"],
         unique=True,
-        postgresql_nulls_not_distinct=True,
     )
 
     op.add_column("withings_device", sa.Column("battery", sa.String(length=32), nullable=True))

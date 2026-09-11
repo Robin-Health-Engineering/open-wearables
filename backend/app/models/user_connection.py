@@ -42,7 +42,6 @@ class UserConnection(BaseDbModel):
             "provider",
             "provider_user_id",
             unique=True,
-            postgresql_nulls_not_distinct=True,
         ),
         Index("ix_user_connection_status_user_id", "status", "user_id"),
         Index(
