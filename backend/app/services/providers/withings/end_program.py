@@ -46,6 +46,7 @@ import httpx
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
 from app.services.providers.withings.oauth import redact_body
 from app.services.providers.withings.request_budget import acquire_request_slot
+from app.services.providers.withings.sdk_users import STATUS_OK
 from app.services.providers.withings.signature import sign_payload
 from app.utils.structured_logging import log_structured
 
@@ -54,9 +55,6 @@ logger = logging.getLogger(__name__)
 _DEVICE_PATH = "/v2/device"
 _ACTION = "endpartnerprogram"
 _TIMEOUT_SECONDS = 30.0
-
-# Withings encodes success as status 0 inside an HTTP 200 body; raise_for_status never sees it.
-_STATUS_OK = 0
 
 # The programme state we are asking for. STANDBY is the documented reversal, available for a few
 # minutes before the device begins updating; deliberately not wired — an undo path for a window
@@ -129,7 +127,7 @@ def _end_one(
         return EndProgramResult(mac_address=mac_address, ok=False, detail=type(e).__name__)
 
     status = envelope.get("status")
-    if status != _STATUS_OK:
+    if status != STATUS_OK:
         # No body echo: it is the response to a signed request and may repeat our parameters.
         log_structured(
             logger,

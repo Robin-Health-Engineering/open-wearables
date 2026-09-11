@@ -40,11 +40,17 @@ _TIMEOUT_SECONDS = 30.0
 # Withings' own constraint, quoted from the docs: /^[a-zA-Z0-9]{3}$/. Enforced here rather
 # than left to the API because the failure comes back as an opaque non-zero status, and this
 # value is rendered on the device screen — a wrong one is visible on the hardware.
-_SHORTNAME_RE = re.compile(r"^[a-zA-Z0-9]{3}$")
+#
+# No leading underscore: ``dropshipment`` depends on this and on ``measures_payload`` below,
+# because the shortname rule and the measures encoding are WITHINGS' and duplicating them is how
+# the two provisioning paths would drift. Two modules deep, they are the provider package's
+# internal API rather than this module's privates, and the name should say so.
+SHORTNAME_RE = re.compile(r"^[a-zA-Z0-9]{3}$")
 
 # Withings encodes success as status 0 inside an HTTP 200 body. Every other value is a
-# failure that `raise_for_status` will never catch.
-_STATUS_OK = 0
+# failure that `raise_for_status` will never catch. Shared with ``dropshipment`` — one constant
+# and one explanation, rather than two copies that can drift.
+STATUS_OK = 0
 
 
 class WithingsSdkUserError(RuntimeError):
@@ -80,7 +86,7 @@ class SdkUser:
     external_id: str
 
 
-def _measures_payload(weight_kg: float, height_m: float) -> str:
+def measures_payload(weight_kg: float, height_m: float) -> str:
     """Withings takes measures as JSON, with a value/unit pair per measure.
 
     ``unit`` is a power of ten: value * 10^unit is the real quantity. At the milli precision
@@ -125,8 +131,8 @@ def create_sdk_user(
     ``signature.py`` covers it too. The response carries ``csrf_token`` alongside the token
     pair, which is why ``withings_sdk_account`` exists to hold it.
     """
-    if not _SHORTNAME_RE.match(shortname):
-        raise ValueError(f"shortname must match {_SHORTNAME_RE.pattern} (Withings renders it on the device screen)")
+    if not SHORTNAME_RE.match(shortname):
+        raise ValueError(f"shortname must match {SHORTNAME_RE.pattern} (Withings renders it on the device screen)")
     if gender not in (0, 1):
         raise ValueError("gender must be 0 (male) or 1 (female) per the Withings API")
     if mailingpref not in (0, 1):
@@ -139,7 +145,7 @@ def create_sdk_user(
         "external_id": external_id,
         "gender": str(gender),
         "mailingpref": str(mailingpref),
-        "measures": _measures_payload(weight_kg, height_m),
+        "measures": measures_payload(weight_kg, height_m),
         "preflang": preflang,
         "shortname": shortname,
         "timezone": timezone,
@@ -189,7 +195,7 @@ def create_sdk_user(
         raise WithingsSdkUserError(detail="Withings createuser request failed") from e
 
     status = envelope.get("status")
-    if status != _STATUS_OK:
+    if status != STATUS_OK:
         # No body echo: it is the response to a signed request and may repeat our parameters.
         log_structured(
             logger,
@@ -294,7 +300,7 @@ def exchange_sdk_code(
         raise WithingsSdkUserError(detail="Withings SDK token exchange failed") from e
 
     status = envelope.get("status")
-    if status != _STATUS_OK:
+    if status != STATUS_OK:
         # HTTP 200 with a non-zero status is how Withings reports failure here too.
         log_structured(
             logger,
