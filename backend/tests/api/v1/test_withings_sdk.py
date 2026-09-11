@@ -19,6 +19,7 @@ was broken.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
@@ -31,14 +32,23 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.user import User
 from app.models.withings_sdk_account import WithingsSdkAccount
+from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
+from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.sdk_provisioning import CellularProvisioning
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 from tests.factories import UserConnectionFactory, UserFactory
 
 _TOKEN = "app.api.routes.v1.withings_sdk._get_valid_token"
 _PROVISION = "app.api.routes.v1.withings_sdk.provision_sdk_account"
+_PROVISION_CELLULAR = "app.api.routes.v1.withings_sdk.provision_cellular_order"
 
 _ACCOUNTS_URL = "/api/v1/providers/withings/sdk/accounts"
 _SESSION_URL = "/api/v1/providers/withings/sdk/session"
+_CELLULAR_URL = "/api/v1/providers/withings/cellular/orders"
+
+# ``{customerProfileId}#{orderRef}`` — the shape robin-backend sends, and the reason the column
+# is 128 rather than 64. One account per order, so the suffix is what keeps them apart.
+_EXTERNAL_ID = "11111111-2222-3333-4444-555555555555#01K5ZQ8MZ0XJ7R2T4V6W8Y"
 
 
 @pytest.fixture
@@ -64,6 +74,42 @@ def _valid_payload(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def _valid_cellular_payload(**overrides: Any) -> dict[str, Any]:
+    """The SDK profile plus the two fields ``createuserorder`` adds: ``unit_pref`` and ``orders``."""
+    payload = _valid_payload(external_id=_EXTERNAL_ID)
+    payload.update(
+        {
+            "unit_pref": {"weight": 1, "height": 6},
+            "orders": [
+                {
+                    "customer_ref_id": "01K5ZQ8MZ0XJ7R2T4V6W8Y",
+                    "address": {
+                        "name": "Francesco Rossi",
+                        "email": "member@example.com",
+                        "address1": "Via Roma 1",
+                        "city": "Milano",
+                        "zip": "20121",
+                        "country": "IT",
+                    },
+                    "products": [{"quantity": 1, "ean": "3700546705526"}],
+                }
+            ],
+        }
+    )
+    payload.update(overrides)
+    return payload
+
+
+def _provisioning() -> CellularProvisioning:
+    """A successful provisioning, for the tests that only care about what was sent."""
+    return CellularProvisioning(
+        account=WithingsSdkAccount(
+            id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+        ),
+        orders=[DropshipOrderResult(orderid="WO-1", status="PENDING")],
+    )
 
 
 def _connected_member(db: Session, *, csrf_token: str | None, with_account: bool = True) -> User:
@@ -216,6 +262,23 @@ class TestProvisioningRoute:
 
         assert response.status_code == 502
 
+    def test_400_when_the_account_already_exists(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # A duplicate account is the CALLER's state, not a server fault, and this route has always
+        # answered 400 for it. It used to do so by accident — an HTTPException raised by the
+        # repository's @handle_exceptions and allowed to escape into the service layer — and the
+        # store no longer goes through the repository (open-wearables#12). The shape was right, so
+        # it is now the route's own decision, driven by `already_exists`, and pinned here.
+        error = WithingsSdkUserError(
+            detail="the Withings account was created but could not be stored", already_exists=True
+        )
+
+        with patch(_PROVISION, side_effect=error):
+            response = client.post(_ACCOUNTS_URL, json=_valid_payload(), headers=api_key_header)
+
+        assert response.status_code == 400
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [
@@ -249,3 +312,266 @@ class TestProvisioningRoute:
         assert response.status_code == 400
         # A rejected request must not reach Withings.
         provision.assert_not_called()
+
+
+class TestCellularOrderRoute:
+    """The HTTP surface ``provision_cellular_order`` did not have.
+
+    ``#8`` shipped the client and the service and no route, so the function was reachable from
+    Python and from nowhere else — which meant robin-backend, the only caller there will ever
+    be, could not place an order at all. These tests pin the route, not the provisioning
+    beneath it: that has its own suite in ``tests/providers/withings``.
+    """
+
+    def test_returns_the_account_and_the_orders_separately(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The two halves go to different systems — the account is ours, the orders are
+        # robin-backend's. A route returning only the account would strand a placed order with
+        # no id to track it by, after the parcel had already been committed to.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid="WO-1", status="PENDING")],
+        )
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["external_id"] == _EXTERNAL_ID
+        assert body["csrf_token"] == "csrf-new"
+        # Field-wise rather than dict-equal: DropshipOrderResult carries a nullable echoed
+        # ``address`` and is ``extra="allow"``, because Withings adds keys to it. An exact-shape
+        # assertion here would fail the day they do, on a response that was perfectly fine.
+        assert [(o["orderid"], o["status"]) for o in body["orders"]] == [("WO-1", "PENDING")]
+        assert provision.call_args.kwargs["testmode"] is False
+
+    def test_forwards_testmode_when_asked(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The only way to exercise the whole path without shipping hardware, and therefore the
+        # first thing that will be run once the dropshipment entitlement lands. A route that
+        # accepted the flag and dropped it would look like it worked and ship a real device.
+        with patch(_PROVISION_CELLULAR, return_value=_provisioning()) as provision:
+            client.post(_CELLULAR_URL, json=_valid_cellular_payload(testmode=True), headers=api_key_header)
+
+        assert provision.call_args.kwargs["testmode"] is True
+
+    def test_passes_the_order_block_through_as_models(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # ``create_user_order`` signs a payload built from these objects. Handing the service a
+        # list of dicts instead would fail inside the signature step, after the request shape
+        # had already been accepted.
+        with patch(_PROVISION_CELLULAR, return_value=_provisioning()) as provision:
+            client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        orders = provision.call_args.kwargs["orders"]
+        assert [type(o) for o in orders] == [DropshipOrder]
+        assert orders[0].customer_ref_id == "01K5ZQ8MZ0XJ7R2T4V6W8Y"
+        assert orders[0].address.country == "IT"
+
+    def test_requires_authentication(self, client: TestClient) -> None:
+        response = client.post(_CELLULAR_URL, json=_valid_cellular_payload())
+
+        assert response.status_code == 401
+
+    def test_503_when_the_deployment_has_no_withings_credentials(
+        self, client: TestClient, api_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "withings_client_id", None)
+
+        response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 503
+
+    def test_400_when_provisioning_rejects_the_input_locally(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with patch(_PROVISION_CELLULAR, side_effect=ValueError("unit_pref must not be empty")):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 400
+
+    def test_502_without_echoing_the_upstream_detail(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Worse here than on the SDK route: this request also carried the member's HOME ADDRESS,
+        # and the upstream body answers a signed payload that contains it.
+        error = WithingsDropshipmentError(withings_status=277, detail="createuserorder refused for Via Roma 1, Milano")
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "Via Roma" not in response.text
+        assert "status=277" in response.json()["detail"]
+
+    def test_400_when_an_order_carries_no_products(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # An empty order is accepted by nothing downstream, and Withings answers it with an
+        # opaque status AFTER creating the account — leaving a member with a Withings account
+        # and no device on the way.
+        payload = _valid_cellular_payload()
+        payload["orders"][0]["products"] = []
+
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=payload, headers=api_key_header)
+
+        assert response.status_code == 400
+        provision.assert_not_called()
+
+    def test_400_when_no_order_is_attached_at_all(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # ``createuserorder`` with an empty ``order`` list creates the account and ships
+        # nothing, which is the one success this integration must never report.
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(orders=[]), headers=api_key_header)
+
+        assert response.status_code == 400
+        provision.assert_not_called()
+
+    def test_502_when_withings_returned_no_csrf_token(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Same invariant as the SDK route: the column is nullable and a null is unusable by the
+        # caller, so it is asserted here rather than discovered at WebView-open time.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token=None
+            ),
+            orders=[DropshipOrderResult(orderid="WO-1", status="PENDING")],
+        )
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+
+    def test_400_when_unit_pref_is_empty(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Lucas's finding on #12: the PR claimed three rejection cases were verified and only two
+        # were pinned. Worth pinning specifically because this one's failure mode is the only one
+        # in the payload whose consequence is a SUCCESS — dropshipment.py:111, "a successful order
+        # for a device that renders the wrong units on its own screen, and nothing downstream ever
+        # flags it". If a refactor drops the Field(...) for a plain dict annotation, min_length
+        # silently stops applying and nothing else here notices.
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(unit_pref={}), headers=api_key_header)
+
+        assert response.status_code == 400
+        provision.assert_not_called()
+
+    def test_502_when_the_code_exchange_fails_after_the_order_was_placed(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # `exchange_sdk_code` raises WithingsSdkUserError, and it runs AFTER createuserorder has
+        # placed the order. Before this handler existed the exception escaped both `except`
+        # clauses and the caller got a bare 500 with a device already shipping.
+        error = WithingsSdkUserError(withings_status=401, detail="signature invalid for Via Roma 1")
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "status=401" in response.json()["detail"]
+        # The 500 this replaced did not leak either — FastAPI answers a bare "Internal Server
+        # Error" — but the detail we now choose ourselves must not start leaking what that did not.
+        assert "Via Roma" not in response.text
+
+    def test_409_when_the_external_id_was_already_provisioned(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # THE RETRY CASE, and the reason the check runs before any Withings call. robin-backend
+        # retries fulfillWithingsDeviceOrder after a timeout with the SAME
+        # {customerProfileId}#{orderRef}; without this, that ordinary retry creates a second
+        # Withings account and places a SECOND ORDER — a real parcel — before anything here can
+        # object. `provision.assert_not_called()` is the whole point of the test.
+        connection = UserConnectionFactory(provider="withings", provider_user_id="withings-first")
+        db.add(
+            WithingsSdkAccount(
+                id=uuid4(),
+                user_connection_id=connection.id,
+                external_id=_EXTERNAL_ID,
+                csrf_token="csrf-first",
+                # NOT NULL, and with no server default — the model leaves it to the writer, and
+                # `_upsert_sdk_account` always sets it. A fixture that builds the row directly has
+                # to as well; `_connected_member` above does the same.
+                updated_at=connection.updated_at,
+            )
+        )
+        db.commit()
+
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 409
+        provision.assert_not_called()
+
+    def test_409_when_a_concurrent_provisioning_won_the_unique_race(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The pre-flight is a TOCTOU narrowing, not a fix: two simultaneous retries can both pass
+        # it and both reach Withings. The loser must still get an answer meaning "already placed,
+        # do not retry" rather than one a generic retry policy would act on.
+        #
+        # Raises what the SERVICE actually raises. This test used to inject a bare IntegrityError,
+        # which cannot happen: every write in `_store_provisioned_account` is inside a try that
+        # converts it to `store_error`. So it passed against a route branch nothing could reach
+        # while the real race answered 502 — found by Lucas measuring the live path on #12, not by
+        # this test, which is the definition of a false pin.
+        error = WithingsDropshipmentError(
+            detail="the Withings account was created but could not be stored: it already exists",
+            already_exists=True,
+        )
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 409
+        assert "already exists" in response.json()["detail"]
+
+    def test_a_dropshipment_error_with_no_status_does_not_render_status_none(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # `withings_status` is set only on the non-zero-envelope branch; the transport branch and
+        # the detail-only raises leave it None. "status=None" reads as though Withings answered
+        # without a status, which is the wrong diagnosis for a transport failure — and the first
+        # real exercise of this route is exactly when that distinction matters.
+        error = WithingsDropshipmentError(detail="the request to Withings could not be completed")
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "status=None" not in response.json()["detail"]
+        assert "could not be completed" in response.json()["detail"]
+
+    def test_the_placed_orders_are_logged_before_a_missing_csrf_token_discards_them(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+        withings_configured: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Raising throws `result.orders` away, and this fork stores nothing about an order by
+        # design — so the order ids exist in that value and nowhere else. Losing them leaves a
+        # shipment nothing can track and that end_program can never terminate.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token=None
+            ),
+            orders=[DropshipOrderResult(orderid="WO-STRANDED", status="PENDING")],
+        )
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning), caplog.at_level(logging.ERROR):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert any("WO-STRANDED" in str(record.orders) for record in caplog.records if hasattr(record, "orders"))
