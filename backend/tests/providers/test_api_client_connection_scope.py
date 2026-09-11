@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -42,9 +42,21 @@ class _Recorder:
         return _noop()
 
 
-def _connection(*, expired: bool, refresh_token: str | None = "refresh") -> MagicMock:
+def _connection(
+    *,
+    expired: bool,
+    refresh_token: str | None = "refresh",
+    user_id: UUID | None = None,
+    provider: str = "withings",
+) -> MagicMock:
     connection = MagicMock()
     connection.id = uuid4()
+    # Stamped rather than left to MagicMock. An unset attribute on a mock is a truthy Mock that
+    # compares unequal to everything, so a scoping assertion written against a bare MagicMock
+    # passes whether or not the code checks anything — the test would be green on the very code
+    # it exists to reject.
+    connection.user_id = user_id if user_id is not None else uuid4()
+    connection.provider = provider
     connection.access_token = "access"
     connection.refresh_token = refresh_token
     connection.token_expires_at = datetime.now(timezone.utc) + (
@@ -62,11 +74,11 @@ def _repo(*, by_id: MagicMock, primary: MagicMock) -> MagicMock:
 
 class TestWhichConnectionIsUsed:
     def test_a_named_connection_is_fetched_by_id_not_by_provider(self) -> None:
-        named = _connection(expired=False)
-        primary = _connection(expired=False)
+        user_id = uuid4()
+        named = _connection(expired=False, user_id=user_id)
+        primary = _connection(expired=False, user_id=user_id)
         primary.access_token = "primary-access"
         repo = _repo(by_id=named, primary=primary)
-        user_id = uuid4()
 
         token = _get_valid_token(MagicMock(), user_id, "withings", repo, MagicMock(), named.id)
 
@@ -85,6 +97,31 @@ class TestWhichConnectionIsUsed:
         repo.get_by_user_and_provider.assert_called_once()
         repo.get.assert_not_called()
 
+    def test_a_connection_belonging_to_another_member_is_unauthorized(self) -> None:
+        # THE authz pin. The id arrives from outside on the disconnect route, so resolving it by
+        # id alone hands the caller another member's access token — and one layer up, revokes
+        # that member's Withings authorization before any ownership check runs.
+        victim = _connection(expired=False)
+        victim.access_token = "victim-access"
+        repo = _repo(by_id=victim, primary=_connection(expired=False))
+
+        with pytest.raises(HTTPException) as exc:
+            _get_valid_token(MagicMock(), uuid4(), "withings", repo, MagicMock(), victim.id)
+
+        assert exc.value.status_code == 401
+
+    def test_a_connection_for_a_different_provider_is_unauthorized(self) -> None:
+        # Same hole, sideways: without the provider check a member's own Garmin token is sent to
+        # Withings' API.
+        user_id = uuid4()
+        garmin = _connection(expired=False, user_id=user_id, provider="garmin")
+        repo = _repo(by_id=garmin, primary=_connection(expired=False, user_id=user_id))
+
+        with pytest.raises(HTTPException) as exc:
+            _get_valid_token(MagicMock(), user_id, "withings", repo, MagicMock(), garmin.id)
+
+        assert exc.value.status_code == 401
+
     def test_an_unknown_connection_id_is_unauthorized_rather_than_the_primary(self) -> None:
         # Falling back here would silently authenticate as a DIFFERENT Withings account than
         # the caller named, which is the whole failure this parameter exists to prevent.
@@ -98,11 +135,11 @@ class TestWhichConnectionIsUsed:
 
 class TestRefreshingAnExpiredToken:
     def test_refreshes_the_named_connection_and_says_which(self) -> None:
-        named = _connection(expired=True)
-        repo = _repo(by_id=named, primary=_connection(expired=True))
+        user_id = uuid4()
+        named = _connection(expired=True, user_id=user_id)
+        repo = _repo(by_id=named, primary=_connection(expired=True, user_id=user_id))
         oauth = MagicMock()
         oauth.refresh_access_token.return_value = MagicMock(access_token="fresh")
-        user_id = uuid4()
 
         with patch(_REDIS, return_value=_Recorder()):
             token = _get_valid_token(MagicMock(), user_id, "withings", repo, oauth, named.id)
@@ -113,13 +150,14 @@ class TestRefreshingAnExpiredToken:
     def test_re_reads_the_same_connection_inside_the_lock(self) -> None:
         # The subtle half. The re-read inside the lock used to call get_by_user_and_provider,
         # so with two connections the lock guarded one row while the refresh wrote to another.
-        named = _connection(expired=True)
-        repo = _repo(by_id=named, primary=_connection(expired=True))
+        user_id = uuid4()
+        named = _connection(expired=True, user_id=user_id)
+        repo = _repo(by_id=named, primary=_connection(expired=True, user_id=user_id))
         oauth = MagicMock()
         oauth.refresh_access_token.return_value = MagicMock(access_token="fresh")
 
         with patch(_REDIS, return_value=_Recorder()):
-            _get_valid_token(MagicMock(), uuid4(), "withings", repo, oauth, named.id)
+            _get_valid_token(MagicMock(), user_id, "withings", repo, oauth, named.id)
 
         assert repo.get_by_user_and_provider.call_count == 0
         assert all(call.args[1] == named.id for call in repo.get.call_args_list)
@@ -127,12 +165,12 @@ class TestRefreshingAnExpiredToken:
     def test_the_lock_key_names_the_connection(self) -> None:
         # Two connections of one member must not serialise on one lock, and — the real defect —
         # a lock that does not name the connection cannot protect the row being written.
-        named = _connection(expired=True)
+        user_id = uuid4()
+        named = _connection(expired=True, user_id=user_id)
         repo = _repo(by_id=named, primary=named)
         oauth = MagicMock()
         oauth.refresh_access_token.return_value = MagicMock(access_token="fresh")
         recorder = _Recorder()
-        user_id = uuid4()
 
         with patch(_REDIS, return_value=recorder):
             _get_valid_token(MagicMock(), user_id, "withings", repo, oauth, named.id)
@@ -146,7 +184,7 @@ class TestRefreshingAnExpiredToken:
         oauth.refresh_access_token.return_value = MagicMock(access_token="fresh")
 
         for _ in range(2):
-            connection = _connection(expired=True)
+            connection = _connection(expired=True, user_id=user_id)
             repo = _repo(by_id=connection, primary=connection)
             with patch(_REDIS, return_value=recorder):
                 _get_valid_token(MagicMock(), user_id, "withings", repo, oauth, connection.id)

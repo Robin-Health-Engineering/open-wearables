@@ -20,6 +20,7 @@ that is left behind.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -42,6 +43,30 @@ def _member(db: Session) -> UUID:
     user = UserFactory()
     UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-1")
     return user.id
+
+
+def _getdevice_per_account(devices_by_connection: dict[UUID, str]) -> Any:
+    """Answer each Getdevice call with only the device THAT account holds.
+
+    Which is what Withings does — the response is scoped to the account the token belongs to.
+    Handing both devices to both accounts would hide the bug this exists to catch.
+    """
+
+    def _respond(**kwargs: Any) -> dict:
+        deviceid = devices_by_connection[kwargs["connection_id"]]
+        return {"devices": [_entry(deviceid=deviceid)]}
+
+    return _respond
+
+
+def _second_withings_connection(user: Any) -> UUID:
+    """A second Withings account for the same member, as a cellular order creates.
+
+    The factory takes the relationship and discards a bare ``user_id`` (it pops it), so the User
+    itself has to be passed rather than its id.
+    """
+    connection = UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-provisioned")
+    return connection.id
 
 
 def _entry(**overrides: object) -> dict:
@@ -243,3 +268,60 @@ class TestMarkDissociatedAndList:
         user_id = _member(db)
 
         assert mark_dissociated(db, user_id=user_id, device_id="never-seen") is None
+
+
+class TestSeveralConnections:
+    """A member with two Withings accounts has devices on both, and must see both."""
+
+    def test_list_devices_spans_every_connection(self, db: Session) -> None:
+        # The member the whole multi-account change exists for: linked their own account, then
+        # was shipped a device. Resolving the primary alone made the shipped device invisible.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-1")
+        user_id = user.id
+        second = _second_withings_connection(user)
+        _sync(db, user_id, _entry(deviceid="personal-scale"))
+        record_installed_device(db, user_id=user_id, device_id="shipped-bpm", connection_id=second)
+
+        listed = {d.device_id for d in list_devices(db, user_id=user_id)}
+
+        assert listed == {"personal-scale", "shipped-bpm"}
+
+    def test_the_sweep_runs_once_per_connection(self, db: Session) -> None:
+        # Getdevice is account-scoped, so a member with two accounts needs two calls. One call as
+        # the primary would never list a device on the account we provisioned.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-1")
+        user_id = user.id
+        _second_withings_connection(user)
+
+        with patch(_GETDEVICE, return_value={"devices": [_entry()]}) as getdevice:
+            sync_devices_from_withings(db, user_id=user_id, oauth=MagicMock())
+
+        assert getdevice.call_count == 2
+        assert {c.kwargs["connection_id"] for c in getdevice.call_args_list} != {None}
+
+    def test_one_connections_empty_response_does_not_dissociate_the_others_devices(self, db: Session) -> None:
+        # The reason the sweep stays PER connection. A device absent from account A's response
+        # says nothing about a device on account B — judging them together would dissociate
+        # every device on whichever account was not asked.
+        user = UserFactory()
+        primary = UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-1")
+        user_id = user.id
+        second = _second_withings_connection(user)
+        record_installed_device(db, user_id=user_id, device_id="shipped-bpm", connection_id=second)
+        # Both devices have to have been LISTED before they are sweep candidates, so give each
+        # account one response naming its own device.
+        with patch(_GETDEVICE, return_value={"devices": [_entry(deviceid="shipped-bpm")]}):
+            sync_devices_from_withings(db, user_id=user_id, oauth=MagicMock(), connection_id=second)
+        with patch(_GETDEVICE, return_value={"devices": [_entry(deviceid="personal-scale")]}):
+            sync_devices_from_withings(db, user_id=user_id, oauth=MagicMock(), connection_id=None)
+
+        # Now the whole-member sweep, where every account answers with only its OWN device.
+        # A shared "seen" set across accounts would dissociate whichever one answered first.
+        per_account = {primary.id: "personal-scale", second: "shipped-bpm"}
+        with patch(_GETDEVICE, side_effect=_getdevice_per_account(per_account)):
+            sync_devices_from_withings(db, user_id=user_id, oauth=MagicMock())
+
+        surviving = {d.device_id for d in list_devices(db, user_id=user_id)}
+        assert surviving == {"personal-scale", "shipped-bpm"}

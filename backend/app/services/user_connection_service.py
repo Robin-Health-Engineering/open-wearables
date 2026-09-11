@@ -115,18 +115,19 @@ class UserConnectionService(
         wide disconnect it has always been, which is still the right answer for "disconnect
         Withings" and the only possible one for the other twelve providers.
         """
+        # BEFORE anything acts on it. connection_id arrives from the caller, and this used to be
+        # checked after the deregistration call below had already used that connection's token to
+        # revoke someone's Withings authorization — the guard was right and ran too late.
+        target = self.resolve_owned_connection(db_session, user_id, provider, connection_id)
+
         if oauth:
             self._deregister_from_provider(db_session, user_id, provider, oauth, connection_id=connection_id)
 
-        if connection_id is not None:
-            target = self.crud.get(db_session, connection_id)
-            if target is None or target.user_id != user_id or target.provider != provider:
-                # Checked rather than trusted: connection_id arrives from the caller, and a row
-                # belonging to another member must not be revocable by naming its id.
-                raise ResourceNotFoundError("connection", connection_id)
-            updated = self.crud.disconnect_connection(db_session, target)
-        else:
-            updated = self.crud.disconnect(db_session, user_id, provider)
+        updated = (
+            self.crud.disconnect_connection(db_session, target)
+            if target is not None
+            else self.crud.disconnect(db_session, user_id, provider)
+        )
 
         if updated:
             connection = self._target_connection(db_session, user_id, provider, connection_id)
@@ -189,6 +190,27 @@ class UserConnectionService(
         connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
         if connection:
             self.crud.update_last_synced_at(db_session, connection)
+
+    def resolve_owned_connection(
+        self, db_session: DbSession, user_id: UUID, provider: str, connection_id: UUID | None
+    ) -> UserConnection | None:
+        """The named connection, once proven to belong to this member and provider.
+
+        ``None`` when no connection was named — the caller then means "all of them", which is the
+        wide disconnect and the only thing the other twelve providers ever want.
+
+        Raises rather than returning ``None`` on a mismatch, because the two cases are opposite
+        instructions: "everything" and "a row you may not touch" must not resolve to the same
+        value. Exposed rather than private so the ROUTE can call it before ``on_disconnect``,
+        which reaches the vendor with that connection's own token and would otherwise act on an
+        id nobody had checked.
+        """
+        if connection_id is None:
+            return None
+        target = self.crud.get(db_session, connection_id)
+        if target is None or target.user_id != user_id or target.provider != provider:
+            raise ResourceNotFoundError("connection", connection_id)
+        return target
 
     def _target_connection(
         self, db_session: DbSession, user_id: UUID, provider: str, connection_id: UUID | None

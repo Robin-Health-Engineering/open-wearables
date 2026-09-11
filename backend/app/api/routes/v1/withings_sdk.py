@@ -263,6 +263,12 @@ class SdkDeviceInstallRequest(BaseModel):
 
     Only ``user_id`` and ``device_id`` are required; the rest is reported as Withings reported
     it, and a notification that omits a field must not cost us the device record.
+
+    ``advertise_key`` is no longer a field here, and Pydantic's default ``extra="ignore"`` means
+    an older app build still sending one has it **silently dropped** rather than rejected. That
+    is deliberate — lenient is the right posture toward a client we have not shipped yet — but it
+    is worth stating, because "the model no longer accepts it" reads as though the value could
+    not be sent, and what actually happens is that it is accepted and discarded.
     """
 
     model_config = ConfigDict(protected_namespaces=())

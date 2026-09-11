@@ -15,6 +15,13 @@ pair) and the column is gone. The rule it motivated survives and still matters: 
 erases what it cannot replace.** Getdevice shapes its response by what each device reports, so
 an entry omitting ``battery`` means "this device did not say", not "there is no battery level".
 
+**Every entry point spans ALL of a member's Withings connections unless one is named.** A member
+can hold several — their own linked account, plus one per cellular device we shipped them — and
+each device row is keyed by the connection whose account it sits on. Resolving the primary only,
+as this module did, meant a shipped device was invisible to ``list_devices`` and never reached by
+the Getdevice sweep, which called as the personal account. The sweep still runs PER connection,
+because a device missing from one account's response says nothing about a device on another.
+
 Reference: https://developer.withings.com/api-reference/#tag/devices
 """
 
@@ -33,6 +40,7 @@ from app.schemas.enums import ProviderName
 from app.schemas.providers.withings.devices import WithingsDeviceEntry, WithingsGetdeviceBody
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL, withings_request
+from app.services.providers.withings.connections import active_withings_connections
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -53,12 +61,43 @@ class WithingsDeviceError(RuntimeError):
     """Raised when a device operation cannot be attributed to a Withings connection."""
 
 
-def _connection(db: DbSession, user_id: UUID) -> UserConnection:
-    """The member's one Withings connection, or an error naming why there is none."""
-    connection = UserConnectionRepository().get_by_user_and_provider(db, user_id, ProviderName.WITHINGS.value)
+def _connection(db: DbSession, user_id: UUID, connection_id: UUID | None = None) -> UserConnection:
+    """One Withings connection of this member's: the named one, else their primary.
+
+    A member can hold several — their own linked account, plus one per cellular device we ship
+    them — so "the member's Withings connection" is no longer a complete description, and the
+    callers that write a device row have to say which account it belongs to.
+
+    The named lookup is scoped to the member for the reason ``api_client._resolve_connection``
+    gives: an id fetched bare returns whatever row it names, and this one decides whose device
+    table is written.
+    """
+    repo = UserConnectionRepository()
+    if connection_id is not None:
+        connection = repo.get(db, connection_id)
+        if connection is None or connection.user_id != user_id or connection.provider != ProviderName.WITHINGS.value:
+            raise WithingsDeviceError("this member has no such Withings connection")
+        return connection
+    connection = repo.get_by_user_and_provider(db, user_id, ProviderName.WITHINGS.value)
     if connection is None:
         raise WithingsDeviceError("this member has no Withings connection")
     return connection
+
+
+def _connections(db: DbSession, user_id: UUID, connection_id: UUID | None = None) -> list[UserConnection]:
+    """Every active Withings connection of this member's, or just the one named.
+
+    The default is ALL of them, and that is the point. A member who linked their own account and
+    was then shipped a device has devices hanging off two accounts; reading or sweeping only the
+    primary leaves the shipped one invisible and never reconciled — which is precisely the member
+    this whole change exists for.
+    """
+    if connection_id is not None:
+        return [_connection(db, user_id, connection_id)]
+    connections = active_withings_connections(db, user_id)
+    if not connections:
+        raise WithingsDeviceError("this member has no Withings connection")
+    return connections
 
 
 def _from_unix(seconds: int | None) -> datetime | None:
@@ -134,6 +173,7 @@ def record_installed_device(
     device_id: str,
     model_id: int | None = None,
     model: str | None = None,
+    connection_id: UUID | None = None,
 ) -> WithingsDevice:
     """Store the device an install-success notification reported.
 
@@ -142,7 +182,7 @@ def record_installed_device(
     background BLE sync — and that was its real justification; with that integration abandoned
     this writer only gets a device row in slightly sooner than the next sweep would.
     """
-    connection = _connection(db, user_id)
+    connection = _connection(db, user_id, connection_id)
     device = _upsert(
         db,
         connection_id=connection.id,
@@ -171,8 +211,14 @@ def sync_devices_from_withings(
     user_id: UUID,
     oauth: BaseOAuthTemplate,
     api_base_url: str = WITHINGS_API_BASE_URL,
+    connection_id: UUID | None = None,
 ) -> list[WithingsDevice]:
     """Reconcile the member's devices against ``User v2 - Getdevice``.
+
+    Sweeps EVERY Withings account the member holds unless one is named. Sweeping only the
+    primary would call Getdevice as the personal account, so a cellular device on an account we
+    provisioned is never listed, never has its battery or last-session updated, and never
+    reconciles — invisible to the very member the multi-account work is for.
 
     The second source, and the only one that survives an app reinstall. Also what reconciles
     the list after the member has been inside Withings' settings WebView, where they can
@@ -182,11 +228,30 @@ def sync_devices_from_withings(
     model. A response that transiently omits a device would otherwise destroy that row's
     history: when it last synced, and which order it shipped on.
     """
-    connection = _connection(db, user_id)
+    swept: list[WithingsDevice] = []
+    for connection in _connections(db, user_id, connection_id):
+        swept.extend(_sync_one(db, user_id=user_id, connection=connection, oauth=oauth, api_base_url=api_base_url))
+    return swept
 
+
+def _sync_one(
+    db: DbSession,
+    *,
+    user_id: UUID,
+    connection: UserConnection,
+    oauth: BaseOAuthTemplate,
+    api_base_url: str = WITHINGS_API_BASE_URL,
+) -> list[WithingsDevice]:
+    """Reconcile ONE Withings account's devices.
+
+    Per connection, not per member, and the stale sweep is why: a device absent from account A's
+    Getdevice response says nothing about a device on account B, so judging them together would
+    dissociate every device on the account that was not asked.
+    """
     body = withings_request(
         db=db,
         user_id=user_id,
+        connection_id=connection.id,
         connection_repo=UserConnectionRepository(),
         oauth=oauth,
         service_path="/v2/user",
@@ -259,14 +324,16 @@ def mark_dissociated(db: DbSession, *, user_id: UUID, device_id: str) -> Withing
     Returns ``None`` when we hold no such device, which is not an error: the member may have
     dissociated one that was set up before we started recording them, or on another phone.
     """
-    connection = _connection(db, user_id)
+    # Across every one of the member's Withings accounts: the caller names a DEVICE, and which
+    # of their accounts it hangs off is our bookkeeping rather than something they can know.
+    connection_ids = [c.id for c in _connections(db, user_id)]
     device = (
         db.query(WithingsDevice)
         .filter(
-            WithingsDevice.user_connection_id == connection.id,
+            WithingsDevice.user_connection_id.in_(connection_ids),
             WithingsDevice.device_id == device_id,
         )
-        .one_or_none()
+        .first()
     )
     if device is None:
         return None
@@ -288,10 +355,20 @@ def mark_dissociated(db: DbSession, *, user_id: UUID, device_id: str) -> Withing
     return device
 
 
-def list_devices(db: DbSession, *, user_id: UUID, include_dissociated: bool = False) -> list[WithingsDevice]:
-    """The member's devices, newest first, dissociated ones excluded by default."""
-    connection = _connection(db, user_id)
-    query = db.query(WithingsDevice).filter(WithingsDevice.user_connection_id == connection.id)
+def list_devices(
+    db: DbSession,
+    *,
+    user_id: UUID,
+    include_dissociated: bool = False,
+    connection_id: UUID | None = None,
+) -> list[WithingsDevice]:
+    """The member's devices, newest first, dissociated ones excluded by default.
+
+    Spans every Withings account the member holds unless one is named. A member sees "my
+    devices", not "my devices on the account this happens to have been shipped against".
+    """
+    connection_ids = [c.id for c in _connections(db, user_id, connection_id)]
+    query = db.query(WithingsDevice).filter(WithingsDevice.user_connection_id.in_(connection_ids))
     if not include_dissociated:
         query = query.filter(WithingsDevice.dissociated_at.is_(None))
     return query.order_by(WithingsDevice.created_at.desc()).all()

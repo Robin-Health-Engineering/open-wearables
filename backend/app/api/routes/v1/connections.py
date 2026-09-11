@@ -83,6 +83,11 @@ def disconnect_provider_endpoint(
     been, which is what the other twelve providers will always want.
     """
     strategy = ProviderFactory().get_provider(provider.value)
+    # Ownership is settled BEFORE on_disconnect, which reaches the vendor using that connection's
+    # own token — it lists and revokes Withings notify subscriptions. Checking inside the
+    # disconnect below would be too late: by then the teardown has already run against whatever
+    # row the id named. Raises 404 for a connection that is not this member's.
+    user_connection_service.resolve_owned_connection(db, user_id, provider.value, connection_id)
     strategy.on_disconnect(db, user_id, connection_id=connection_id)
     user_connection_service.disconnect(db, user_id, provider.value, oauth=strategy.oauth, connection_id=connection_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

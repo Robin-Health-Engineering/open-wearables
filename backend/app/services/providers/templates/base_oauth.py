@@ -216,9 +216,17 @@ class BaseOAuthTemplate(ABC):
 
         One place rather than four, so "which connection did we mean" cannot answer differently
         in the refresh, the revoke and the callback.
+
+        Scoped to the caller for the reason ``api_client._resolve_connection`` gives at length:
+        a bare fetch by id returns whatever row that id names, and this one decides which row a
+        refreshed token pair is written onto. ``None`` on a mismatch, which every caller already
+        treats as "no connection".
         """
         if connection_id is not None:
-            return self.connection_repo.get(db, connection_id)
+            connection = self.connection_repo.get(db, connection_id)
+            if connection is None or connection.user_id != user_id or connection.provider != self.provider_name:
+                return None
+            return connection
         return self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
 
     def _revoke_connection(

@@ -37,9 +37,21 @@ def _resolve_connection(
     Withings currently needs to — a member can hold their own Withings account plus one per
     cellular device we ship them — and every other provider passes nothing and gets the
     repository's documented primary-connection rule, exactly as before.
+
+    **The named lookup is scoped to the caller, and that is not defensive padding.** The id
+    arrives from outside on the disconnect route, and a bare fetch by id returns whatever row it
+    names — so an unscoped version hands the caller ANOTHER MEMBER'S access token, and a
+    cross-provider id sends a member's Garmin token to Withings' API. The fallback below has
+    always been narrow (it filters on both columns); this makes the named path exactly as narrow.
+
+    A mismatch returns ``None`` rather than raising, which keeps the contract every caller
+    already has for "no such connection" — they answer it with a 401.
     """
     if connection_id is not None:
-        return connection_repo.get(db, connection_id)
+        connection = connection_repo.get(db, connection_id)
+        if connection is None or connection.user_id != user_id or connection.provider != provider_name:
+            return None
+        return connection
     return connection_repo.get_by_user_and_provider(db, user_id, provider_name)
 
 

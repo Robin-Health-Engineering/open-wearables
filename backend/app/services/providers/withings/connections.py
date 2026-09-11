@@ -40,7 +40,7 @@ def _provisioned_connection_ids(db: DbSession, connection_ids: list[UUID]) -> se
     return {row[0] for row in rows}
 
 
-def _active_withings_connections(db: DbSession, user_id: UUID) -> list[UserConnection]:
+def active_withings_connections(db: DbSession, user_id: UUID) -> list[UserConnection]:
     """Every active Withings connection for a member, oldest first.
 
     Oldest first for the same reason the repository orders that way: it is the fork's one notion
@@ -64,7 +64,7 @@ def member_linked_connection(db: DbSession, user_id: UUID) -> UserConnection | N
     At most one: consumer OAuth writes a single connection per Withings account, and a member
     signing in twice re-links the same one.
     """
-    connections = _active_withings_connections(db, user_id)
+    connections = active_withings_connections(db, user_id)
     provisioned = _provisioned_connection_ids(db, [c.id for c in connections])
     for connection in connections:
         if connection.id not in provisioned:
@@ -79,7 +79,7 @@ def device_connections(db: DbSession, user_id: UUID) -> list[UserConnection]:
     cannot be added to an account that already exists, so a member accumulates one of these per
     cellular order.
     """
-    connections = _active_withings_connections(db, user_id)
+    connections = active_withings_connections(db, user_id)
     provisioned = _provisioned_connection_ids(db, [c.id for c in connections])
     return [c for c in connections if c.id in provisioned]
 

@@ -21,6 +21,8 @@ from sqlalchemy.orm import Session
 from app.models import UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
+from app.services import user_connection_service
+from app.utils.exceptions import ResourceNotFoundError
 from tests.factories import UserFactory
 
 repo = UserConnectionRepository()
@@ -201,3 +203,49 @@ class TestConnectionScopedDisconnect:
 
         statuses = {c.status for c in db.query(UserConnection).filter(UserConnection.user_id == user.id).all()}
         assert statuses == {ConnectionStatus.REVOKED}
+
+
+class TestDisconnectOwnership:
+    """The disconnect route takes a connection_id from outside; it must prove ownership first."""
+
+    def test_another_members_connection_is_not_resolvable(self, db: Session) -> None:
+        # Naming someone else's connection id must not reach any side effect. Before the check
+        # was hoisted, on_disconnect and _deregister_from_provider had already run against it —
+        # listing and revoking the victim's Withings subscriptions with the victim's own token.
+        victim = UserFactory()
+        attacker = UserFactory()
+        victim_connection = _add(db, victim.id, "withings-victim")
+
+        with pytest.raises(ResourceNotFoundError):
+            user_connection_service.resolve_owned_connection(db, attacker.id, "withings", victim_connection.id)
+
+    def test_a_connection_for_another_provider_is_not_resolvable(self, db: Session) -> None:
+        user = UserFactory()
+        garmin = _add(db, user.id, "garmin-1", provider="garmin")
+
+        with pytest.raises(ResourceNotFoundError):
+            user_connection_service.resolve_owned_connection(db, user.id, "withings", garmin.id)
+
+    def test_an_unknown_id_is_not_resolvable(self, db: Session) -> None:
+        user = UserFactory()
+
+        with pytest.raises(ResourceNotFoundError):
+            user_connection_service.resolve_owned_connection(db, user.id, "withings", uuid4())
+
+    def test_the_members_own_connection_resolves(self, db: Session) -> None:
+        user = UserFactory()
+        own = _add(db, user.id, "withings-own")
+
+        resolved = user_connection_service.resolve_owned_connection(db, user.id, "withings", own.id)
+
+        assert resolved is not None
+        assert resolved.id == own.id
+
+    def test_no_connection_id_means_all_of_them_rather_than_a_rejection(self, db: Session) -> None:
+        # None is "the wide disconnect", which is what every caller that passes nothing means and
+        # the only thing the other twelve providers ever want. It must not collapse into the
+        # not-found case, which is the opposite instruction.
+        user = UserFactory()
+        _add(db, user.id, "withings-own")
+
+        assert user_connection_service.resolve_owned_connection(db, user.id, "withings", None) is None

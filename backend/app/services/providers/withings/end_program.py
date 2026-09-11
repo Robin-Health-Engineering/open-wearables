@@ -25,6 +25,14 @@ nothing to store.
 authenticated with nonce+HMAC in the application's own name, exactly like ``/v2/sdk``, so
 ``signature.sign_payload`` covers it unchanged and no new credential is introduced.
 
+**Not reachable yet, and here is what activates it.** Its only caller is
+``WithingsStrategy._end_cellular_program``, which returns early because ``_device_mac_addresses``
+has nothing to return: MACs live in robin-backend's ``WithingsDeviceOrder`` and arrive through the
+``owWithingsDisconnect`` proxy (robin-backend#166), which passes ``device_macs`` into the
+disconnect route. Until that ships, this module is fully tested and never executed — including
+the Sentry capture in ``_end_cellular_program``, so "a failure here is reported rather than
+logged" is a property of the code and not yet an observed one.
+
 Reference: Withings "End Program API" — developer-guide/v3/get-access/terminatecellular
 """
 
