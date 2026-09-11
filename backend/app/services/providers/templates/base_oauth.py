@@ -223,10 +223,7 @@ class BaseOAuthTemplate(ABC):
         treats as "no connection".
         """
         if connection_id is not None:
-            connection = self.connection_repo.get(db, connection_id)
-            if connection is None or connection.user_id != user_id or connection.provider != self.provider_name:
-                return None
-            return connection
+            return self.connection_repo.get(db, connection_id)
         return self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
 
     def _revoke_connection(
