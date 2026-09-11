@@ -325,7 +325,10 @@ class TestCellularOrderRoute:
         body = response.json()
         assert body["external_id"] == _EXTERNAL_ID
         assert body["csrf_token"] == "csrf-new"
-        assert body["orders"] == [{"orderid": "WO-1", "status": "PENDING"}]
+        # Field-wise rather than dict-equal: DropshipOrderResult carries a nullable echoed
+        # ``address`` and is ``extra="allow"``, because Withings adds keys to it. An exact-shape
+        # assertion here would fail the day they do, on a response that was perfectly fine.
+        assert [(o["orderid"], o["status"]) for o in body["orders"]] == [("WO-1", "PENDING")]
         assert provision.call_args.kwargs["testmode"] is False
 
     def test_forwards_testmode_when_asked(
