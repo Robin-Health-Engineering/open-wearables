@@ -79,7 +79,15 @@ class Withings247Data(Base247DataTemplate):
 
     # ---------------------- Body measures (getmeas) ----------------------
 
-    def _active_connection_id(self, db: DbSession, user_id: UUID) -> UUID | None:
+    def _active_connection_id(self, db: DbSession, user_id: UUID, connection_id: UUID | None = None) -> UUID | None:
+        """Which connection this sync is reading — the named one, else the member's primary.
+
+        A member can hold several Withings connections (their own account, plus one per cellular
+        device we ship them). The sync loop iterates all of them and names each in turn; without
+        that name every pass resolves to the primary and the others are never read at all.
+        """
+        if connection_id is not None:
+            return connection_id
         connection = self.connection_repo.get_active_connection(db, user_id, self.provider_name)
         return connection.id if connection is not None and isinstance(connection.id, UUID) else None
 
@@ -152,8 +160,15 @@ class Withings247Data(Base247DataTemplate):
             )
         return samples
 
-    def save_measures(self, db: DbSession, user_id: UUID, start: datetime, end: datetime) -> WriteCounts:
-        user_connection_id = self._active_connection_id(db, user_id)
+    def save_measures(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start: datetime,
+        end: datetime,
+        connection_id: UUID | None = None,
+    ) -> WriteCounts:
+        user_connection_id = self._active_connection_id(db, user_id, connection_id)
         page = paginate(
             db=db,
             user_id=user_id,
@@ -168,6 +183,7 @@ class Withings247Data(Base247DataTemplate):
                 "enddate": int(end.timestamp()),
             },
             list_key=MEASURES.list_key,
+            connection_id=user_connection_id,
         )
         samples = self.normalize_measures(
             page.rows,
@@ -283,8 +299,9 @@ class Withings247Data(Base247DataTemplate):
         user_id: UUID,
         start: datetime,
         end: datetime,
+        connection_id: UUID | None = None,
     ) -> WriteCounts:
-        user_connection_id = self._active_connection_id(db, user_id)
+        user_connection_id = self._active_connection_id(db, user_id, connection_id)
         start_ymd, end_ymd = self._ymd_window(start, end)
         rows = paginate(
             db=db,
@@ -299,6 +316,7 @@ class Withings247Data(Base247DataTemplate):
                 "data_fields": ",".join(ACTIVITY.data_fields),
             },
             list_key=ACTIVITY.list_key,
+            connection_id=user_connection_id,
         ).rows
         samples = self.normalize_activity(rows, user_id, user_connection_id)
         if not samples:
@@ -315,8 +333,9 @@ class Withings247Data(Base247DataTemplate):
         user_id: UUID,
         start: datetime,
         end: datetime,
+        connection_id: UUID | None = None,
     ) -> WriteCounts:
-        user_connection_id = self._active_connection_id(db, user_id)
+        user_connection_id = self._active_connection_id(db, user_id, connection_id)
         start_ymd, end_ymd = self._ymd_window(start, end)
         rows = paginate(
             db=db,
@@ -331,6 +350,7 @@ class Withings247Data(Base247DataTemplate):
                 "data_fields": ",".join(SLEEP_SUMMARY.data_fields),
             },
             list_key=SLEEP_SUMMARY.list_key,
+            connection_id=user_connection_id,
         ).rows
         processed = 0
         skipped = 0
@@ -447,9 +467,16 @@ class Withings247Data(Base247DataTemplate):
         start_time: datetime | str | None = None,
         end_time: datetime | str | None = None,
         is_first_sync: bool = False,
+        connection_id: UUID | None = None,
     ) -> dict[str, int]:
         """Sync-task entry point. Each domain runs independently so one failure
-        doesn't abort the others."""
+        doesn't abort the others.
+
+        ``connection_id`` is the connection this pass is syncing. The sync task iterates a
+        member's connections and names each one; omitted, every domain falls back to the
+        member's primary connection, which for a member with two Withings accounts means
+        reading the first one twice and the second never.
+        """
         if isinstance(start_time, str):
             start_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
         if isinstance(end_time, str):
@@ -467,7 +494,7 @@ class Withings247Data(Base247DataTemplate):
             ("sleep", self.save_sleep),
         ):
             try:
-                results[name] = fn(db, user_id, start_time, end_time)
+                results[name] = fn(db, user_id, start_time, end_time, connection_id)
             except Exception as e:
                 failures[name] = e
                 # Reset the session for the next domain; a failing rollback must

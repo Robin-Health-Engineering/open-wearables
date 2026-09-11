@@ -128,7 +128,14 @@ class WithingsOAuth(BaseOAuthTemplate):
         }
         return self._request_token(payload, task="exchange_token", max_wait_seconds=_EXCHANGE_MAX_WAIT_SECONDS)
 
-    def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
+    def refresh_access_token(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        refresh_token: str,
+        *,
+        connection_id: UUID | None = None,
+    ) -> OAuthTokenResponse:
         payload = {
             "action": "requesttoken",
             "grant_type": "refresh_token",
@@ -140,10 +147,13 @@ class WithingsOAuth(BaseOAuthTemplate):
             token_response = self._request_token(payload, task="refresh_access_token")
         except WithingsTokenError as exc:
             if exc.invalid_grant:
-                self._revoke_connection(db, user_id, reason="refresh_failed")
+                self._revoke_connection(db, user_id, reason="refresh_failed", connection_id=connection_id)
             raise
 
-        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        # THE connection this refresh belongs to, not the member's primary one. A member can hold
+        # their own Withings account and one per cellular device we ship them, and update_tokens
+        # below writes the new pair onto whichever row this resolves to.
+        connection = self._connection_for(db, user_id, connection_id)
         if connection:
             # Withings rotates the refresh token on refresh; keep the old one if omitted.
             self.connection_repo.update_tokens(

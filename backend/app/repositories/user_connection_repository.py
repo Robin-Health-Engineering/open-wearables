@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, func, select, tuple_, update
+from sqlalchemy import CursorResult, and_, case, func, select, tuple_, update
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
@@ -86,7 +86,33 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         user_id: UUID,
         provider: str,
     ) -> UserConnection | None:
-        """Get connection for specific user and provider."""
+        """The member's PRIMARY connection for a provider: active before revoked, then oldest.
+
+        **Twelve of the thirteen providers only ever have one row, and for them this is what it
+        has always been.** Withings can have several — a member may link their own account and
+        also be shipped cellular devices, each of which creates an account we provision — so this
+        needs a stated rule rather than an accident of query planning. Seventeen call sites
+        depend on the answer.
+
+        The rule: ACTIVE before revoked, then ``created_at`` ascending, then ``id``. It is
+        deliberately the same ordering ``_active_by_provider_external_id`` documents a few methods
+        down, so the repository carries ONE notion of "primary" rather than two.
+
+        Two properties are load-bearing:
+
+        * **Ordered, not filtered.** Revoked rows are ranked last but still returned, because
+          ``base_oauth._save_connection`` looks a connection up in order to REACTIVATE it. Filter
+          them out and that path stops finding the row it means to revive and creates a duplicate
+          instead.
+        * **``.first()``, not ``.one_or_none()``.** This used to end in ``one_or_none``, which
+          raises ``MultipleResultsFound`` the moment a member has two connections for a provider —
+          i.e. every Withings call site would have started throwing when the unique index was
+          relaxed.
+
+        Callers that must act on a SPECIFIC connection rather than the primary one should not use
+        this at all: pass a ``connection_id`` (the token and data paths take one) or ask
+        ``withings.connections`` which connections a member has.
+        """
         return (
             db_session.query(self.model)
             .filter(
@@ -95,7 +121,12 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     self.model.provider == provider,
                 ),
             )
-            .one_or_none()
+            .order_by(
+                case((self.model.status == ConnectionStatus.ACTIVE, 0), else_=1),
+                self.model.created_at.asc(),
+                self.model.id.asc(),
+            )
+            .first()
         )
 
     def get_active_connection(
@@ -104,7 +135,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         user_id: UUID,
         provider: str,
     ) -> UserConnection | None:
-        """Get active connection for specific user and provider."""
+        """The member's primary ACTIVE connection for a provider — see ``get_by_user_and_provider``.
+
+        Same rule minus the status term, which the filter has already settled: ordering by status
+        here would be a no-op implying a distinction this query cannot make.
+        """
         return (
             db_session.query(self.model)
             .filter(
@@ -112,6 +147,44 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     self.model.user_id == user_id,
                     self.model.provider == provider,
                     self.model.status == ConnectionStatus.ACTIVE,
+                ),
+            )
+            .order_by(self.model.created_at.asc(), self.model.id.asc())
+            .first()
+        )
+
+    def get_by_user_provider_and_account(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        provider_user_id: str | None,
+    ) -> UserConnection | None:
+        """The member's connection for ONE SPECIFIC provider account, whatever its status.
+
+        This is the OAuth callback's question — "have I seen this exact account for this member
+        before?" — and it is the natural key of ``ix_user_connection_user_provider``, so at most
+        one row can ever match.
+
+        Asking ``get_by_user_and_provider`` instead is a live hazard once a member can hold two
+        Withings accounts: that returns the member's PRIMARY connection, which may well be the
+        device account we provisioned, and the callback would then overwrite its tokens with the
+        personal account's. That is the same destructive collapse the provisioning overwrite is
+        being deleted for, arriving from the other direction.
+
+        A ``None`` ``provider_user_id`` falls back to the primary lookup. Providers that report no
+        account id can only ever have one row for a member — the unique index is NULLS NOT
+        DISTINCT — so the two questions coincide there, and today's behaviour is preserved.
+        """
+        if provider_user_id is None:
+            return self.get_by_user_and_provider(db_session, user_id, provider)
+        return (
+            db_session.query(self.model)
+            .filter(
+                and_(
+                    self.model.user_id == user_id,
+                    self.model.provider == provider,
+                    self.model.provider_user_id == provider_user_id,
                 ),
             )
             .one_or_none()
@@ -268,7 +341,12 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         )
 
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
-        """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
+        """Revoke EVERY connection a member has with a provider, in one UPDATE.
+
+        "Disconnect Withings" in its widest sense. For a member who holds several Withings
+        accounts — their own, plus one per cellular device we shipped — this revokes all of
+        them; use ``disconnect_connection`` to remove just one.
+        """
         result = cast(
             CursorResult[tuple[()]],
             db_session.execute(
@@ -277,6 +355,37 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     and_(
                         UserConnection.user_id == user_id,
                         UserConnection.provider == provider,
+                        UserConnection.status != ConnectionStatus.REVOKED,
+                    ),
+                )
+                .values(
+                    status=ConnectionStatus.REVOKED,
+                    access_token=None,
+                    refresh_token=None,
+                    token_expires_at=None,
+                    updated_at=datetime.now(timezone.utc),
+                ),
+            ),
+        )
+        db_session.commit()
+        return result.rowcount
+
+    def disconnect_connection(self, db_session: DbSession, connection: UserConnection) -> int:
+        """Revoke ONE connection and clear its tokens. Returns rows updated (0 or 1).
+
+        The sibling ``disconnect`` above revokes every connection a member has with a provider,
+        which is right for "disconnect Withings entirely" and wrong for "remove this device":
+        a member's own linked account and an account we created to ship them hardware are
+        separately revocable things, and collapsing them is the destructive move this whole
+        change exists to remove.
+        """
+        result = cast(
+            CursorResult[tuple[()]],
+            db_session.execute(
+                update(UserConnection)
+                .where(
+                    and_(
+                        UserConnection.id == connection.id,
                         UserConnection.status != ConnectionStatus.REVOKED,
                     ),
                 )

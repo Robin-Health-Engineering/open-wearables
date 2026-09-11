@@ -12,6 +12,7 @@ from fastapi import HTTPException, status
 
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.models import UserConnection
 from app.repositories import UserConnectionRepository
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.structured_logging import log_structured
@@ -23,18 +24,50 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
 
 
+def _resolve_connection(
+    db: DbSession,
+    connection_repo: UserConnectionRepository,
+    user_id: UUID,
+    provider_name: str,
+    connection_id: UUID | None,
+) -> UserConnection | None:
+    """The connection a request is acting for: the named one, else the member's primary.
+
+    ``connection_id`` is how a caller says WHICH of a member's connections it means. Only
+    Withings currently needs to — a member can hold their own Withings account plus one per
+    cellular device we ship them — and every other provider passes nothing and gets the
+    repository's documented primary-connection rule, exactly as before.
+
+    **The named lookup is scoped to the caller, and that is not defensive padding.** The id
+    arrives from outside on the disconnect route, and a bare fetch by id returns whatever row it
+    names — so an unscoped version hands the caller ANOTHER MEMBER'S access token, and a
+    cross-provider id sends a member's Garmin token to Withings' API. The fallback below has
+    always been narrow (it filters on both columns); this makes the named path exactly as narrow.
+
+    A mismatch returns ``None`` rather than raising, which keeps the contract every caller
+    already has for "no such connection" — they answer it with a 401.
+    """
+    if connection_id is not None:
+        connection = connection_repo.get(db, connection_id)
+        if connection is None or connection.user_id != user_id or connection.provider != provider_name:
+            return None
+        return connection
+    return connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+
+
 def _get_valid_token(
     db: DbSession,
     user_id: UUID,
     provider_name: str,
     connection_repo: UserConnectionRepository,
     oauth: BaseOAuthTemplate,
+    connection_id: UUID | None = None,
 ) -> str:
     """Get a valid access token, refreshing if necessary.
 
     Private function used internally by make_authenticated_request.
     """
-    connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+    connection = _resolve_connection(db, connection_repo, user_id, provider_name, connection_id)
     if not connection:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -55,14 +88,24 @@ def _get_valid_token(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Token expired and no refresh token available for {provider_name}",
             )
-        # Scope distributed lock per user/provider to avoid concurrent refresh race conditions.
+        # Scope the distributed lock per CONNECTION, not per user/provider, to avoid concurrent
+        # refresh races.
+        #
+        # It was per (provider, user), which was right while a member could only have one
+        # connection per provider. With several, that key is wrong in both directions: two
+        # connections of one member serialise on a lock neither of them contends for, and — the
+        # real defect — the re-fetch inside the lock resolves the member's PRIMARY connection
+        # rather than the one being refreshed, so the lock would guard one row while the refresh
+        # wrote to another. Keying on the connection makes the thing locked and the thing written
+        # the same thing.
+        refreshing_connection_id = connection.id
 
         redis_client = get_redis_client()
-        lock_key = f"token_refresh_lock:{provider_name}:{user_id}"
+        lock_key = f"token_refresh_lock:{provider_name}:{user_id}:{refreshing_connection_id}"
 
         with redis_client.lock(lock_key, timeout=60, blocking_timeout=10, sleep=0.2):
             # Fetch and refresh connection instance inside the lock
-            connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+            connection = connection_repo.get(db, refreshing_connection_id)
             if not connection:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -89,7 +132,9 @@ def _get_valid_token(
                     detail=f"Token expired and no refresh token available for {provider_name}",
                 )
 
-            token_response = oauth.refresh_access_token(db, user_id, connection.refresh_token)
+            token_response = oauth.refresh_access_token(
+                db, user_id, connection.refresh_token, connection_id=refreshing_connection_id
+            )
             return token_response.access_token
 
     return connection.access_token
@@ -111,6 +156,7 @@ def make_authenticated_request(
     expect_json: bool = True,
     http2: bool = False,
     acquire_slot: Callable[[], None] | None = None,
+    connection_id: UUID | None = None,
 ) -> Any:
     """Make authenticated request to provider API.
 
@@ -137,6 +183,10 @@ def make_authenticated_request(
         acquire_slot: Called before every HTTP attempt, including retries, so a
             provider's own rate-limit policy paces the retry loop instead of
             being outrun by it. Raise from it to reject the request.
+        connection_id: Act for THIS connection rather than the member's primary one.
+            Only needed where a member can hold several connections with one provider
+            (Withings: their own account, plus one per cellular device we ship them).
+            Omit it and behaviour is unchanged — the repository's primary rule answers.
 
     Returns:
         Any: API response JSON, or dict with status_code if expect_json=False
@@ -148,7 +198,7 @@ def make_authenticated_request(
         raise ValueError("form_data and json_data are mutually exclusive")
 
     # Get valid token (will auto-refresh if needed)
-    access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
+    access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth, connection_id)
 
     # Prepare headers
     request_headers = {

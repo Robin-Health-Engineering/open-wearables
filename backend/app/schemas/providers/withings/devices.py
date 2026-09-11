@@ -1,4 +1,4 @@
-"""Model the ``User v2 - Getdevice`` payload, one of the two sources of ``advertise_key``."""
+"""Model the ``User v2 - Getdevice`` payload — what Withings reports about a member's devices."""
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -25,11 +25,10 @@ class WithingsDeviceEntry(BaseModel):
     model: str | None = None
     type: str | None = None
 
-    # THE reason this schema exists. Withings documents two sources for it and requires both
-    # to be implemented; this is the second. Absent here is normal and not an error — the
-    # install-success notification may already have supplied it, and a Wi-Fi-only device that
-    # never fell back to BLE has no use for one.
-    advertise_key: str | None = None
+    # Withings' own word for the charge level: "high", "medium", "low". Absent is normal —
+    # not every device reports one, which is the example the class docstring gives for why
+    # every field but ``deviceid`` is optional.
+    battery: str | None = None
 
     # Unix seconds. What "last synced" on the device hub is built from.
     last_session_date: int | None = None

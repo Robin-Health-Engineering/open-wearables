@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import ForeignKey, Index, String
+from sqlalchemy import ForeignKey, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
@@ -9,27 +9,29 @@ from app.mappings import PrimaryKey, str_32, str_64
 
 
 class WithingsDevice(BaseDbModel):
-    """One physical Withings device set up by a member through the Mobile SDK.
+    """One Withings device on a member's account, as the member is shown it.
 
-    Exists for ``advertise_key``. Background BLE sync is what makes a scale or a monitor
-    useful between Wi-Fi sessions, and the SDK cannot start it without that per-device token
-    — so a device row missing one is a device that silently stops reporting.
+    This table was created for ``advertise_key`` — the per-device token the Withings Mobile SDK
+    needed to start background BLE sync. That integration is abandoned: cellular devices ship
+    already connected, so there is no pairing to bridge and no key to carry. Both columns are
+    gone, and what the table is FOR now is the answer to "which devices do I have, and are they
+    working": model, type, when each last synced, how its battery is doing.
 
-    Withings hands that token out two ways and states that **both must be implemented**: the
-    install-success notification the app receives from the SDK, and ``User v2 - Getdevice``.
-    Hence two writers (``sdk_devices``), one row, and ``advertise_key_source`` recording which
-    of them last supplied the value — because when a device stops syncing, "where did this key
-    come from" is the first question worth being able to answer.
+    It is deliberately NOT the record of what we shipped. Order state — the order id, its
+    shipment status and history, the delivery address, the device MAC — lives in robin-backend's
+    DynamoDB, because it is commerce rather than health data and this is a fork that has to keep
+    rebasing onto upstream. The two sides answer different questions and both are legitimate:
+    this table is authoritative for what Withings currently reports on the account, that one for
+    what we ordered. ``order_ref`` is the link between them.
 
     Its own table rather than columns on ``withings_sdk_account`` because the cardinality is
-    different: one SDK account, many devices. And not on ``user_connection`` for the reason
-    that table gives — it is upstream's, and this fork has to keep rebasing onto it cleanly.
+    different: one account, many devices. And not on ``user_connection`` for the reason that
+    table gives — it is upstream's.
     """
 
     __table_args__ = (
-        # A member cannot own the same physical device twice. This is the upsert key for both
-        # writers: without it, a notification and a Getdevice sync reporting the same device
-        # produce two rows, and nothing says which advertise_key is current.
+        # A member cannot own the same physical device twice on one account, and this is the
+        # upsert key for the Getdevice sweep.
         Index("ix_withings_device_connection_device", "user_connection_id", "device_id", unique=True),
     )
     __tablename__ = "withings_device"
@@ -38,6 +40,7 @@ class WithingsDevice(BaseDbModel):
 
     # NOT NULL and CASCADE, matching withings_sdk_account: a device belongs to a connection,
     # and a device row that outlived it could never be synced, read or dissociated again.
+    # Which connection also says which Withings account it is on — a member can have several.
     user_connection_id: Mapped[UUID] = mapped_column(
         ForeignKey("user_connection.id", ondelete="CASCADE"), nullable=False
     )
@@ -54,15 +57,16 @@ class WithingsDevice(BaseDbModel):
     # "Scale", "Blood Pressure Monitor", "Sleep Monitor" — Withings' own vocabulary.
     device_type: Mapped[str_32 | None] = mapped_column(nullable=True)
 
-    # The BLE token background sync needs. NULLABLE, and that is a real state rather than a
-    # gap in the schema: a Wi-Fi device that never fell back to BLE has no reason to have one,
-    # and a device known only from a Getdevice response may not carry one either. Absent means
-    # "no background sync for this device", which is a thing the app has to be able to say.
-    advertise_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Withings' own word for the charge level ("high", "medium", "low"). Getdevice has always
+    # returned it and we parsed it into nothing; on a screen listing a member's devices it is
+    # the field that answers why a scale stopped reporting. Nullable because not every device
+    # reports one, which is why every field of that response but ``deviceid`` is optional.
+    battery: Mapped[str_32 | None] = mapped_column(nullable=True)
 
-    # Which writer last supplied advertise_key: "notification" or "getdevice". Diagnostic, not
-    # a rule — neither source is authoritative over the other, and the later write wins.
-    advertise_key_source: Mapped[str_32 | None] = mapped_column(nullable=True)
+    # The robin-backend order this device shipped on, and the join to its DynamoDB row (status,
+    # address, MAC). NULLABLE and expected to be: a device the member already owned when they
+    # linked their own Withings account arrived through no order of ours.
+    order_ref: Mapped[str_64 | None] = mapped_column(nullable=True)
 
     # From Getdevice's ``last_session_date``. What "last synced" on the device hub is built
     # from, and the honest answer to "why has nothing arrived from my scale in a week".
@@ -75,18 +79,16 @@ class WithingsDevice(BaseDbModel):
     # yet, which is the whole reason the install notification is a separate source. Sweeping
     # on absence alone marks a scale the member paired seconds ago as dissociated.
     #
-    # It needs its own column rather than a reading of ``advertise_key_source``: a Getdevice
-    # entry that carries no ``advertise_key`` leaves that field saying "notification", so a
-    # sweep keyed on it would still sweep devices Getdevice knows perfectly well about.
+    # It needs a column of its own: "has Getdevice ever listed this device" is not derivable
+    # from any other field here, since every one of them can be filled in by the install
+    # notification alone.
     last_getdevice_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
-    # Set when the member dissociates the device in Withings' settings WebView, and when a
-    # Getdevice sync stops listing a device we hold.
+    # Set when a Getdevice sync stops listing a device we hold.
     #
-    # SOFT on purpose. Neither source is complete — a Getdevice response that transiently
-    # omits a device would, under a hard delete, destroy an advertise_key that only the
-    # install notification ever carried and that nothing can re-derive. A device that comes
-    # back simply has this cleared again.
+    # SOFT on purpose: a response that transiently omits a device would, under a hard delete,
+    # lose the row's history — when it last synced, which order it came from — none of which
+    # Getdevice can re-derive. A device that comes back simply has this cleared again.
     dissociated_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     updated_at: Mapped[datetime]

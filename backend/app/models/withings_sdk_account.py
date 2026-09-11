@@ -5,7 +5,7 @@ from sqlalchemy import ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
-from app.mappings import PrimaryKey, str_64
+from app.mappings import PrimaryKey
 
 
 class WithingsSdkAccount(BaseDbModel):
@@ -16,15 +16,21 @@ class WithingsSdkAccount(BaseDbModel):
     * ``user_connection`` is an upstream table and this fork has to keep rebasing onto
       upstream cleanly; widening it invites a conflict on every rebase.
     * None of this means anything to the other twelve providers.
-    * ``csrf_token`` is only the first field. Device ``advertise_key``s land here next —
-      Withings requires both sources of them (the install notification AND ``Getdevice``),
-      and background BLE sync does not work without one.
+    * ``external_id`` is the identifier WE minted for this account, and the join back to the
+      member; nothing in the other twelve providers has an equivalent.
 
-    Hangs off whichever ``user_connection`` the member has for Withings. There is only ever
-    one: that table's unique ``(user_id, provider)`` index means a personally-linked account
-    and an SDK-provisioned one cannot coexist for the same member, and provisioning
-    overwrites. ``external_id`` is the value WE minted and is what ties this row back to the
-    member, so it is unique.
+    Hangs off ONE ``user_connection``, and a member can have several — their own linked
+    Withings account, plus an account we created for each cellular order, because Withings
+    creates an account on every provisioning path and a device cannot join one that already
+    exists. So there is one of these rows per account we provisioned, not one per member.
+
+    ``external_id`` is the value WE minted and is the join back to the member, so it is unique
+    — which is exactly why it can no longer be the bare CustomerProfile id. That is one value
+    per member for life, and a member's second provisioned account would collide on it, failing
+    AFTER Withings had already created a real account and stranding it. robin-backend sends
+    ``{customerProfileId}#{orderRef}`` instead: still unique per account, and still answers
+    "which member owns this" by prefix rather than by equality. 128 characters because two
+    UUIDs and a separator do not fit in 64.
     """
 
     __table_args__ = (
@@ -44,7 +50,8 @@ class WithingsSdkAccount(BaseDbModel):
     )
 
     # Ours, not Withings'. The value we sent to createuser and the join back to the member.
-    external_id: Mapped[str_64] = mapped_column(unique=True)
+    # See the class docstring for why it is 128 and no longer the bare CustomerProfile id.
+    external_id: Mapped[str] = mapped_column(String(128), unique=True)
 
     # Reissued on every token refresh, so it is as short-lived as the access token and must
     # be rewritten alongside it.

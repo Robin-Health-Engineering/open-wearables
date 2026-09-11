@@ -238,12 +238,17 @@ class BaseProviderStrategy(ABC):
         """Returns True if provider uses cloud OAuth API."""
         return self.oauth is not None
 
-    def on_disconnect(self, db: DbSession, user_id: UUID) -> None:
+    def on_disconnect(self, db: DbSession, user_id: UUID, *, connection_id: UUID | None = None) -> None:
         """Provider-side teardown to run while the connection's tokens are still valid.
 
         Called before the connection is revoked, by disconnect, data purge and
         account deletion. Default is a no-op; override for providers that hold
         per-connection state at the vendor (e.g. Withings notify subscriptions).
+
+        ``connection_id`` names the single connection being removed, when one is. Only Withings
+        can have more than one connection per member, so every other provider may ignore it —
+        but a provider that tears down vendor-side state MUST honour it if it grows a second
+        connection, or removing one will tear down the others' state too.
         """
 
     @property

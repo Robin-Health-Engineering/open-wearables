@@ -393,3 +393,84 @@ def test_redact_body_redacts_before_truncating() -> None:
     # Truncating first could cut a secret in half and leave the prefix in the log.
     padded = "y" * 480 + ' {"client_secret":"abc123"}'
     assert "abc123" not in redact_body(padded)
+
+
+class TestRefreshWritesOnlyToAConnectionTheMemberOwns:
+    """``_connection_for`` decides which row a refreshed token pair lands on.
+
+    Its twin in ``api_client._resolve_connection`` leaks a token; this one OVERWRITES someone
+    else's, which is the worse of the two. It is the reachable half from the disconnect route,
+    where ``connection_id`` arrives from outside.
+    """
+
+    def _token_body(self) -> dict:
+        return {
+            "status": 0,
+            "body": {
+                "access_token": "attacker-access",
+                # token_type is REQUIRED by OAuthTokenResponse. Omitting it made all three of
+                # these fail in _request_token, before _connection_for was ever reached — green
+                # locally on lint and types, red in CI, and pinning nothing on the way.
+                "token_type": "Bearer",
+                "refresh_token": "attacker-refresh",
+                "expires_in": 10800,
+                "scope": "user.metrics",
+                "userid": "999",
+            },
+        }
+
+    def test_a_victims_connection_is_not_written_to(self, db: Session, withings_oauth: WithingsOAuth) -> None:
+        victim = UserFactory()
+        attacker = UserFactory()
+        victim_connection = UserConnectionFactory(
+            user=victim,
+            provider="withings",
+            provider_user_id="withings-victim",
+            access_token="victim-access",
+            refresh_token="victim-refresh",
+        )
+
+        response = MagicMock()
+        response.json.return_value = self._token_body()
+        response.raise_for_status.return_value = None
+        with patch("app.services.providers.withings.oauth.httpx.post", return_value=response):
+            withings_oauth.refresh_access_token(db, attacker.id, "attacker-refresh", connection_id=victim_connection.id)
+
+        db.refresh(victim_connection)
+        assert victim_connection.access_token == "victim-access", "a refresh wrote onto another member's row"
+        assert victim_connection.refresh_token == "victim-refresh"
+
+    def test_a_connection_for_another_provider_is_not_written_to(
+        self, db: Session, withings_oauth: WithingsOAuth
+    ) -> None:
+        # Same hole sideways: a Withings refresh must not land on the member's Garmin row.
+        user = UserFactory()
+        garmin = UserConnectionFactory(
+            user=user, provider="garmin", provider_user_id="garmin-1", access_token="garmin-access"
+        )
+
+        response = MagicMock()
+        response.json.return_value = self._token_body()
+        response.raise_for_status.return_value = None
+        with patch("app.services.providers.withings.oauth.httpx.post", return_value=response):
+            withings_oauth.refresh_access_token(db, user.id, "some-refresh", connection_id=garmin.id)
+
+        db.refresh(garmin)
+        assert garmin.access_token == "garmin-access", "a Withings refresh wrote onto a Garmin row"
+
+    def test_the_members_own_connection_is_written_to(self, db: Session, withings_oauth: WithingsOAuth) -> None:
+        # The control. Without it the two above pass on a _connection_for that returns None
+        # unconditionally, i.e. on a refresh that never writes at all.
+        user = UserFactory()
+        own = UserConnectionFactory(
+            user=user, provider="withings", provider_user_id="withings-own", access_token="old-access"
+        )
+
+        response = MagicMock()
+        response.json.return_value = self._token_body()
+        response.raise_for_status.return_value = None
+        with patch("app.services.providers.withings.oauth.httpx.post", return_value=response):
+            withings_oauth.refresh_access_token(db, user.id, "old-refresh", connection_id=own.id)
+
+        db.refresh(own)
+        assert own.access_token == "attacker-access", "the owner's own refresh did not land"

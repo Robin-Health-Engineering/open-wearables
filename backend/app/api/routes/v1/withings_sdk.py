@@ -226,10 +226,9 @@ def get_withings_sdk_session(
 class SdkDeviceResponse(BaseModel):
     """One of the member's devices, as the app needs it.
 
-    ``advertise_key`` is included on purpose. It is what the native SDK's background sync
-    service takes to talk to the device over BLE, so withholding it would leave the app able
-    to list devices and unable to sync them — and it is a device pairing token, not a
-    credential for the member's Withings account.
+    Display state only — what the device is, when it last synced, how its battery is doing.
+    Nothing here identifies the member or authenticates anything. What we SHIPPED them (order,
+    status, MAC) is robin-backend's to hold, not ours.
     """
 
     # ``model_id`` trips Pydantic's protected "model_" namespace. Safe to disable: nothing
@@ -242,7 +241,7 @@ class SdkDeviceResponse(BaseModel):
     model_id: int | None
     model: str | None
     device_type: str | None
-    advertise_key: str | None
+    battery: str | None
     last_session_at: datetime | None
     dissociated_at: datetime | None
 
@@ -253,18 +252,23 @@ class SdkDeviceResponse(BaseModel):
             model_id=device.model_id,
             model=device.model,
             device_type=device.device_type,
-            advertise_key=device.advertise_key,
+            battery=device.battery,
             last_session_at=device.last_session_at,
             dissociated_at=device.dissociated_at,
         )
 
 
 class SdkDeviceInstallRequest(BaseModel):
-    """What the SDK's install-success notification gave the app.
+    """What an install-success notification gave the app.
 
-    Only ``user_id`` and ``device_id`` are required. The rest is reported as Withings reported
-    it: a notification that carries no ``advertise_key`` is a real case (a Wi-Fi device that
-    never fell back to BLE), and refusing it would lose the device record along with it.
+    Only ``user_id`` and ``device_id`` are required; the rest is reported as Withings reported
+    it, and a notification that omits a field must not cost us the device record.
+
+    ``advertise_key`` is no longer a field here, and Pydantic's default ``extra="ignore"`` means
+    an older app build still sending one has it **silently dropped** rather than rejected. That
+    is deliberate — lenient is the right posture toward a client we have not shipped yet — but it
+    is worth stating, because "the model no longer accepts it" reads as though the value could
+    not be sent, and what actually happens is that it is accepted and discarded.
     """
 
     model_config = ConfigDict(protected_namespaces=())
@@ -273,7 +277,6 @@ class SdkDeviceInstallRequest(BaseModel):
     device_id: str = Field(max_length=64)
     model_id: int | None = None
     model: str | None = Field(default=None, max_length=64)
-    advertise_key: str | None = Field(default=None, max_length=255)
 
 
 @router.post(
@@ -289,9 +292,10 @@ def record_withings_device(
 ) -> SdkDeviceResponse:
     """Store the device the member just finished setting up.
 
-    The FIRST of the two sources Withings requires for ``advertise_key``, and frequently the
-    only one that will ever carry this device's: ``getdevice`` may not list a just-installed
-    device yet, and the notification is not repeated.
+    Pre-registers a device ahead of the Getdevice sweep, which may not list a just-installed one
+    yet. Its original justification was ``advertise_key``, the Mobile SDK's background-BLE token;
+    that integration is abandoned and the field is gone, so this endpoint now only buys earlier
+    visibility. It is a candidate for retirement along with the rest of the SDK surface.
 
     Idempotent on ``(member, device_id)`` — the app may retry, and a member may re-run setup
     on a device they already own.
@@ -303,7 +307,6 @@ def record_withings_device(
             device_id=payload.device_id,
             model_id=payload.model_id,
             model=payload.model,
-            advertise_key=payload.advertise_key,
         )
     except WithingsDeviceError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
@@ -346,12 +349,12 @@ def sync_withings_devices(
 ) -> list[SdkDeviceResponse]:
     """Fetch ``User v2 - Getdevice`` and reconcile it into our rows.
 
-    The SECOND source of ``advertise_key``, and the only one that survives an app reinstall —
-    which loses every notification the app ever received. Also the only way to learn about a
-    dissociation the member performed inside Withings' settings WebView.
+    The authoritative source, and the only one that survives an app reinstall — which loses
+    every notification the app ever received. Also the only way to learn that a member
+    dissociated a device on Withings' own side.
 
     A POST because it writes: it upserts every listed device and marks the ones Withings no
-    longer lists as dissociated. It never erases an ``advertise_key`` it cannot replace.
+    longer lists as dissociated. It never erases a field the response merely omits.
     """
     strategy = ProviderFactory().get_provider(ProviderName.WITHINGS.value)
     if not strategy.oauth:

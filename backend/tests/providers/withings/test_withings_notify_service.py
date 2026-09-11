@@ -363,7 +363,7 @@ def test_remove_user_revokes_everything_for_the_last_active_link() -> None:
     with patch.object(service, "sync_user", return_value=[]) as sync_user:
         service.remove_user(db, user_id)
 
-    sync_user.assert_called_once_with(db, user_id, LiveSyncMode.PULL)
+    sync_user.assert_called_once_with(db, user_id, LiveSyncMode.PULL, connection_id=None)
 
 
 def test_remove_user_keeps_subscriptions_a_sibling_profile_still_wants() -> None:
