@@ -408,6 +408,10 @@ class TestRefreshWritesOnlyToAConnectionTheMemberOwns:
             "status": 0,
             "body": {
                 "access_token": "attacker-access",
+                # token_type is REQUIRED by OAuthTokenResponse. Omitting it made all three of
+                # these fail in _request_token, before _connection_for was ever reached — green
+                # locally on lint and types, red in CI, and pinning nothing on the way.
+                "token_type": "Bearer",
                 "refresh_token": "attacker-refresh",
                 "expires_in": 10800,
                 "scope": "user.metrics",
