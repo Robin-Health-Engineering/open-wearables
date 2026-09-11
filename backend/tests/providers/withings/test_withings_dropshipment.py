@@ -175,6 +175,12 @@ class TestWhatItRefusesToSend:
         with pytest.raises(ValueError, match="exactly one"):
             DropshipProduct(quantity=1, ean="3700546705526", partner_ref="robin-bpm")
 
+    def test_rejects_an_empty_unit_pref(self) -> None:
+        # Not a formatting concern: this is what the scale displays to the member, and Withings
+        # answers a bad one with a SUCCESSFUL order rather than an error.
+        with pytest.raises(ValueError, match="unit_pref"):
+            _call(MagicMock(), unit_pref={})
+
     def test_rejects_a_call_with_no_order_at_all(self) -> None:
         # A createuserorder with no order would create an account nothing ships to — worse than
         # a rejection, because the account is real.
@@ -228,6 +234,59 @@ class TestTheResponse:
             _call(post)
 
         assert exc.value.withings_status == 277
+
+    def test_returns_our_external_id_not_the_one_withings_echoed(self) -> None:
+        # The column is ours ("Ours, not Withings'") and it is the join back to robin-backend's
+        # order row, under #7's {profileId}#{orderRef} UNIQUE discipline. createuser makes this
+        # same choice deliberately; this path storing the echo instead would put two writers with
+        # opposite policies on one unique column.
+        #
+        # The fixture must echo a DIFFERENT value, or the assertion cannot tell the policies
+        # apart — which is exactly how the original version of this test passed on the bug.
+        post = MagicMock(
+            return_value=_ok(
+                {
+                    "user": {"code": "auth-code", "external_id": "WITHINGS-NORMALISED-999"},
+                    "orders": [{"orderid": "WO-1", "status": "PENDING"}],
+                }
+            )
+        )
+
+        result = _call(post)
+
+        assert result.external_id == "profile-1#order-1"
+
+    def test_a_success_that_acknowledged_no_orders_raises(self) -> None:
+        # An account with nothing shipping to it — the state the request-side guard exists to
+        # prevent, reached from the response side. Also how a key-name miss degrades: we send the
+        # block under `order` and read it back under `orders`, and nobody has seen this response.
+        post = MagicMock(
+            return_value=_ok({"user": {"code": "auth-code", "external_id": "profile-1#order-1"}, "orders": []})
+        )
+
+        with pytest.raises(WithingsDropshipmentError, match="no orders"):
+            _call(post)
+
+    def test_an_order_arriving_under_the_singular_key_is_not_silently_dropped(self) -> None:
+        # The concrete shape of that miss: a REAL placed order, read as none.
+        post = MagicMock(
+            return_value=_ok(
+                {"user": {"code": "auth-code", "external_id": "profile-1#order-1"}, "order": [{"orderid": "WO-1"}]}
+            )
+        )
+
+        with pytest.raises(WithingsDropshipmentError, match="no orders"):
+            _call(post)
+
+    def test_an_unreadable_order_raises_this_modules_error_not_a_pydantic_one(self) -> None:
+        # Leniency absorbs unexpected KEYS; an unexpected TYPE still lands here, after the order
+        # is placed. The caller must be able to tell it from a transport failure.
+        post = MagicMock(
+            return_value=_ok({"user": {"code": "auth-code", "external_id": "profile-1#order-1"}, "orders": ["WO-1"]})
+        )
+
+        with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
+            _call(post)
 
     def test_a_success_with_no_code_raises_rather_than_returning_half_a_result(self) -> None:
         # status 0 and no code is a contract change, and a dangerous one: the account and the

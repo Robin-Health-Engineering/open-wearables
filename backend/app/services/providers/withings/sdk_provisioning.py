@@ -32,7 +32,7 @@ from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
 from app.services.outgoing_webhooks.events import on_connection_created
-from app.services.providers.withings.dropshipment import create_user_order
+from app.services.providers.withings.dropshipment import WithingsDropshipmentError, create_user_order
 from app.services.providers.withings.sdk_users import (
     SdkTokens,
     WithingsSdkUserError,
@@ -91,12 +91,20 @@ def _store_provisioned_account(
     user_id: UUID,
     external_id: str,
     tokens: SdkTokens,
+    store_error: type[WithingsSdkUserError] | type[WithingsDropshipmentError] = WithingsSdkUserError,
 ) -> WithingsSdkAccount:
     """Persist a provisioned Withings account: its connection, its SDK row, one commit.
 
     Shared by both provisioning paths — the SDK's ``createuser`` and cellular's
     ``createuserorder`` — because what they do with the result is identical once the tokens are
     in hand. Only how the account was created differs, and that is the caller's half.
+
+    ``store_error`` is which exception a failed store raises, and it is the caller's to choose
+    because the two paths leave DIFFERENT things stranded upstream. An SDK failure strands an
+    account; a cellular one strands an account AND a placed order, which is why
+    ``WithingsDropshipmentError`` exists as a distinct type. Raising the SDK error on the
+    cellular path would mean a caller catching the dropshipment error never sees the one failure
+    it most needs to hear about.
     """
     repo = UserConnectionRepository()
     provider = ProviderName.WITHINGS.value
@@ -127,14 +135,7 @@ def _store_provisioned_account(
         # checker-suppression comment; here it is handled instead, because a provisioning
         # that reached this point has already created a real Withings account —
         # continuing without a connection row would strand it, reachable by nothing.
-        raise WithingsSdkUserError(detail="the Withings account was created but its connection could not be stored")
-    on_connection_created(
-        user_id=user_id,
-        provider=provider,
-        connection_id=connection.id,
-        connected_at=connection.created_at.isoformat(),
-    )
-
+        raise store_error(detail="the Withings account was created but its connection could not be stored")
     account = _upsert_sdk_account(
         db,
         connection_id=connection.id,
@@ -142,6 +143,16 @@ def _store_provisioned_account(
         csrf_token=tokens.csrf_token,
     )
     db.commit()
+
+    # AFTER the commit, deliberately. It fired before the upsert and the commit, so a failure in
+    # either announced a connection that never persisted — and robin-backend would then hold a
+    # connection id that resolves to nothing, with a retry able to announce it twice.
+    on_connection_created(
+        user_id=user_id,
+        provider=provider,
+        connection_id=connection.id,
+        connected_at=connection.created_at.isoformat(),
+    )
 
     return account
 
@@ -299,6 +310,7 @@ def provision_cellular_order(
         user_id=user_id,
         external_id=user_order.external_id,
         tokens=tokens,
+        store_error=WithingsDropshipmentError,
     )
 
     log_structured(

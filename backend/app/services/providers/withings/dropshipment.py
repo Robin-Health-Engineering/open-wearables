@@ -35,14 +35,16 @@ import logging
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult, DropshipUserOrder
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
 from app.services.providers.withings.oauth import redact_body
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.sdk_users import (
-    _SHORTNAME_RE,
-    _measures_payload,
+    SHORTNAME_RE,
+    STATUS_OK,
+    measures_payload,
 )
 from app.services.providers.withings.signature import sign_payload
 from app.utils.structured_logging import log_structured
@@ -52,9 +54,6 @@ logger = logging.getLogger(__name__)
 _DROPSHIPMENT_PATH = "/v2/dropshipment"
 _ACTION = "createuserorder"
 _TIMEOUT_SECONDS = 30.0
-
-# Withings encodes success as status 0 inside an HTTP 200 body; raise_for_status never sees it.
-_STATUS_OK = 0
 
 
 class WithingsDropshipmentError(RuntimeError):
@@ -102,12 +101,17 @@ def create_user_order(
     ``unit_pref`` is required by this action where ``createuser`` defaulted it, and is what the
     device renders in — sending an empty object gives the member a scale in the wrong units.
     """
-    if not _SHORTNAME_RE.match(shortname):
-        raise ValueError(f"shortname must match {_SHORTNAME_RE.pattern} (Withings renders it on the device screen)")
+    if not SHORTNAME_RE.match(shortname):
+        raise ValueError(f"shortname must match {SHORTNAME_RE.pattern} (Withings renders it on the device screen)")
     if gender not in (0, 1):
         raise ValueError("gender must be 0 (male) or 1 (female) per the Withings API")
     if mailingpref not in (0, 1):
         raise ValueError("mailingpref must be 0 (refused) or 1 (accepted)")
+    if not unit_pref:
+        # The one required field whose bad value is not an opaque status but a SUCCESSFUL order
+        # for a device that renders the wrong units on its own screen — nothing downstream ever
+        # flags it. Every other consequential field here is front-loaded for a weaker reason.
+        raise ValueError("unit_pref is required for createuserorder; an empty object ships wrong units")
     if not orders:
         # A createuserorder with no order is a createuser with extra steps, and Withings would
         # either reject it or — worse — create an account nothing is shipping to.
@@ -120,7 +124,7 @@ def create_user_order(
         "external_id": external_id,
         "gender": str(gender),
         "mailingpref": str(mailingpref),
-        "measures": _measures_payload(weight_kg, height_m),
+        "measures": measures_payload(weight_kg, height_m),
         "order": json.dumps([order.model_dump(exclude_none=True) for order in orders]),
         "preflang": preflang,
         "shortname": shortname,
@@ -175,8 +179,13 @@ def create_user_order(
         )
         raise WithingsDropshipmentError(detail="Withings createuserorder request failed") from e
 
+    if not isinstance(envelope, dict):
+        # Same class as the unreadable-order case below: a shape the leniency policy does not
+        # cover, arriving after the order may already be placed.
+        raise WithingsDropshipmentError(detail="Withings createuserorder returned a non-object response")
+
     status = envelope.get("status")
-    if status != _STATUS_OK:
+    if status != STATUS_OK:
         # No body echo: the response to a signed request may repeat our parameters, and those
         # parameters include the member's email, birth date, weight and home address.
         log_structured(
@@ -197,7 +206,52 @@ def create_user_order(
         # dangerous one, because the account and the order may both exist upstream.
         raise WithingsDropshipmentError(detail="Withings createuserorder returned no code")
 
-    order_results = [DropshipOrderResult.model_validate(o) for o in (body.get("orders") or [])]
+    # Return OUR external_id, never the echo — the same choice ``create_sdk_user`` makes, and for
+    # the same reason: ``withings_sdk_account.external_id`` says "Ours, not Withings'", it is the
+    # join back to robin-backend's order row, and it is what #7's {profileId}#{orderRef}
+    # discipline puts under a UNIQUE constraint. Storing a normalised echo instead would break
+    # that join silently, and an echo over 128 characters would fail the flush AFTER the account
+    # exists and the order is placed. A mismatch is not fatal, so it is logged rather than raised.
+    echoed = user.get("external_id")
+    if echoed and echoed != external_id:
+        log_structured(
+            logger,
+            "warning",
+            "Withings echoed a different external_id than the one sent",
+            provider="withings",
+            task=_ACTION,
+            sent_external_id=external_id,
+            echoed_external_id=echoed,
+        )
+
+    raw_orders = body.get("orders") or []
+    if not raw_orders:
+        # A status-0 response acknowledging NO order is the state the request-side guard exists
+        # to prevent, reached from the other direction: a real Withings account with nothing
+        # shipping to it. Raising strands an account, which is recoverable and nameable —
+        # ``external_id`` is deterministic — where a silent no-ship is detectable by nobody.
+        #
+        # It is also how a key-name miss degrades. We send the block under ``order`` and read the
+        # response under ``orders``; nobody has seen this response, and without this guard a real
+        # placed order arriving under a different key would return a clean success with an empty
+        # list. Same precedent as ``exchange_sdk_code``: partial success is worse than failure.
+        log_structured(
+            logger,
+            "error",
+            "Withings createuserorder succeeded but acknowledged no orders",
+            provider="withings",
+            task=_ACTION,
+            body_keys=sorted(body.keys()),
+        )
+        raise WithingsDropshipmentError(detail="Withings createuserorder returned no orders")
+
+    try:
+        order_results = [DropshipOrderResult.model_validate(o) for o in raw_orders]
+    except ValidationError as e:
+        # Leniency covers unexpected KEYS (extra="allow", every field optional); an unexpected
+        # TYPE still lands here, and after the order is placed. Re-raised as this module's own
+        # error so the caller can discriminate it from a transport failure.
+        raise WithingsDropshipmentError(detail="Withings createuserorder returned an unreadable order") from e
 
     log_structured(
         logger,
@@ -210,6 +264,6 @@ def create_user_order(
     )
     return DropshipUserOrder(
         code=code,
-        external_id=str(user.get("external_id") or external_id),
+        external_id=external_id,
         orders=order_results,
     )
