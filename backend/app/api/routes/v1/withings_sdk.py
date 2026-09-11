@@ -34,9 +34,11 @@ from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName
+from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
 from app.services.api_key_service import ApiKeyDep
 from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.withings.dropshipment import WithingsDropshipmentError
 from app.services.providers.withings.sdk_devices import (
     WithingsDeviceError,
     list_devices,
@@ -44,7 +46,10 @@ from app.services.providers.withings.sdk_devices import (
     record_installed_device,
     sync_devices_from_withings,
 )
-from app.services.providers.withings.sdk_provisioning import provision_sdk_account
+from app.services.providers.withings.sdk_provisioning import (
+    provision_cellular_order,
+    provision_sdk_account,
+)
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 
 logger = getLogger(__name__)
@@ -154,6 +159,135 @@ def create_withings_sdk_account(
         )
 
     return SdkAccountResponse(external_id=account.external_id, csrf_token=account.csrf_token)
+
+
+class CellularOrderRequest(SdkAccountRequest):
+    """What robin-backend sends to ship a cellular device.
+
+    Deliberately the SDK account request plus the two fields ``createuserorder`` adds, so the
+    caller builds ONE profile shape for both provisioning paths — the app's
+    ``buildSdkAccountRequest`` is the single producer of both, and a second field list would
+    drift from it silently.
+
+    Three things differ from the parent and each is load-bearing:
+
+    ``external_id`` widens to 128. The SDK route sends a bare profile id; here Withings gives a
+    member one account PER ORDER, so the value is ``{customerProfileId}#{orderRef}`` and a
+    36-character UUID plus a separator leaves the 64-character parent limit unreachable.
+
+    ``unit_pref`` and ``orders`` are new. Both are required by ``createuserorder`` and neither
+    has a sensible default: the first decides what the device screen displays, the second is the
+    parcel.
+    """
+
+    external_id: str = Field(max_length=128, description="{customerProfileId}#{orderRef} — one per ORDER")
+    unit_pref: dict[str, int] = Field(
+        min_length=1, description="Withings' unit vocabulary, e.g. {'weight': 1, 'height': 6}"
+    )
+    # ``min_length=1`` is the whole reason this is validated here. ``createuserorder`` with an
+    # empty order list creates the account, ships nothing, and answers 0 — a success that
+    # delivered no device, which is the one outcome this integration must never report.
+    orders: list[DropshipOrder] = Field(min_length=1)
+    firstname: str | None = Field(default=None, max_length=255)
+    lastname: str | None = Field(default=None, max_length=255)
+    phonenumber: str | None = Field(default=None, max_length=32)
+    recovery_code: str | None = Field(default=None, max_length=64)
+    # Places a real order against Withings without shipping hardware. The first exercise of this
+    # route runs with it on, and it is the reason ``create_user_order`` already carries the flag.
+    testmode: bool = False
+
+
+class CellularOrderResponse(BaseModel):
+    """The two halves of a cellular provisioning, kept apart.
+
+    ``external_id``/``csrf_token`` are the account, which lives here. ``orders`` are commerce —
+    an order id and a shipment status — and belong to robin-backend's ``WithingsDeviceOrder``,
+    which is also where the device MACs that ``end_program`` needs will land. Nothing about an
+    order is stored in this fork, so this response is the only place the caller can get it.
+    """
+
+    external_id: str
+    csrf_token: str
+    orders: list[DropshipOrderResult]
+
+
+@router.post(
+    "/withings/cellular/orders",
+    summary="Create a Withings account and ship a cellular device to the member",
+    status_code=status.HTTP_201_CREATED,
+    tags=["External: Providers"],
+)
+def create_withings_cellular_order(
+    payload: CellularOrderRequest,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> CellularOrderResponse:
+    """Provision a cellular device: one signed Withings call, two halves of a result.
+
+    Unlike ``POST /withings/sdk/accounts`` this does NOT overwrite the member's existing Withings
+    connection. A cellular device cannot be activated onto an account we did not create, so a
+    member holds one account per device plus, possibly, their own — which is what the three-column
+    ``ix_user_connection_user_provider`` was widened to allow.
+
+    Called only from robin-backend's ``fulfillWithingsDeviceOrder``, after Stripe confirms the
+    payment. That ordering is the caller's to keep: this route ships a parcel, and nothing here
+    knows whether it was paid for.
+    """
+    if not settings.withings_client_id or not settings.withings_client_secret:
+        # An operator condition, not a bad request — the same 503 the SDK route answers.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Withings credentials are not configured on this deployment",
+        )
+
+    try:
+        result = provision_cellular_order(
+            db,
+            user_id=payload.user_id,
+            client_id=settings.withings_client_id,
+            client_secret=settings.withings_client_secret.get_secret_value(),
+            redirect_uri=settings.oauth_redirect_uri(ProviderName.WITHINGS),
+            external_id=payload.external_id,
+            email=payload.email,
+            shortname=payload.shortname,
+            birthdate=payload.birthdate,
+            gender=payload.gender,
+            weight_kg=payload.weight_kg,
+            height_m=payload.height_m,
+            preflang=payload.preflang,
+            timezone_name=payload.timezone,
+            mailingpref=payload.mailingpref,
+            unit_pref=payload.unit_pref,
+            orders=payload.orders,
+            firstname=payload.firstname,
+            lastname=payload.lastname,
+            phonenumber=payload.phonenumber,
+            recovery_code=payload.recovery_code,
+            testmode=payload.testmode,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except WithingsDropshipmentError as e:
+        # NEVER the upstream body. It answers a signed payload that, on this route, carries the
+        # member's home address as well as their email, birth date and weight.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Withings declined the cellular order (status={e.withings_status})",
+        ) from e
+
+    if not result.account.csrf_token:
+        # Same invariant as the SDK route, and worse to discover late here: the order is already
+        # placed, so a null hands the caller an account it can never open a WebView against.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Withings returned no csrf_token; the account cannot open a WebView",
+        )
+
+    return CellularOrderResponse(
+        external_id=result.account.external_id,
+        csrf_token=result.account.csrf_token,
+        orders=result.orders,
+    )
 
 
 class SdkSessionResponse(BaseModel):

@@ -31,14 +31,23 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.user import User
 from app.models.withings_sdk_account import WithingsSdkAccount
+from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
+from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.sdk_provisioning import CellularProvisioning
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 from tests.factories import UserConnectionFactory, UserFactory
 
 _TOKEN = "app.api.routes.v1.withings_sdk._get_valid_token"
 _PROVISION = "app.api.routes.v1.withings_sdk.provision_sdk_account"
+_PROVISION_CELLULAR = "app.api.routes.v1.withings_sdk.provision_cellular_order"
 
 _ACCOUNTS_URL = "/api/v1/providers/withings/sdk/accounts"
 _SESSION_URL = "/api/v1/providers/withings/sdk/session"
+_CELLULAR_URL = "/api/v1/providers/withings/cellular/orders"
+
+# ``{customerProfileId}#{orderRef}`` — the shape robin-backend sends, and the reason the column
+# is 128 rather than 64. One account per order, so the suffix is what keeps them apart.
+_EXTERNAL_ID = "11111111-2222-3333-4444-555555555555#01K5ZQ8MZ0XJ7R2T4V6W8Y"
 
 
 @pytest.fixture
@@ -64,6 +73,42 @@ def _valid_payload(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def _valid_cellular_payload(**overrides: Any) -> dict[str, Any]:
+    """The SDK profile plus the two fields ``createuserorder`` adds: ``unit_pref`` and ``orders``."""
+    payload = _valid_payload(external_id=_EXTERNAL_ID)
+    payload.update(
+        {
+            "unit_pref": {"weight": 1, "height": 6},
+            "orders": [
+                {
+                    "customer_ref_id": "01K5ZQ8MZ0XJ7R2T4V6W8Y",
+                    "address": {
+                        "name": "Francesco Rossi",
+                        "email": "member@example.com",
+                        "address1": "Via Roma 1",
+                        "city": "Milano",
+                        "zip": "20121",
+                        "country": "IT",
+                    },
+                    "products": [{"quantity": 1, "ean": "3700546705526"}],
+                }
+            ],
+        }
+    )
+    payload.update(overrides)
+    return payload
+
+
+def _provisioning() -> CellularProvisioning:
+    """A successful provisioning, for the tests that only care about what was sent."""
+    return CellularProvisioning(
+        account=WithingsSdkAccount(
+            id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+        ),
+        orders=[DropshipOrderResult(orderid="WO-1", status="PENDING")],
+    )
 
 
 def _connected_member(db: Session, *, csrf_token: str | None, with_account: bool = True) -> User:
@@ -249,3 +294,140 @@ class TestProvisioningRoute:
         assert response.status_code == 400
         # A rejected request must not reach Withings.
         provision.assert_not_called()
+
+
+class TestCellularOrderRoute:
+    """The HTTP surface ``provision_cellular_order`` did not have.
+
+    ``#8`` shipped the client and the service and no route, so the function was reachable from
+    Python and from nowhere else — which meant robin-backend, the only caller there will ever
+    be, could not place an order at all. These tests pin the route, not the provisioning
+    beneath it: that has its own suite in ``tests/providers/withings``.
+    """
+
+    def test_returns_the_account_and_the_orders_separately(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The two halves go to different systems — the account is ours, the orders are
+        # robin-backend's. A route returning only the account would strand a placed order with
+        # no id to track it by, after the parcel had already been committed to.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid="WO-1", status="PENDING")],
+        )
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["external_id"] == _EXTERNAL_ID
+        assert body["csrf_token"] == "csrf-new"
+        assert body["orders"] == [{"orderid": "WO-1", "status": "PENDING"}]
+        assert provision.call_args.kwargs["testmode"] is False
+
+    def test_forwards_testmode_when_asked(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The only way to exercise the whole path without shipping hardware, and therefore the
+        # first thing that will be run once the dropshipment entitlement lands. A route that
+        # accepted the flag and dropped it would look like it worked and ship a real device.
+        with patch(_PROVISION_CELLULAR, return_value=_provisioning()) as provision:
+            client.post(_CELLULAR_URL, json=_valid_cellular_payload(testmode=True), headers=api_key_header)
+
+        assert provision.call_args.kwargs["testmode"] is True
+
+    def test_passes_the_order_block_through_as_models(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # ``create_user_order`` signs a payload built from these objects. Handing the service a
+        # list of dicts instead would fail inside the signature step, after the request shape
+        # had already been accepted.
+        with patch(_PROVISION_CELLULAR, return_value=_provisioning()) as provision:
+            client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        orders = provision.call_args.kwargs["orders"]
+        assert [type(o) for o in orders] == [DropshipOrder]
+        assert orders[0].customer_ref_id == "01K5ZQ8MZ0XJ7R2T4V6W8Y"
+        assert orders[0].address.country == "IT"
+
+    def test_requires_authentication(self, client: TestClient) -> None:
+        response = client.post(_CELLULAR_URL, json=_valid_cellular_payload())
+
+        assert response.status_code == 401
+
+    def test_503_when_the_deployment_has_no_withings_credentials(
+        self, client: TestClient, api_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "withings_client_id", None)
+
+        response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 503
+
+    def test_400_when_provisioning_rejects_the_input_locally(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with patch(_PROVISION_CELLULAR, side_effect=ValueError("unit_pref must not be empty")):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 400
+
+    def test_502_without_echoing_the_upstream_detail(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Worse here than on the SDK route: this request also carried the member's HOME ADDRESS,
+        # and the upstream body answers a signed payload that contains it.
+        error = WithingsDropshipmentError(withings_status=277, detail="createuserorder refused for Via Roma 1, Milano")
+
+        with patch(_PROVISION_CELLULAR, side_effect=error):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "Via Roma" not in response.text
+        assert "status=277" in response.json()["detail"]
+
+    def test_400_when_an_order_carries_no_products(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # An empty order is accepted by nothing downstream, and Withings answers it with an
+        # opaque status AFTER creating the account — leaving a member with a Withings account
+        # and no device on the way.
+        payload = _valid_cellular_payload()
+        payload["orders"][0]["products"] = []
+
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=payload, headers=api_key_header)
+
+        assert response.status_code == 400
+        provision.assert_not_called()
+
+    def test_400_when_no_order_is_attached_at_all(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # ``createuserorder`` with an empty ``order`` list creates the account and ships
+        # nothing, which is the one success this integration must never report.
+        with patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(orders=[]), headers=api_key_header)
+
+        assert response.status_code == 400
+        provision.assert_not_called()
+
+    def test_502_when_withings_returned_no_csrf_token(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Same invariant as the SDK route: the column is nullable and a null is unusable by the
+        # caller, so it is asserted here rather than discovered at WebView-open time.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token=None
+            ),
+            orders=[DropshipOrderResult(orderid="WO-1", status="PENDING")],
+        )
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
