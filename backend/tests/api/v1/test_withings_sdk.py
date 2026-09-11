@@ -501,6 +501,10 @@ class TestCellularOrderRoute:
                 user_connection_id=connection.id,
                 external_id=_EXTERNAL_ID,
                 csrf_token="csrf-first",
+                # NOT NULL, and with no server default — the model leaves it to the writer, and
+                # `_upsert_sdk_account` always sets it. A fixture that builds the row directly has
+                # to as well; `_connected_member` above does the same.
+                updated_at=connection.updated_at,
             )
         )
         db.commit()
