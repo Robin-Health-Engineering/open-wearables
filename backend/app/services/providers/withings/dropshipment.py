@@ -64,8 +64,17 @@ class WithingsDropshipmentError(RuntimeError):
     both, which is what the caller has to reason about.
     """
 
-    def __init__(self, *, withings_status: int | None = None, detail: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        withings_status: int | None = None,
+        detail: str | None = None,
+        already_exists: bool = False,
+    ) -> None:
         self.withings_status = withings_status
+        # See WithingsSdkUserError: the account already being ours is the caller's state, not a
+        # fault, and the cellular route answers 409 for it rather than 502.
+        self.already_exists = already_exists
         super().__init__(detail or f"Withings createuserorder failed (status={withings_status})")
 
 

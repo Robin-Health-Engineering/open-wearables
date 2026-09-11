@@ -54,10 +54,24 @@ STATUS_OK = 0
 
 
 class WithingsSdkUserError(RuntimeError):
-    """Raised when Withings declines to create the SDK user."""
+    """Raised when Withings declines to create the SDK user, or when the result cannot be stored.
 
-    def __init__(self, *, withings_status: int | None = None, detail: str | None = None) -> None:
+    ``already_exists`` distinguishes the one failure that is the CALLER's state rather than a
+    fault: the account this provisioning produced is one we already hold. It exists so a route can
+    answer 409 instead of 502 without matching on the message — the two mean opposite things to
+    whoever called, and before this the distinction was carried by an ``HTTPException`` escaping a
+    repository decorator into the service layer.
+    """
+
+    def __init__(
+        self,
+        *,
+        withings_status: int | None = None,
+        detail: str | None = None,
+        already_exists: bool = False,
+    ) -> None:
         self.withings_status = withings_status
+        self.already_exists = already_exists
         super().__init__(detail or f"Withings createuser failed (status={withings_status})")
 
 

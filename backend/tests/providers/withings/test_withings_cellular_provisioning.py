@@ -183,13 +183,15 @@ class TestFailureIsDiscriminable:
         # A cellular store failure strands an account AND a placed order; the SDK one strands
         # only an account. A caller catching WithingsDropshipmentError must see the failure it
         # most needs to hear about, which is why the shared helper takes the error type.
+        #
+        # Reached through the real collision now rather than a patched-out repository call: the
+        # store no longer goes through `UserConnectionRepository.create`, so the old
+        # `return_value=None` patch had nothing left to bite (open-wearables#12). Provisioning the
+        # same external_id twice is the genuine article and exercises the same branch.
         user = UserFactory()
+        _provision(db, user.id, withings_userid="withings-first")
 
-        with (
-            patch(
-                "app.services.providers.withings.sdk_provisioning.UserConnectionRepository.create",
-                return_value=None,
-            ),
-            pytest.raises(WithingsDropshipmentError, match="could not be stored"),
-        ):
-            _provision(db, user.id)
+        with pytest.raises(WithingsDropshipmentError, match="could not be stored") as exc:
+            _provision(db, user.id, withings_userid="withings-second")
+
+        assert exc.value.already_exists is True

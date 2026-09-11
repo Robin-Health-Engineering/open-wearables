@@ -22,15 +22,13 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
-from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.user_connection import UserConnection
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.services.providers.withings.connections import device_connections, member_linked_connection
 from app.services.providers.withings.sdk_provisioning import provision_sdk_account
-from app.services.providers.withings.sdk_users import SdkTokens, SdkUser
+from app.services.providers.withings.sdk_users import SdkTokens, SdkUser, WithingsSdkUserError
 from tests.factories import UserConnectionFactory, UserFactory
 
 _EXTERNAL_ID = "robin-user-1"
@@ -165,8 +163,14 @@ class TestProvisionSdkAccount:
         user = UserFactory()
         _provision(db, user.id, withings_userid="withings-order-1")
 
-        with pytest.raises(IntegrityError):
+        # A WithingsSdkUserError carrying already_exists, not a raw IntegrityError. The store now
+        # writes the connection and the SDK row in ONE transaction rather than through the
+        # repository, which committed the connection first and let a UNIQUE violation strand it
+        # (open-wearables#12). The collision this pins is unchanged; only its type is.
+        with pytest.raises(WithingsSdkUserError) as exc:
             _provision(db, user.id, withings_userid="withings-order-2")
+
+        assert exc.value.already_exists is True
 
     def test_a_second_order_with_its_own_external_id_adds_a_third_connection(self, db: Session) -> None:
         # And with a distinct external_id it works, which is what the format change buys: a
@@ -187,16 +191,20 @@ class TestProvisionSdkAccount:
         # account for one member is a bug, and it is also the guard if Withings ever adopts an
         # existing account instead of creating a new one.
         #
-        # Surfaces as a 400 rather than a raw IntegrityError: the connection is written through
-        # the repository, whose @handle_exceptions turns an integrity violation into
-        # "entity already exists". That is the right shape for a caller — a duplicate account is
-        # a bad request, not a server fault — and it is what the API actually returns, so it is
-        # what this pins. Contrast the external_id case above, which is written with a bare
-        # flush and therefore raises IntegrityError unwrapped.
+        # Both unique indexes now surface the SAME way — a store error carrying already_exists —
+        # where this one used to come back as an HTTPException(400) raised by the repository's
+        # @handle_exceptions and the external_id case as a raw IntegrityError.
+        #
+        # The old asymmetry was an accident of which write went through the repository, not a
+        # decision. What that 400 got RIGHT was the shape it presented to a caller: a duplicate
+        # account is the caller's state, not a server fault. That is preserved — the SDK route
+        # reads `already_exists` and still answers 400 (see test_400_when_the_account_already_
+        # exists) — but it is now the route's decision rather than a status code leaking out of a
+        # repository decorator into the service layer.
         user = UserFactory()
         _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}#order-1")
 
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(WithingsSdkUserError) as exc:
             _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}#order-2")
 
-        assert exc.value.status_code == 400
+        assert exc.value.already_exists is True

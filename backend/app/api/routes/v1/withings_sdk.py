@@ -144,6 +144,13 @@ def create_withings_sdk_account(
         # Local validation (shortname shape, enum ranges) — the caller can fix these.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except WithingsSdkUserError as e:
+        if e.already_exists:
+            # A duplicate account is the caller's state, not a server fault — this route used to
+            # answer 400 here via an HTTPException escaping the repository's @handle_exceptions,
+            # and that shape was right even though its mechanism was not. Preserved deliberately
+            # now that the store writes both rows in one transaction and no longer goes through
+            # the repository.
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         # Never echo the upstream body: it answers a signed request and may repeat our
         # parameters. The Withings status is enough to diagnose from the logs.
         raise HTTPException(
@@ -342,6 +349,17 @@ def create_withings_cellular_order(
             detail="An account already exists for this external_id; the order was already placed",
         ) from e
     except WithingsDropshipmentError as e:
+        if e.already_exists:
+            # The store lost the UNIQUE race — same meaning as the pre-flight 409 and as the
+            # IntegrityError branch above, reached from inside the service instead.
+            logger.error(
+                "Withings cellular order: the account already exists — a concurrent provisioning won",
+                extra={"external_id": payload.external_id},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account already exists for this external_id; the order was already placed",
+            ) from e
         # NEVER the upstream body. It answers a signed payload that, on this route, carries the
         # member's home address as well as their email, birth date and weight.
         #

@@ -163,7 +163,10 @@ def _store_provisioned_account(
         # already ran. Both mean "a real Withings account exists for this request" — and on the
         # cellular path, an order with it.
         db.rollback()
-        raise store_error(detail="the Withings account was created but could not be stored: it already exists") from e
+        raise store_error(
+            detail="the Withings account was created but could not be stored: it already exists",
+            already_exists=True,
+        ) from e
 
     # AFTER the commit, deliberately. It fired before the upsert and the commit, so a failure in
     # either announced a connection that never persisted — and robin-backend would then hold a
