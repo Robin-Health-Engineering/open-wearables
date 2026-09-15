@@ -44,7 +44,7 @@ from dataclasses import dataclass
 import httpx
 
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
-from app.services.providers.withings.oauth import redact_body
+from app.services.providers.withings.oauth import describe_body
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.sdk_users import STATUS_OK
 from app.services.providers.withings.signature import sign_payload
@@ -102,11 +102,13 @@ def _end_one(
         response.raise_for_status()
         envelope = response.json()
     except httpx.HTTPStatusError as e:
-        # Redacted: the request carried a signature and the response may echo it back.
+        # NOT logged: the request carried a signature and a device MAC, and the response may echo
+        # either. A MAC identifies one member's hardware and is what End of Program is addressed
+        # by, so it is kept out of the log for the same reason the profile fields are.
         log_structured(
             logger,
             "error",
-            f"Withings endpartnerprogram HTTP error: {redact_body(e.response.text)}",
+            f"Withings endpartnerprogram HTTP error ({describe_body(e.response.text)})",
             provider="withings",
             task=_ACTION,
             status_code=e.response.status_code,

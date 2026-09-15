@@ -39,7 +39,7 @@ from pydantic import ValidationError
 
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult, DropshipUserOrder
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
-from app.services.providers.withings.oauth import redact_body
+from app.services.providers.withings.oauth import describe_body
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.sdk_users import (
     SHORTNAME_RE,
@@ -165,12 +165,13 @@ def create_user_order(
         response.raise_for_status()
         envelope = response.json()
     except httpx.HTTPStatusError as e:
-        # Redacted: the request body carried a signature AND a postal address, and the response
-        # may echo either back.
+        # NOT logged: the request body carried a signature AND a postal address, and the response
+        # may echo either back. `redact_body` does not cover that — it masks credential-shaped keys
+        # and an address is not one, which was measured rather than assumed. See `describe_body`.
         log_structured(
             logger,
             "error",
-            f"Withings createuserorder HTTP error: {redact_body(e.response.text)}",
+            f"Withings createuserorder HTTP error ({describe_body(e.response.text)})",
             provider="withings",
             task=_ACTION,
             status_code=e.response.status_code,
@@ -217,10 +218,10 @@ def create_user_order(
 
     # Return OUR external_id, never the echo — the same choice ``create_sdk_user`` makes, and for
     # the same reason: ``withings_sdk_account.external_id`` says "Ours, not Withings'", it is the
-    # join back to robin-backend's order row, and it is what #7's {profileId}#{orderRef}
-    # discipline puts under a UNIQUE constraint. Storing a normalised echo instead would break
-    # that join silently, and an echo over 128 characters would fail the flush AFTER the account
-    # exists and the order is placed. A mismatch is not fatal, so it is logged rather than raised.
+    # join back to the member, and it is what the UNIQUE constraint is on. Storing a normalised
+    # echo instead would break that join silently, and an echo over 128 characters would fail the
+    # flush AFTER the account exists and the order is placed. A mismatch is not fatal, so it is
+    # logged rather than raised.
     echoed = user.get("external_id")
     if echoed and echoed != external_id:
         log_structured(

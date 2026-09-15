@@ -1,9 +1,13 @@
 """Provisioning ADDS a Withings account; these pin what "add" has to mean.
 
-A member can hold several Withings connections at once. Withings creates an account on every
-provisioning path they offer, and a cellular device cannot be activated onto an account the
-partner did not create — so someone who has linked their own account and is then shipped a
-device holds two, and another for every later order.
+A member can hold TWO Withings connections. Withings creates an account on every provisioning
+path they offer, and a cellular device cannot be activated onto an account the partner did not
+create — so someone who has linked their own account and is then shipped a device holds both.
+
+Two, not one per order: Withings confirmed (2026-09-15) that a member's later orders ship to the
+account their first one created. So a repeat provisioning arrives with an external_id and a
+Withings userid we already hold, and must REUSE that connection — the tests below say what reuse
+is allowed to mean, and where it must still refuse.
 
 This used to overwrite instead, because ``user_connection``'s unique index was
 ``(user_id, provider)`` and there was nowhere to put a second row. The consequence was that
@@ -24,6 +28,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy.orm import Session
 
+from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
 from app.models.user_connection import UserConnection
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.services.providers.withings.connections import device_connections, member_linked_connection
@@ -151,60 +156,157 @@ class TestProvisionSdkAccount:
         assert connection.provider_user_id == "withings-provisioned"
         assert account.external_id == _EXTERNAL_ID
 
-    def test_a_second_order_needs_its_own_external_id(self, db: Session) -> None:
-        # The constraint that decides how robin-backend must mint external_id. It is UNIQUE,
-        # and today robin-backend sends the bare CustomerProfile id — one value per member for
-        # life — so a member's SECOND provisioned account collides here, after Withings has
-        # already created a real account on their side.
+    def test_a_repeat_order_reuses_the_connection_instead_of_adding_one(self, db: Session) -> None:
+        # THE case the account model turns on. Withings reuse the account they created for a
+        # member, so a second order comes back with the same userid under the same external_id —
+        # and robin-backend now sends a stable external_id precisely because of that.
         #
-        # Pinned rather than fixed in this repo: the fix is the {profileId}#{orderRef} format,
-        # which is robin-backend's to send. This test is what makes that a requirement instead
-        # of an intention.
+        # Creating unconditionally here violates (user_id, provider, provider_user_id) AFTER
+        # createuserorder has placed the order: the member's second device is paid for, shipped by
+        # Withings, and unknown to us. That is what this prevents.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-personal")
+
+        first = _provision(db, user.id, withings_userid="withings-ours")
+        second = _provision(db, user.id, withings_userid="withings-ours")
+
+        connections = db.query(UserConnection).filter(UserConnection.user_id == user.id).all()
+        assert len(connections) == 2, "the personal account and ours — never a third"
+        assert len(device_connections(db, user.id)) == 1
+        assert db.query(WithingsSdkAccount).count() == 1
+        assert second.id == first.id, "the same SDK row, updated in place"
+
+    def test_a_repeat_order_writes_the_new_tokens(self, db: Session) -> None:
+        # Reuse is not a no-op. The code exchange just minted fresh tokens and the stored ones are
+        # spent, so a reuse that kept the old row untouched would leave the connection holding
+        # dead credentials — healthy-looking and unable to read the account.
+        user = UserFactory()
+        _provision(db, user.id, withings_userid="withings-ours")
+
+        with patch(
+            "app.services.providers.withings.sdk_provisioning.create_sdk_user",
+            return_value=SdkUser(code="auth-code", external_id=_EXTERNAL_ID),
+        ):
+            rotated = SdkTokens(
+                userid="withings-ours",
+                access_token="access-rotated",
+                refresh_token="refresh-rotated",
+                csrf_token="csrf-rotated",
+                expires_in=10800,
+                scope="user.metrics",
+            )
+            with patch(
+                "app.services.providers.withings.sdk_provisioning.exchange_sdk_code",
+                return_value=rotated,
+            ):
+                provision_sdk_account(
+                    db,
+                    user_id=user.id,
+                    client_id="client-id",
+                    client_secret="client-secret",
+                    redirect_uri="https://api.example.com/api/v1/oauth/withings/callback",
+                    external_id=_EXTERNAL_ID,
+                    **_PROFILE,
+                )
+
+        connection = device_connections(db, user.id)[0]
+        assert connection.access_token == "access-rotated"
+        assert connection.refresh_token == "refresh-rotated"
+        assert db.query(WithingsSdkAccount).one().csrf_token == "csrf-rotated"
+
+    def test_the_same_account_under_a_different_external_id_is_refused(self, db: Session) -> None:
+        # The limit of reuse, and the reason it is an explicit check rather than a fallthrough.
+        # external_id is the join robin-backend resolves an account by; one Withings account
+        # answering to two names, or one name pointing at two accounts, breaks that link.
+        # Rewriting the row silently would be strictly worse than refusing an order that can be
+        # reconciled by hand, so this refuses.
+        user = UserFactory()
+        _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}-a")
+
+        with pytest.raises(WithingsSdkUserError) as exc:
+            _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}-b")
+
+        assert exc.value.already_exists is True
+
+    def test_a_different_account_under_the_same_external_id_is_refused(self, db: Session) -> None:
+        # The mirror image, caught by the external_id unique index rather than by the check above:
+        # no existing connection matches this userid, so the insert goes ahead and collides.
+        #
+        # Under the old per-order external_id this was the ORDINARY second order and it was pinned
+        # as a requirement on robin-backend to send {profileId}#{orderRef}. It is now a genuine
+        # fault — Withings handing us a different account for a member we already provisioned —
+        # and the same already_exists answer is the right one for a different reason.
         user = UserFactory()
         _provision(db, user.id, withings_userid="withings-order-1")
 
-        # A WithingsSdkUserError carrying already_exists, not a raw IntegrityError. The store now
-        # writes the connection and the SDK row in ONE transaction rather than through the
-        # repository, which committed the connection first and let a UNIQUE violation strand it
-        # (open-wearables#12). The collision this pins is unchanged; only its type is.
         with pytest.raises(WithingsSdkUserError) as exc:
             _provision(db, user.id, withings_userid="withings-order-2")
 
         assert exc.value.already_exists is True
 
-    def test_a_second_order_with_its_own_external_id_adds_a_third_connection(self, db: Session) -> None:
-        # And with a distinct external_id it works, which is what the format change buys: a
-        # member's own account plus one per cellular order.
+
+class TestSubscriptionScheduling:
+    """Provisioning must ask for a Notify subscription, because nothing else will.
+
+    ``WithingsNotifyService`` has been complete since the Notify work landed, but the task that
+    drives it was enqueued from exactly ONE place: the OAuth callback. A provisioned account never
+    goes through OAuth, so a member shipped a cellular device had a connection, live tokens and no
+    subscription — their scale would upload to Withings and nothing would ever tell us a
+    measurement existed.
+
+    It failed silently in both directions. A missing subscription looks exactly like a member who
+    has not stepped on the scale, and there is no periodic reconcile to heal it.
+    """
+
+    def test_provisioning_schedules_the_subscription_sync(self, db: Session) -> None:
         user = UserFactory()
-        UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-personal")
 
-        _provision(db, user.id, withings_userid="withings-order-1", external_id=f"{_EXTERNAL_ID}#order-1")
-        _provision(db, user.id, withings_userid="withings-order-2", external_id=f"{_EXTERNAL_ID}#order-2")
+        with patch("app.services.providers.withings.sdk_provisioning.celery_app") as celery:
+            _provision(db, user.id, withings_userid="withings-ours")
 
-        connections = db.query(UserConnection).filter(UserConnection.user_id == user.id).all()
-        assert len(connections) == 3
-        assert len(device_connections(db, user.id)) == 2
-        assert db.query(WithingsSdkAccount).count() == 2
+        celery.send_task.assert_called_once()
+        name, kwargs = celery.send_task.call_args[0][0], celery.send_task.call_args[1]
+        assert name == SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
+        assert kwargs["args"] == ["withings", str(user.id)]
+        assert kwargs["queue"] == "webhook_sync"
 
-    def test_the_same_withings_account_twice_is_still_rejected(self, db: Session) -> None:
-        # Relaxing the index did not make it meaningless. Two rows describing ONE Withings
-        # account for one member is a bug, and it is also the guard if Withings ever adopts an
-        # existing account instead of creating a new one.
-        #
-        # Both unique indexes now surface the SAME way — a store error carrying already_exists —
-        # where this one used to come back as an HTTPException(400) raised by the repository's
-        # @handle_exceptions and the external_id case as a raw IntegrityError.
-        #
-        # The old asymmetry was an accident of which write went through the repository, not a
-        # decision. What that 400 got RIGHT was the shape it presented to a caller: a duplicate
-        # account is the caller's state, not a server fault. That is preserved — the SDK route
-        # reads `already_exists` and still answers 400 (see test_400_when_the_account_already_
-        # exists) — but it is now the route's decision rather than a status code leaking out of a
-        # repository decorator into the service layer.
+    def test_a_repeat_order_schedules_it_too(self, db: Session) -> None:
+        # Reuse is the path most likely to skip this, and the one where skipping is least
+        # visible: the connection already exists, so everything looks provisioned. But a
+        # subscription can have been revoked, expired, or never made — the task reconciles rather
+        # than blindly subscribing, so asking again is cheap and not asking is a silent gap.
         user = UserFactory()
-        _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}#order-1")
 
-        with pytest.raises(WithingsSdkUserError) as exc:
-            _provision(db, user.id, withings_userid="withings-same", external_id=f"{_EXTERNAL_ID}#order-2")
+        with patch("app.services.providers.withings.sdk_provisioning.celery_app") as celery:
+            _provision(db, user.id, withings_userid="withings-ours")
+            _provision(db, user.id, withings_userid="withings-ours")
 
-        assert exc.value.already_exists is True
+        assert celery.send_task.call_count == 2
+
+    def test_a_broker_failure_does_not_fail_the_provisioning(self, db: Session) -> None:
+        # The account exists at Withings and the device is shipping. Reporting that as a failure
+        # would send robin-backend down a path that strands a real order, to recover a
+        # subscription the next fan-out can make anyway.
+        user = UserFactory()
+
+        with patch("app.services.providers.withings.sdk_provisioning.celery_app") as celery:
+            celery.send_task.side_effect = RuntimeError("broker down")
+            account = _provision(db, user.id, withings_userid="withings-ours")
+
+        assert account.csrf_token == "csrf-withings-ours"
+        assert len(device_connections(db, user.id)) == 1
+
+    def test_it_is_scheduled_after_the_commit(self, db: Session) -> None:
+        # Same rule as on_connection_created, and for the same reason: the worker resolves the
+        # user's connections from the database, so a task dispatched before the commit can find
+        # nothing and report a clean "no subscriptions to make".
+        user = UserFactory()
+        seen: list[int] = []
+
+        with patch("app.services.providers.withings.sdk_provisioning.celery_app") as celery:
+            celery.send_task.side_effect = lambda *a, **k: seen.append(
+                db.query(WithingsSdkAccount).filter(WithingsSdkAccount.external_id == _EXTERNAL_ID).count()
+            )
+            _provision(db, user.id, withings_userid="withings-ours")
+
+        assert seen == [1], "the row must be visible by the time the task is dispatched"

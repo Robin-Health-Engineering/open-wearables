@@ -236,8 +236,8 @@ class TestTheResponse:
         assert exc.value.withings_status == 277
 
     def test_returns_our_external_id_not_the_one_withings_echoed(self) -> None:
-        # The column is ours ("Ours, not Withings'") and it is the join back to robin-backend's
-        # order row, under #7's {profileId}#{orderRef} UNIQUE discipline. createuser makes this
+        # The column is ours ("Ours, not Withings'") and it is the join back to the member, under
+        # a UNIQUE constraint. createuser makes this
         # same choice deliberately; this path storing the echo instead would put two writers with
         # opposite policies on one unique column.
         #

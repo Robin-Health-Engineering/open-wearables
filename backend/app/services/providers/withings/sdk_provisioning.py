@@ -5,17 +5,24 @@ and storing what came back. Split across callers they can half-succeed, and a ha
 provisioning is the bad case — a connection with no ``csrf_token`` looks healthy and then
 cannot open a WebView.
 
-A member may hold SEVERAL Withings connections at once, and provisioning adds one rather than
+A member may hold up to TWO Withings connections, and provisioning adds one rather than
 replacing what is there. Two facts force it: Withings creates an account on every provisioning
 path they offer, and a cellular device cannot be activated onto an account the partner did not
-create. So a member who has linked their own Withings account and is then shipped a device
-holds two, and another for every later order.
+create. So a member who has linked their own Withings account and is then shipped a device holds
+both.
+
+**Two, not one per order.** Withings confirmed on 2026-09-15 that an account created by
+``createuserorder`` is REUSED by that member's later orders — the second device ships to the
+account the first one made. robin-backend therefore sends a stable ``external_id`` (the bare
+profile id), and the repeat provisioning that produces must REUSE the connection it finds rather
+than failing the unique index. That is what ``_store_provisioned_account`` does below, and it is
+the difference between a member's second order shipping and a second order 502-ing after Withings
+have already placed it.
 
 This used to overwrite instead, because the unique index was ``(user_id, provider)`` and there
 was nowhere to put a second row — which meant shipping someone a blood-pressure monitor
 silently stopped their own scale and watch from syncing. The index now includes
-``provider_user_id``; provisioning the SAME Withings account twice still fails there, which is
-the bug worth keeping a constraint for.
+``provider_user_id``, so the personal account and the one we created coexist.
 """
 
 from __future__ import annotations
@@ -25,9 +32,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
+from celery import current_app as celery_app
 from sqlalchemy.exc import IntegrityError
 
 from app.database import DbSession
+from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
 from app.models.user_connection import UserConnection
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.schemas.enums import ProviderName
@@ -87,6 +96,44 @@ def _upsert_sdk_account(db: DbSession, *, connection_id: UUID, external_id: str,
     return account
 
 
+def _schedule_subscription_sync(user_id: UUID) -> None:
+    """Ask the webhook worker to reconcile this member's Withings subscriptions.
+
+    **The gap this closes.** ``WithingsNotifyService`` has been complete since the Notify work
+    landed, but the task that drives it was enqueued from exactly ONE place — the OAuth callback.
+    A provisioned account never goes through OAuth, so a member shipped a cellular device had a
+    connection, live tokens, and no Notify subscription: their scale would upload to Withings and
+    nothing would ever tell us a measurement existed. Nothing reported it either, because a
+    missing subscription looks exactly like a member who has not stepped on the scale, and there
+    is no periodic reconcile to heal it.
+
+    Fire-and-forget, and unconditional on the gating the OAuth callback applies. The task itself
+    reads the configured live-sync mode and returns ``skipped`` when it is not WEBHOOK, so
+    repeating that check here would be a second copy of a decision that can change underneath it —
+    and getting the copy wrong fails silent in the direction of no subscription at all.
+
+    Never raises. A provisioning that succeeded must not be reported as failed because a broker
+    was briefly unreachable: the account exists, the device is shipping, and a missed subscription
+    is recoverable by the next fan-out. The failure is logged rather than swallowed quietly.
+    """
+    try:
+        celery_app.send_task(
+            SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
+            args=[ProviderName.WITHINGS.value, str(user_id)],
+            queue="webhook_sync",
+        )
+    except Exception as e:
+        log_structured(
+            logger,
+            "error",
+            "Withings provisioning could not schedule the subscription sync",
+            provider=ProviderName.WITHINGS.value,
+            task="provision_subscription_sync",
+            user_id=str(user_id),
+            error=str(e),
+        )
+
+
 def _store_provisioned_account(
     db: DbSession,
     *,
@@ -109,15 +156,25 @@ def _store_provisioned_account(
     it most needs to hear about.
     """
     provider = ProviderName.WITHINGS.value
-    # CREATE, never replace. A member can hold several Withings accounts — their own, linked
-    # through consumer OAuth, plus one for every cellular order, because Withings creates an
-    # account on every provisioning path and a device cannot be added to an account that
-    # already exists.
+    # Never REPLACE a different account, but do REUSE the same one. A member can hold two Withings
+    # accounts — their own, linked through consumer OAuth, and the one we created — and those two
+    # must coexist, which is what the three-column unique index is for.
     #
     # This branch used to find any existing Withings connection and overwrite it, which meant
     # shipping someone a blood-pressure monitor silently stopped their own scale and watch from
-    # syncing. The unique index now keys on (user_id, provider, provider_user_id), so the two
-    # coexist; provisioning the SAME Withings account twice still fails there, which is right.
+    # syncing.
+    #
+    # It then swung the other way and created unconditionally, on the reading that every order
+    # yields a NEW account. Withings say otherwise (2026-09-15): a second order ships to the
+    # account the first one created, so a repeat provisioning hands back the SAME provider_user_id
+    # and an unconditional insert violates (user_id, provider, provider_user_id) — after
+    # createuserorder has already placed the order. Refusing there would mean a member's second
+    # device is paid for, shipped by Withings, and unknown to us.
+    #
+    # So: look for the connection this account already has, and refresh its tokens if it is there.
+    # Matching on provider_user_id is what makes that safe — it is the Withings account's own id,
+    # so this can only ever touch the connection for the very account Withings just handed back,
+    # never the member's personal one.
     #
     # ONE TRANSACTION, and NOT through ``UserConnectionRepository.create``, which is the whole
     # point of building the row by hand here. ``CrudRepository.create`` COMMITS
@@ -133,19 +190,51 @@ def _store_provisioned_account(
     # What this does NOT fix is the Withings side — the account and any order it placed are
     # already real by the time we get here, and no database transaction can undo them. That is
     # what ``store_error`` is for, and why the caller answers 409 rather than retrying.
-    connection = UserConnection(
-        **UserConnectionCreate(
-            user_id=user_id,
-            provider=provider,
-            provider_user_id=tokens.userid,
-            provider_username=None,
-            access_token=tokens.access_token,
-            refresh_token=tokens.refresh_token,
-            token_expires_at=datetime.now(timezone.utc) + timedelta(seconds=tokens.expires_in),
-            scope=tokens.scope,
-        ).model_dump()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens.expires_in)
+    existing = (
+        db.query(UserConnection)
+        .filter(
+            UserConnection.user_id == user_id,
+            UserConnection.provider == provider,
+            UserConnection.provider_user_id == tokens.userid,
+        )
+        .one_or_none()
     )
-    db.add(connection)
+    reused = existing is not None
+    if existing is not None:
+        # REUSE means the same account under the same name. If this connection already carries a
+        # DIFFERENT external_id, the two identifiers have come apart — one Withings account is
+        # being provisioned under two names, or one name has been pointed at two accounts — and
+        # the right answer is to refuse rather than to quietly rewrite the row. `external_id` is
+        # the join robin-backend resolves an account by; silently moving it breaks that link with
+        # no error anywhere, which is strictly worse than a 409 on an order that can be reconciled.
+        held = db.query(WithingsSdkAccount).filter(WithingsSdkAccount.user_connection_id == existing.id).one_or_none()
+        if held is not None and held.external_id != external_id:
+            raise store_error(
+                detail="this Withings account is already provisioned under a different external_id",
+                already_exists=True,
+            )
+        # The tokens are new — the code exchange just minted them — and the old ones are already
+        # dead, so writing them is the point of coming back here rather than an optimisation.
+        existing.access_token = tokens.access_token
+        existing.refresh_token = tokens.refresh_token
+        existing.token_expires_at = expires_at
+        existing.scope = tokens.scope
+        connection = existing
+    else:
+        connection = UserConnection(
+            **UserConnectionCreate(
+                user_id=user_id,
+                provider=provider,
+                provider_user_id=tokens.userid,
+                provider_username=None,
+                access_token=tokens.access_token,
+                refresh_token=tokens.refresh_token,
+                token_expires_at=expires_at,
+                scope=tokens.scope,
+            ).model_dump()
+        )
+        db.add(connection)
     try:
         # flush, not commit: the id has to exist for the SDK row's FK, but nothing is durable
         # until both rows are in.
@@ -158,10 +247,12 @@ def _store_provisioned_account(
         )
         db.commit()
     except IntegrityError as e:
-        # Either unique index can fire: (user_id, provider, provider_user_id) if Withings handed
-        # back an account this member already holds, or external_id if this exact provisioning
-        # already ran. Both mean "a real Withings account exists for this request" — and on the
-        # cellular path, an order with it.
+        # The reuse above handles the ordinary repeat, so what is left here is a genuine race —
+        # two provisionings for the same member in flight at once, one of which committed between
+        # the SELECT and this flush — or ``external_id`` already belonging to a DIFFERENT
+        # connection, which means the identifier has been reused for something it should not have
+        # been. Both mean "a real Withings account exists for this request", and on the cellular
+        # path an order with it, so neither may be retried.
         db.rollback()
         raise store_error(
             detail="the Withings account was created but could not be stored: it already exists",
@@ -171,12 +262,19 @@ def _store_provisioned_account(
     # AFTER the commit, deliberately. It fired before the upsert and the commit, so a failure in
     # either announced a connection that never persisted — and robin-backend would then hold a
     # connection id that resolves to nothing, with a retry able to announce it twice.
-    on_connection_created(
-        user_id=user_id,
-        provider=provider,
-        connection_id=connection.id,
-        connected_at=connection.created_at.isoformat(),
-    )
+    #
+    # Only for a connection that is actually NEW. A repeat order reuses one robin-backend was told
+    # about the first time, and re-announcing it would present an existing connection as a fresh
+    # one to every consumer of that webhook.
+    if not reused:
+        on_connection_created(
+            user_id=user_id,
+            provider=provider,
+            connection_id=connection.id,
+            connected_at=connection.created_at.isoformat(),
+        )
+
+    _schedule_subscription_sync(user_id)
 
     return account
 
@@ -287,11 +385,14 @@ def provision_cellular_order(
     robin-backend's ``WithingsDeviceOrder``, which is also where the device MACs live that
     ``end_program`` later needs. Nothing about an order is stored in this fork.
 
-    ``external_id`` must be unique per ACCOUNT, not per member: ``withings_sdk_account`` enforces
-    that, and a member gets one account per cellular order. robin-backend sends
-    ``{customerProfileId}#{orderRef}`` for exactly this reason — passing a bare profile id here
-    for a member's second order fails on that constraint, after Withings has already created the
-    account and placed the order.
+    ``external_id`` is per MEMBER and stable across their orders — robin-backend sends the bare
+    CustomerProfile id. Withings reuse the account they created for a member on that member's
+    later orders, so a second order legitimately arrives with an ``external_id`` we already hold
+    and ``_store_provisioned_account`` reuses the connection behind it.
+
+    Which ORDER a shipment belongs to is ``customer_ref_id``, carried on each ``DropshipOrder``.
+    It is per-order, unique and ours, and it is what Withings name in their order notifications —
+    so it, not ``external_id``, is the value that ties a shipment back to one robin-backend row.
     """
     kwargs = {"api_base_url": api_base_url} if api_base_url else {}
 

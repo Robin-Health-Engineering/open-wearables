@@ -35,10 +35,12 @@ from app.models.withings_sdk_account import WithingsSdkAccount
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
+from app.schemas.providers.withings.order_detail import OrderDetail
 from app.services.api_key_service import ApiKeyDep
 from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.order_detail import WithingsOrderDetailError, get_order_detail
 from app.services.providers.withings.sdk_devices import (
     WithingsDeviceError,
     list_devices,
@@ -178,16 +180,19 @@ class CellularOrderRequest(SdkAccountRequest):
 
     Three things differ from the parent and each is load-bearing:
 
-    ``external_id`` widens to 128. The SDK route sends a bare profile id; here Withings gives a
-    member one account PER ORDER, so the value is ``{customerProfileId}#{orderRef}`` and a
-    36-character UUID plus a separator leaves the 64-character parent limit unreachable.
+    ``external_id`` widens to 128. Both routes now send a bare profile id — Withings reuse a
+    member's provisioned account on their later orders — so the extra room is headroom rather
+    than a live requirement. It is kept because narrowing a column needs a migration and buys
+    nothing, and because the value is robin-backend's to choose.
 
     ``unit_pref`` and ``orders`` are new. Both are required by ``createuserorder`` and neither
     has a sensible default: the first decides what the device screen displays, the second is the
     parcel.
     """
 
-    external_id: str = Field(max_length=128, description="{customerProfileId}#{orderRef} — one per ORDER")
+    external_id: str = Field(
+        max_length=128, description="The CustomerProfile id — one per MEMBER, stable across their orders"
+    )
     unit_pref: dict[str, int] = Field(
         min_length=1, description="Withings' unit vocabulary, e.g. {'weight': 1, 'height': 6}"
     )
@@ -233,8 +238,9 @@ def create_withings_cellular_order(
 
     Unlike ``POST /withings/sdk/accounts`` this does NOT overwrite the member's existing Withings
     connection. A cellular device cannot be activated onto an account we did not create, so a
-    member holds one account per device plus, possibly, their own — which is what the three-column
-    ``ix_user_connection_user_provider`` was widened to allow.
+    member holds the account we made plus, possibly, their own — which is what the three-column
+    ``ix_user_connection_user_provider`` was widened to allow. A member's SECOND order reuses the
+    first one's account, per Withings, so it reuses that connection rather than adding a third.
 
     Called only from robin-backend's ``fulfillWithingsDeviceOrder``, after Stripe confirms the
     payment. That ordering is the caller's to keep: this route ships a parcel, and nothing here
@@ -250,24 +256,29 @@ def create_withings_cellular_order(
     — not this docstring (Lucas, #12).
 
     **RETRIES ARE NOT SAFE, and this route cannot make them safe.** ``createuserorder`` is not
-    idempotent at Withings and we hold no idempotency key they honour, so a second call with the
-    same ``external_id`` creates a second account and places a SECOND ORDER before anything here
-    can object. The pre-flight check below turns the ordinary sequential retry into a 409 before
-    any Withings call, which is the case that actually occurs — robin-backend retries
-    ``fulfillWithingsDeviceOrder`` after a timeout, and it sends the same
-    ``{customerProfileId}#{orderRef}``.
+    idempotent at Withings and we hold no idempotency key they honour, so a second call places a
+    SECOND ORDER before anything here can object. The pre-flight below turns the ordinary
+    sequential retry into a 409 before any Withings call, which is the case that actually occurs:
+    robin-backend retries ``fulfillWithingsDeviceOrder`` after a timeout, with the same
+    ``customer_ref_id``.
 
-    Two gaps remain, deliberately un-papered-over:
+    **The pre-flight asks WITHINGS, not our own tables, and that change is load-bearing.** It used
+    to check whether a ``withings_sdk_account`` already held this ``external_id``. That worked only
+    while ``external_id`` was per-order; now it is per member and stable, so "an account exists"
+    is true from a member's FIRST order onward and would refuse every legitimate second one.
 
-    * it is a TOCTOU narrowing, not a fix. Two SIMULTANEOUS retries can both pass the check and
-      both ship. Closing that needs a reservation row written before the Withings call, which
-      ``withings_sdk_account`` cannot hold today (``user_connection_id`` is NOT NULL), or an
-      idempotency key Withings honours.
-    * it does nothing about a crash BETWEEN Withings accepting and our commit.
+    ``orderv2-getdetail`` answers the question the old check was approximating, and answers it
+    better: ``customer_ref_id`` is per-order, unique and ours, and Withings are the authority on
+    whether an order carrying it exists. That also closes the gap the old check conceded — a crash
+    between Withings accepting and our commit leaves no local trace, but Withings still hold the
+    order and will say so.
 
-    A 409 therefore means "a real Withings account exists for this external_id, and on this path an
-    order was placed with it". The caller must treat it as terminal and reconcile, NOT retry —
-    retrying can only ship again.
+    One gap remains, un-papered-over: it is a TOCTOU narrowing, not a fix. Two SIMULTANEOUS
+    fulfilments can both see "no order" and both ship. Closing that needs an idempotency key
+    Withings honour, which they do not offer.
+
+    A 409 therefore means "Withings already hold an order under this customer_ref_id". The caller
+    must treat it as terminal and reconcile, NOT retry — retrying can only ship again.
     """
     if not settings.withings_client_id or not settings.withings_client_secret:
         # An operator condition, not a bad request — the same 503 the SDK route answers.
@@ -276,17 +287,39 @@ def create_withings_cellular_order(
             detail="Withings credentials are not configured on this deployment",
         )
 
-    # PRE-FLIGHT, before any Withings call — see the docstring. Cheap, and it is the difference
-    # between a retry costing a 409 and a retry costing a second parcel. Reached only on the
-    # sequential retry; the concurrent one falls through to the `already_exists` branch below,
-    # which says the same thing after the fact.
-    if (
-        db.query(WithingsSdkAccount).filter(WithingsSdkAccount.external_id == payload.external_id).one_or_none()
-        is not None
-    ):
+    # PRE-FLIGHT, before any Withings call — see the docstring. One signed round trip against the
+    # authority, and it is the difference between a retry costing a round trip and a retry costing
+    # a second parcel.
+    #
+    # It is NOT best-effort: a getdetail that fails is answered 502 rather than shrugged off and
+    # pushed through. "We could not find out whether this order exists" and "this order does not
+    # exist" are different facts, and treating the first as the second is precisely how a retry
+    # ships twice. getdetail changes nothing at Withings, so a 502 here is safe to retry — which
+    # is the opposite of a 502 from the order call itself.
+    refs = [order.customer_ref_id for order in payload.orders]
+    try:
+        placed = get_order_detail(
+            client_id=settings.withings_client_id,
+            client_secret=settings.withings_client_secret.get_secret_value(),
+            customer_ref_ids=refs,
+        )
+    except WithingsOrderDetailError as e:
+        logger.error(
+            "Withings cellular order: could not check whether the order was already placed",
+            extra={"withings_status": e.withings_status},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not verify with Withings whether this order was already placed",
+        ) from e
+    if placed:
+        logger.error(
+            "Withings cellular order: an order already exists for this customer_ref_id",
+            extra={"order_count": len(placed)},
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="An account already exists for this external_id; the order was already placed",
+            detail="Withings already hold an order for this customer_ref_id; it was already placed",
         )
 
     try:
@@ -335,9 +368,11 @@ def create_withings_cellular_order(
         ) from e
     except WithingsDropshipmentError as e:
         if e.already_exists:
-            # The store lost the UNIQUE race: two retries both passed the pre-flight, both reached
-            # Withings, and this one hit the constraint. Same meaning as the pre-flight 409,
-            # reached after the fact instead of before it.
+            # The store lost the UNIQUE race: two provisionings for this member were in flight and
+            # the other committed first, or `external_id` belongs to a different connection. The
+            # ordinary repeat no longer reaches here at all — `_store_provisioned_account` reuses
+            # the connection — so what is left is a genuine conflict, and it means the same thing
+            # as the pre-flight 409: an order exists, do not retry.
             #
             # There is deliberately no `except IntegrityError` beside this. There was one until
             # Lucas measured the real path on #12 and found it could not fire: every write in
@@ -401,6 +436,95 @@ def create_withings_cellular_order(
         csrf_token=result.account.csrf_token,
         orders=result.orders,
     )
+
+
+class CellularOrderDetailResponse(BaseModel):
+    """What Withings currently say about orders we placed, plus the MACs once they exist.
+
+    ``macs`` is the reason this route exists and is lifted to the top level rather than left
+    inside ``orders[].products[].devices[]``: the caller needs one flat list to hand to
+    ``owWithingsDisconnect``, and burying it three levels down invites each caller to walk the
+    structure differently. ``orders`` is the raw answer beside it, because shipment state is
+    robin-backend's and this fork must not become the thing that decides which fields matter.
+
+    An EMPTY ``macs`` is the normal answer before a device ships — Withings populate MAC addresses
+    only once the parcel has left — and it is NOT distinguishable here from "shipped but not yet
+    populated". A caller that needs the difference has ``orders[].status``.
+    """
+
+    macs: list[str]
+    orders: list[OrderDetail]
+
+
+@router.get(
+    "/withings/cellular/orders/{customer_ref_id}",
+    summary="What Withings say about a cellular order, including its device MAC addresses",
+    tags=["External: Providers"],
+)
+def get_withings_cellular_order(
+    customer_ref_id: str,
+    _caller: ApiKeyDep,
+) -> CellularOrderDetailResponse:
+    """Read one order back from Withings by OUR reference.
+
+    **This is the MAC source, and the MAC is the field with money attached.**
+    ``Devicev2-endpartnerprogram`` ends a member's cellular plan and is addressed by MAC address.
+    ``end_program`` has been written and unreachable since #7 because nothing produced one: the
+    ``createuserorder`` response carries no MAC, this fork stores none, and Withings populate
+    ``products[].mac_addresses`` only once the order has shipped. So the flow is
+    robin-backend's order webhook sees SHIPPED, robin-backend calls this, and the MACs land on the
+    ``WithingsDeviceOrder`` row that ``owWithingsDisconnect`` already reads them from. Without
+    this route that chain has no first link and a member who leaves keeps costing us a SIM.
+
+    **Why it is here rather than in robin-backend**, which owns every other fact about an order:
+    the call is signed with the Withings client secret in the application's own name, and that
+    secret lives in this codebase and should live in exactly one place.
+
+    Nothing is stored. The answer goes straight back to the caller, which is the same division
+    ``POST /withings/cellular/orders`` makes with its ``orders`` field.
+
+    404 means Withings do not know this reference — either it was never placed, or it was placed
+    against a different ``client_id`` (staging versus prod). It does **not** mean the order failed.
+    """
+    if not settings.withings_client_id or not settings.withings_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Withings credentials are not configured on this deployment",
+        )
+
+    try:
+        orders = get_order_detail(
+            client_id=settings.withings_client_id,
+            client_secret=settings.withings_client_secret.get_secret_value(),
+            customer_ref_ids=[customer_ref_id],
+        )
+    except WithingsOrderDetailError as e:
+        # Never the upstream body: the order it echoes carries the member's home address.
+        logger.error(
+            "Withings cellular order detail failed",
+            extra={"withings_status": e.withings_status},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Withings declined the order lookup (status={e.withings_status})"
+            if e.withings_status is not None
+            else f"Withings order lookup failed: {e}",
+        ) from e
+
+    if not orders:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Withings hold no order for this customer_ref_id",
+        )
+
+    # De-duplicated across orders as well as within one: a replacement shipment can repeat a MAC,
+    # and End of Program called twice for the same device is a second call that can only fail.
+    macs: dict[str, None] = {}
+    for order in orders:
+        for mac in order.macs:
+            macs.setdefault(mac, None)
+
+    return CellularOrderDetailResponse(macs=list(macs), orders=orders)
 
 
 class SdkSessionResponse(BaseModel):

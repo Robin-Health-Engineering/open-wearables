@@ -22,15 +22,18 @@ class WithingsSdkAccount(BaseDbModel):
     Hangs off ONE ``user_connection``, and a member can have several — their own linked
     Withings account, plus an account we created for each cellular order, because Withings
     creates an account on every provisioning path and a device cannot join one that already
-    exists. So there is one of these rows per account we provisioned, not one per member.
+    exists. So there is one of these rows per account we provisioned — at most two per member,
+    theirs and ours.
 
-    ``external_id`` is the value WE minted and is the join back to the member, so it is unique
-    — which is exactly why it can no longer be the bare CustomerProfile id. That is one value
-    per member for life, and a member's second provisioned account would collide on it, failing
-    AFTER Withings had already created a real account and stranding it. robin-backend sends
-    ``{customerProfileId}#{orderRef}`` instead: still unique per account, and still answers
-    "which member owns this" by prefix rather than by equality. 128 characters because two
-    UUIDs and a separator do not fit in 64.
+    ``external_id`` is the value WE minted and is the join back to the member, and it is the bare
+    CustomerProfile id: stable across that member's orders, because Withings reuse the account
+    their first order created rather than making a new one each time (confirmed 2026-09-15). It
+    briefly carried a ``#{orderRef}`` suffix on the opposite reading; which ORDER a shipment
+    belongs to is ``customer_ref_id``, which this fork does not store.
+
+    The column stays 128 rather than being narrowed back to 64. Widening it was the thing that
+    needed a migration; leaving the headroom costs nothing and means a future id scheme does not
+    need another one.
     """
 
     __table_args__ = (

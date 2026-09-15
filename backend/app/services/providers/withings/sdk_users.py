@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
-from app.services.providers.withings.oauth import redact_body
+from app.services.providers.withings.oauth import describe_body, redact_body
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.signature import sign_payload
 from app.utils.structured_logging import log_structured
@@ -188,11 +188,13 @@ def create_sdk_user(
         response.raise_for_status()
         envelope = response.json()
     except httpx.HTTPStatusError as e:
-        # Redacted: the request body carried a signature, and the response may echo it back.
+        # NOT logged: the request body carried a signature and the member's email, birth date and
+        # weight, and the response may echo any of it. `redact_body` masks credential-shaped keys
+        # only, so it would pass the profile fields through — see `describe_body`.
         log_structured(
             logger,
             "error",
-            f"Withings createuser HTTP error: {redact_body(e.response.text)}",
+            f"Withings createuser HTTP error ({describe_body(e.response.text)})",
             provider="withings",
             task="createuser",
             status_code=e.response.status_code,

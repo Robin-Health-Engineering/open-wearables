@@ -33,7 +33,9 @@ from app.config import settings
 from app.models.user import User
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
+from app.schemas.providers.withings.order_detail import OrderDetail
 from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.order_detail import WithingsOrderDetailError
 from app.services.providers.withings.sdk_provisioning import CellularProvisioning
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 from tests.factories import UserConnectionFactory, UserFactory
@@ -46,9 +48,12 @@ _ACCOUNTS_URL = "/api/v1/providers/withings/sdk/accounts"
 _SESSION_URL = "/api/v1/providers/withings/sdk/session"
 _CELLULAR_URL = "/api/v1/providers/withings/cellular/orders"
 
-# ``{customerProfileId}#{orderRef}`` — the shape robin-backend sends, and the reason the column
-# is 128 rather than 64. One account per order, so the suffix is what keeps them apart.
-_EXTERNAL_ID = "11111111-2222-3333-4444-555555555555#01K5ZQ8MZ0XJ7R2T4V6W8Y"
+# The bare CustomerProfile id — what robin-backend sends, and the same on a member's every order,
+# because Withings reuse the account their first one created. Which ORDER a shipment belongs to is
+# ``customer_ref_id`` on the order itself, below.
+_EXTERNAL_ID = "11111111-2222-3333-4444-555555555555"
+_ORDER_REF = "01K5ZQ8MZ0XJ7R2T4V6W8Y"
+_GET_ORDER_DETAIL = "app.api.routes.v1.withings_sdk.get_order_detail"
 
 
 @pytest.fixture
@@ -84,7 +89,7 @@ def _valid_cellular_payload(**overrides: Any) -> dict[str, Any]:
             "unit_pref": {"weight": 1, "height": 6},
             "orders": [
                 {
-                    "customer_ref_id": "01K5ZQ8MZ0XJ7R2T4V6W8Y",
+                    "customer_ref_id": _ORDER_REF,
                     "address": {
                         "name": "Francesco Rossi",
                         "email": "member@example.com",
@@ -323,6 +328,18 @@ class TestCellularOrderRoute:
     beneath it: that has its own suite in ``tests/providers/withings``.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_order_already_placed(self) -> Any:
+        """Answer the pre-flight with "Withings hold no such order" unless a test says otherwise.
+
+        Every request through this route now asks ``orderv2-getdetail`` first. Left unpatched that
+        is a real signed HTTP call, so it is stubbed for the whole class and overridden by the two
+        tests that are actually about the pre-flight — which keeps those two readable and stops
+        every other test in here from silently depending on network behaviour.
+        """
+        with patch(_GET_ORDER_DETAIL, return_value=[]) as stub:
+            yield stub
+
     def test_returns_the_account_and_the_orders_separately(
         self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
     ) -> None:
@@ -485,14 +502,34 @@ class TestCellularOrderRoute:
         # Error" — but the detail we now choose ourselves must not start leaking what that did not.
         assert "Via Roma" not in response.text
 
-    def test_409_when_the_external_id_was_already_provisioned(
-        self, client: TestClient, db: Session, api_key_header: dict[str, str], withings_configured: None
+    def test_409_when_withings_already_hold_this_order(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
     ) -> None:
         # THE RETRY CASE, and the reason the check runs before any Withings call. robin-backend
-        # retries fulfillWithingsDeviceOrder after a timeout with the SAME
-        # {customerProfileId}#{orderRef}; without this, that ordinary retry creates a second
-        # Withings account and places a SECOND ORDER — a real parcel — before anything here can
-        # object. `provision.assert_not_called()` is the whole point of the test.
+        # retries fulfillWithingsDeviceOrder after a timeout with the SAME customer_ref_id;
+        # without this, that ordinary retry places a SECOND ORDER — a real parcel — before
+        # anything here can object. `provision.assert_not_called()` is the whole point.
+        #
+        # It asks Withings rather than our own tables. The old check looked for a
+        # withings_sdk_account carrying this external_id, which worked only while external_id was
+        # per-order: it is now per member and stable, so "an account exists" is true from a
+        # member's FIRST order onward and would refuse every legitimate second one.
+        already = OrderDetail(order_id="D1", customer_ref_id=_ORDER_REF, status="PROCESSING")
+
+        with patch(_GET_ORDER_DETAIL, return_value=[already]) as detail, patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 409
+        provision.assert_not_called()
+        assert detail.call_args.kwargs["customer_ref_ids"] == [_ORDER_REF]
+
+    def test_a_members_second_order_is_allowed_through(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The positive control for the test above, and the regression the old pre-flight WOULD
+        # have caused. This member already holds a provisioned account under this exact
+        # external_id — the account their first order created, which Withings will reuse — and the
+        # order in the payload is a new one. It must ship.
         connection = UserConnectionFactory(provider="withings", provider_user_id="withings-first")
         db.add(
             WithingsSdkAccount(
@@ -500,18 +537,41 @@ class TestCellularOrderRoute:
                 user_connection_id=connection.id,
                 external_id=_EXTERNAL_ID,
                 csrf_token="csrf-first",
-                # NOT NULL, and with no server default — the model leaves it to the writer, and
-                # `_upsert_sdk_account` always sets it. A fixture that builds the row directly has
-                # to as well; `_connected_member` above does the same.
+                # NOT NULL with no server default; a fixture building the row directly has to set
+                # it, the same way `_upsert_sdk_account` always does.
                 updated_at=connection.updated_at,
             )
         )
         db.commit()
 
-        with patch(_PROVISION_CELLULAR) as provision:
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=connection.id, external_id=_EXTERNAL_ID, csrf_token="csrf-second"
+            ),
+            orders=[DropshipOrderResult(orderid="WO-2", status="PENDING")],
+        )
+
+        with patch(_GET_ORDER_DETAIL, return_value=[]), patch(_PROVISION_CELLULAR, return_value=provisioning):
             response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
 
-        assert response.status_code == 409
+        assert response.status_code == 201, "an existing account must not block a member's second order"
+
+    def test_502_when_the_pre_flight_cannot_reach_withings(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # "We could not find out whether this order exists" and "this order does not exist" are
+        # different facts, and treating the first as the second is precisely how a retry ships
+        # twice. So a failed lookup refuses rather than pushing through.
+        #
+        # 502 and not 409: getdetail changes nothing at Withings, so this IS safe to retry — the
+        # opposite of a 502 from the order call itself, which may have shipped.
+        with (
+            patch(_GET_ORDER_DETAIL, side_effect=WithingsOrderDetailError(detail="upstream down")),
+            patch(_PROVISION_CELLULAR) as provision,
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
         provision.assert_not_called()
 
     def test_409_when_a_concurrent_provisioning_won_the_unique_race(
@@ -575,3 +635,114 @@ class TestCellularOrderRoute:
 
         assert response.status_code == 502
         assert any("WO-STRANDED" in str(record.orders) for record in caplog.records if hasattr(record, "orders"))
+
+
+class TestCellularOrderDetailRoute:
+    """``GET /withings/cellular/orders/{customer_ref_id}`` — where a device MAC comes from.
+
+    The MAC is the field with money attached. ``Devicev2-endpartnerprogram`` ends a member's
+    cellular plan and is addressed by MAC address; ``end_program`` has been written and
+    unreachable since #7 because nothing produced one. The ``createuserorder`` response carries no
+    MAC, this fork stores none, and Withings populate them only once the parcel has shipped — so
+    this route is the first link in the chain that ends a plan, and without it a member who leaves
+    keeps costing us a SIM every month.
+    """
+
+    _URL = "/api/v1/providers/withings/cellular/orders/01K5ZQ8MZ0XJ7R2T4V6W8Y"
+    _LOOKUP = "app.api.routes.v1.withings_sdk.get_order_detail"
+
+    def test_flattens_the_macs_for_the_caller(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Lifted to the top level rather than left inside orders[].products[].devices[]: the
+        # caller hands this straight to owWithingsDisconnect, and burying it three levels down
+        # invites each caller to walk the structure differently.
+        order = OrderDetail.model_validate(
+            {
+                "order_id": "D1",
+                "customer_ref_id": _ORDER_REF,
+                "status": "SHIPPED",
+                "products": [
+                    {"mac_addresses": ["00:24:e4:aa:bb:cc"], "devices": [{"mac_address": "00:24:e4:dd:ee:ff"}]}
+                ],
+            }
+        )
+
+        with patch(self._LOOKUP, return_value=[order]) as lookup:
+            response = client.get(self._URL, headers=api_key_header)
+
+        assert response.status_code == 200
+        assert response.json()["macs"] == ["00:24:e4:aa:bb:cc", "00:24:e4:dd:ee:ff"]
+        assert lookup.call_args.kwargs["customer_ref_ids"] == [_ORDER_REF]
+
+    def test_returns_the_raw_orders_beside_the_macs(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Shipment state is robin-backend's. This fork must not become the thing that decides
+        # which of Withings' fields matter, so the whole answer travels with the convenience one.
+        order = OrderDetail(order_id="D1", customer_ref_id=_ORDER_REF, status="SHIPPED", parcel_status="in_transit")
+
+        with patch(self._LOOKUP, return_value=[order]):
+            body = client.get(self._URL, headers=api_key_header).json()
+
+        assert body["orders"][0]["status"] == "SHIPPED"
+        assert body["orders"][0]["parcel_status"] == "in_transit"
+
+    def test_an_unshipped_order_is_200_with_no_macs(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # Not a 404 and not an error: the order exists, Withings simply have not assigned hardware
+        # to it yet. A caller polling for MACs needs to tell that apart from a reference nobody
+        # knows, which is the next test.
+        order = OrderDetail(order_id="D1", customer_ref_id=_ORDER_REF, status="PROCESSING")
+
+        with patch(self._LOOKUP, return_value=[order]):
+            response = client.get(self._URL, headers=api_key_header)
+
+        assert response.status_code == 200
+        assert response.json()["macs"] == []
+
+    def test_404_when_withings_do_not_know_the_reference(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with patch(self._LOOKUP, return_value=[]):
+            response = client.get(self._URL, headers=api_key_header)
+
+        assert response.status_code == 404
+
+    def test_the_same_mac_on_two_orders_is_returned_once(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # A replacement shipment can repeat a MAC. End of Program is addressed by MAC, so a
+        # duplicate is a second termination call for a device already terminated.
+        shared = {"products": [{"mac_addresses": ["00:24:e4:aa:bb:cc"]}]}
+        orders = [OrderDetail.model_validate(shared), OrderDetail.model_validate(shared)]
+
+        with patch(self._LOOKUP, return_value=orders):
+            body = client.get(self._URL, headers=api_key_header).json()
+
+        assert body["macs"] == ["00:24:e4:aa:bb:cc"]
+
+    def test_502_and_no_address_in_the_body_when_withings_decline(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The response this wraps echoes the order, and an order carries the member's home
+        # address. Same rule the order-placing route follows for its own 4xx detail.
+        with patch(self._LOOKUP, side_effect=WithingsOrderDetailError(withings_status=277)):
+            response = client.get(self._URL, headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "Via Roma" not in response.text
+        assert "277" in response.json()["detail"]
+
+    def test_requires_a_credential(self, client: TestClient, withings_configured: None) -> None:
+        # It reads one member's order — address, carrier, hardware identifiers — from our partner
+        # credentials. ApiKeyDep is the same gate the rest of this module uses.
+        assert client.get(self._URL).status_code in (401, 403)
+
+    def test_503_when_the_deployment_has_no_withings_credentials(
+        self, client: TestClient, api_key_header: dict[str, str]
+    ) -> None:
+        # An operator condition, not a bad request — the same answer the two provisioning routes
+        # give. Deliberately without the `withings_configured` fixture.
+        assert client.get(self._URL, headers=api_key_header).status_code == 503
