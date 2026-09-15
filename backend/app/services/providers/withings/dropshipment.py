@@ -38,7 +38,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult, DropshipUserOrder
-from app.services.providers.withings._body_logging import describe_body
+from app.services.providers.withings._body_logging import describe_body, upstream_reason
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.sdk_users import (
@@ -70,8 +70,13 @@ class WithingsDropshipmentError(RuntimeError):
         withings_status: int | None = None,
         detail: str | None = None,
         already_exists: bool = False,
+        upstream_reason: str | None = None,
     ) -> None:
         self.withings_status = withings_status
+        # Withings' own words for WHY, when they gave any. Carried on the exception so the route
+        # can decide whether it reaches the caller — it does not today; the log is enough, and a
+        # 4xx detail on this route is the one place a leak would reach a client.
+        self.upstream_reason = upstream_reason
         # See WithingsSdkUserError: the account already being ours is the caller's state, not a
         # fault, and the cellular route answers 409 for it rather than 502.
         self.already_exists = already_exists
@@ -196,8 +201,11 @@ def create_user_order(
 
     status = envelope.get("status")
     if status != STATUS_OK:
-        # No body echo: the response to a signed request may repeat our parameters, and those
-        # parameters include the member's email, birth date, weight and home address.
+        # Still no body echo — the response to a signed request repeats our parameters, and those
+        # include the member's email, birth date, weight and home address. But the envelope's own
+        # `error` string names the parameter Withings objected to, and without it a 503 is
+        # undiagnosable: see `upstream_reason`, which is where the reasoning and the bound live.
+        reason = upstream_reason(envelope)
         log_structured(
             logger,
             "error",
@@ -205,8 +213,9 @@ def create_user_order(
             provider="withings",
             task=_ACTION,
             withings_status=status,
+            withings_error=reason,
         )
-        raise WithingsDropshipmentError(withings_status=status)
+        raise WithingsDropshipmentError(withings_status=status, upstream_reason=reason)
 
     body = envelope.get("body") or {}
     user = body.get("user") or {}
