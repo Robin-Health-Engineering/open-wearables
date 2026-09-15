@@ -15,6 +15,7 @@ A parameter name. So it is surfaced, bounded, with the bound justified by the fa
 from __future__ import annotations
 
 from app.services.providers.withings._body_logging import upstream_reason
+from app.services.providers.withings.oauth import WithingsTokenError
 
 
 class TestUpstreamReason:
@@ -38,3 +39,65 @@ class TestUpstreamReason:
         # nothing, so an empty value in a log means "they were silent" and not "we lost it".
         for envelope in ({}, {"error": ""}, {"error": "   "}, {"error": 42}, {"status": 503}, None, "nope", []):
             assert upstream_reason(envelope) is None, envelope
+
+
+class TestSpentRefreshToken:
+    """A dead refresh token must revoke the connection, and Withings do not say so with a status.
+
+    They answer HTTP 200 with `{"status": 503, "error": "Invalid Params: invalid refresh_token"}`.
+    503 is their catch-all Invalid Params — the same code a dropshipment order returns for a
+    missing unit_pref key — so the status alone cannot mean "spent grant" and the reason string is
+    the discriminator.
+
+    Before this, the classifier saw HTTP 200 and an unrecognised status, called it a 500, and left
+    `invalid_grant` False. `_revoke_connection` never ran: the connection stayed ACTIVE with a dead
+    token, sync retried it every cycle, and the member was never prompted to reconnect — 19 events
+    over 5 days on staging with their data silently not syncing (OW-BACKEND-4).
+    """
+
+    def test_a_503_naming_the_refresh_token_is_a_spent_grant(self) -> None:
+        err = WithingsTokenError(
+            task="refresh_access_token",
+            withings_status=503,
+            upstream_reason="Invalid Params: invalid refresh_token",
+        )
+
+        assert err.invalid_grant is True
+        # 401, not 500: the status code has to say "reconnect", not "we broke".
+        assert err.status_code == 401
+
+    def test_a_503_about_anything_else_is_not_a_spent_grant(self) -> None:
+        # The whole reason this is keyed on the reason and not the status. Revoking a member's
+        # connection over an unrelated validation error would disconnect them for someone else's
+        # bug — and this exact string came back from a dropshipment order the same day.
+        err = WithingsTokenError(
+            task="refresh_access_token",
+            withings_status=503,
+            upstream_reason="Invalid Params: [unit] Missing value for: distance",
+        )
+
+        assert err.invalid_grant is False
+
+    def test_a_503_with_no_reason_at_all_is_not_a_spent_grant(self) -> None:
+        # Fails safe: an unexplained 503 leaves the connection alone rather than revoking on a guess.
+        assert WithingsTokenError(task="refresh_access_token", withings_status=503).invalid_grant is False
+
+    def test_it_is_only_a_spent_grant_on_refresh(self) -> None:
+        # The same sentence during a code exchange says nothing about a stored grant, because there
+        # is no stored grant yet.
+        err = WithingsTokenError(
+            task="exchange_code",
+            withings_status=503,
+            upstream_reason="Invalid Params: invalid refresh_token",
+        )
+
+        assert err.invalid_grant is False
+        # And the HTTP status agrees with that verdict rather than contradicting it.
+        assert err.status_code != 401
+
+    def test_the_documented_auth_statuses_still_classify(self) -> None:
+        # The positive control for the change: widening the rule must not have replaced the
+        # existing one.
+        for status in (100, 101, 102, 200, 401):
+            err = WithingsTokenError(task="refresh_access_token", withings_status=status)
+            assert err.invalid_grant is True, status
