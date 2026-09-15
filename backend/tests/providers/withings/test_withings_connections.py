@@ -93,8 +93,10 @@ class TestMemberLinkedConnection:
 
 class TestDeviceConnections:
     def test_returns_every_provisioned_account_oldest_first(self, db: Session) -> None:
-        # A list, not an optional: Withings creates an account on every provisioning path and a
-        # device cannot join one that exists, so a member accumulates one per cellular order.
+        # A list, not an optional. A member holds at most one provisioned account today, but the
+        # shape is what stops a caller writing `the` provisioned connection — historic members can
+        # hold more than one, and the personal-vs-provisioned split is the distinction that
+        # matters. The two rows below are exactly that case.
         user = UserFactory()
         _connection(db, user.id, "withings-personal")
         _connection(db, user.id, "withings-order-1", provisioned=True, created_at=_EARLIER + timedelta(days=1))

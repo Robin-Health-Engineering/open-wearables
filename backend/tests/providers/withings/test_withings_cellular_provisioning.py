@@ -166,16 +166,21 @@ class TestTheTwoHalves:
         assert result.account.external_id == _EXTERNAL_ID
         assert [o.orderid for o in result.orders] == ["WO-1", "WO-2"]
 
-    def test_a_second_order_for_one_member_needs_its_own_external_id(self, db: Session) -> None:
-        # One account per order, so the identifier has to differ per order — the constraint
-        # robin-backend's {profileId}#{orderRef} format exists to satisfy.
+    def test_a_members_second_order_reuses_the_first_orders_account(self, db: Session) -> None:
+        # Withings reuse the account createuserorder made, so a second order comes back with the
+        # same external_id AND the same Withings userid. robin-backend sends a stable external_id
+        # for exactly that reason, and this pins the consequence: one account, one connection,
+        # however many devices a member buys.
+        #
+        # It used to assert the opposite — two of each, under a per-order external_id. That was
+        # the honest reading of the docs and is not what Withings do.
         user = UserFactory()
-        _provision(db, user.id, withings_userid="withings-order-1", external_id="profile-1#order-1")
+        _provision(db, user.id, withings_userid="withings-ours", external_id="profile-1")
 
-        _provision(db, user.id, withings_userid="withings-order-2", external_id="profile-1#order-2")
+        _provision(db, user.id, withings_userid="withings-ours", external_id="profile-1")
 
-        assert db.query(WithingsSdkAccount).count() == 2
-        assert db.query(UserConnection).filter(UserConnection.user_id == user.id).count() == 2
+        assert db.query(WithingsSdkAccount).count() == 1
+        assert db.query(UserConnection).filter(UserConnection.user_id == user.id).count() == 1
 
 
 class TestFailureIsDiscriminable:
