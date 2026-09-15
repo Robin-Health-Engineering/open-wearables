@@ -157,6 +157,49 @@ def test_sync_user_skips_without_retrying_on_invalid_grant(mock_req: MagicMock, 
 
 @patch("app.services.providers.withings.notify_service.withings_callback_url", return_value=_OUR_CALLBACK)
 @patch("app.services.providers.withings.notify_service.withings_request")
+def test_sync_user_skips_on_a_spent_refresh_token_too(mock_req: MagicMock, mock_url: MagicMock) -> None:
+    """The second consumer of the widened `invalid_grant`, pinned as a deliberate outcome.
+
+    Withings answer a spent refresh token with a generic 503 naming the token, so this exception
+    did not report `invalid_grant` before — it fell through to `log_and_capture_error` and reached
+    Sentry. It now takes the skip branch. That is intended: the condition is terminal until the
+    member reconnects, and the revoke that fires alongside it is what asks them to. Asserted so
+    the change stays a decision rather than a quiet drop in event volume (Lucas, #14).
+    """
+    mock_req.side_effect = WithingsTokenError(
+        task="refresh_access_token",
+        withings_status=503,
+        upstream_reason="Invalid Params: invalid refresh_token",
+    )
+    service = _service()
+
+    results = service.sync_user(MagicMock(), uuid4(), LiveSyncMode.WEBHOOK)
+
+    assert mock_req.call_count == 1
+    assert results == [{"status": "skipped", "reason": "invalid_grant"}]
+
+
+@patch("app.services.providers.withings.notify_service.withings_callback_url", return_value=_OUR_CALLBACK)
+@patch("app.services.providers.withings.notify_service.withings_request")
+def test_sync_user_still_reports_an_unrelated_503(mock_req: MagicMock, mock_url: MagicMock) -> None:
+    # The control for the case above: a 503 that does not name the refresh token is an ordinary
+    # error and must keep reaching Sentry. Without this, the widening above is indistinguishable
+    # from "every 503 now goes quiet".
+    mock_req.side_effect = WithingsTokenError(
+        task="refresh_access_token",
+        withings_status=503,
+        upstream_reason="Invalid Params: [unit] Missing value for: distance",
+    )
+    service = _service()
+
+    results = service.sync_user(MagicMock(), uuid4(), LiveSyncMode.WEBHOOK)
+
+    assert results != [{"status": "skipped", "reason": "invalid_grant"}]
+    assert results[0]["status"] == "error"
+
+
+@patch("app.services.providers.withings.notify_service.withings_callback_url", return_value=_OUR_CALLBACK)
+@patch("app.services.providers.withings.notify_service.withings_request")
 def test_sync_user_retries_token_rate_limit(mock_req: MagicMock, mock_url: MagicMock) -> None:
     mock_req.side_effect = WithingsTokenError(task="refresh_access_token", withings_status=601)
     service = _service()
