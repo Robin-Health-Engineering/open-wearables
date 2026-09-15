@@ -14,8 +14,20 @@ A parameter name. So it is surfaced, bounded, with the bound justified by the fa
 
 from __future__ import annotations
 
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from app.models import User
+from app.repositories.user_connection_repository import UserConnectionRepository
+from app.repositories.user_repository import UserRepository
 from app.services.providers.withings._body_logging import upstream_reason
-from app.services.providers.withings.oauth import WithingsTokenError
+from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.oauth import WithingsOAuth, WithingsTokenError
+from tests.providers.withings.test_withings_dropshipment import _call
+
+_OAUTH = "app.services.providers.withings.oauth"
 
 
 class TestUpstreamReason:
@@ -35,8 +47,11 @@ class TestUpstreamReason:
         assert upstream_reason({"error": "Invalid\nParams:\r\n  bad ean"}) == "Invalid Params: bad ean"
 
     def test_absent_or_unusable_gives_none(self) -> None:
-        # None rather than a placeholder: the log field is omitted entirely when Withings said
-        # nothing, so an empty value in a log means "they were silent" and not "we lost it".
+        # None rather than a placeholder. `log_structured` spreads **attributes into the record
+        # without dropping None, so the field is emitted as `"withings_error": null` rather than
+        # omitted — which is the property that matters: null says "we asked and they were silent",
+        # where a placeholder would say "we lost it" and an absent key would say "this log line
+        # predates the field". (ross, #14.)
         for envelope in ({}, {"error": ""}, {"error": "   "}, {"error": 42}, {"status": 503}, None, "nope", []):
             assert upstream_reason(envelope) is None, envelope
 
@@ -101,3 +116,68 @@ class TestSpentRefreshToken:
         for status in (100, 101, 102, 200, 401):
             err = WithingsTokenError(task="refresh_access_token", withings_status=status)
             assert err.invalid_grant is True, status
+
+
+class TestTheReasonSurvivesTheEnvelopeHop:
+    """Pins the WIRING rather than the rule, at both call sites.
+
+    Everything above this class passes with `upstream_reason=reason` deleted from both `raise`
+    statements: the classifier tests construct the exception directly, and the pure-function tests
+    never touch a call site. So the feature was deletable in silence — measured by Lucas on #14,
+    33 passed before and after removing both halves.
+
+    That matters most on the token path, where the deletion is not a lost log line but a restored
+    incident: `upstream_reason` None → `spent_refresh_token` False → `invalid_grant` False →
+    `_revoke_connection` never runs → the connection stays ACTIVE with a dead token (OW-BACKEND-4).
+
+    Both read stdout rather than `caplog`, for the reason `test_withings_partner_body_logging.py`
+    documents: `log_structured` writes to stdout and never touches the Logger.
+    """
+
+    @staticmethod
+    def _entry(captured: str, message_fragment: str) -> dict:
+        return next(
+            json.loads(line)
+            for line in captured.splitlines()
+            if line.strip().startswith("{") and message_fragment in line
+        )
+
+    def test_dropshipment_carries_it_to_the_log_and_the_exception(self, capsys: pytest.CaptureFixture[str]) -> None:
+        response = MagicMock()
+        response.json.return_value = {"status": 503, "error": "Invalid Params: invalid ean", "body": {}}
+        response.raise_for_status.return_value = None
+
+        with pytest.raises(WithingsDropshipmentError) as raised:
+            _call(MagicMock(return_value=response))
+
+        assert raised.value.upstream_reason == "Invalid Params: invalid ean"
+        entry = self._entry(capsys.readouterr().out, "non-zero status")
+        assert entry["withings_error"] == "Invalid Params: invalid ean"
+
+    def test_the_token_endpoint_carries_it_all_the_way_to_the_revoke_decision(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        response = MagicMock()
+        response.json.return_value = {"status": 503, "error": "Invalid Params: invalid refresh_token"}
+        response.raise_for_status.return_value = None
+
+        oauth = WithingsOAuth(
+            user_repo=UserRepository(User),
+            connection_repo=UserConnectionRepository(),
+            provider_name="withings",
+            api_base_url="https://wbsapi.withings.net",
+        )
+
+        with (
+            patch(f"{_OAUTH}.httpx.post", MagicMock(return_value=response)),
+            patch(f"{_OAUTH}.acquire_request_slot"),
+            pytest.raises(WithingsTokenError) as raised,
+        ):
+            oauth._request_token({"action": "requesttoken"}, task="refresh_access_token")
+
+        assert raised.value.upstream_reason == "Invalid Params: invalid refresh_token"
+        # The three assertions that make this the OW-BACKEND-4 guard and not a log-field test.
+        assert raised.value.invalid_grant is True
+        assert raised.value.status_code == 401
+        entry = self._entry(capsys.readouterr().out, "envelope status non-zero")
+        assert entry["withings_error"] == "Invalid Params: invalid refresh_token"

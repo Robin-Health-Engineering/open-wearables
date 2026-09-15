@@ -106,6 +106,15 @@ class WithingsTokenError(HTTPException):
         # exchange_code failure answer 401 while reporting invalid_grant False — harmless today,
         # and exactly the kind of drift between two readings of one fact that this file has been
         # bitten by before.
+        #
+        # `invalid_grant` has a SECOND consumer, and widening it changes that one too: on a failed
+        # `_list_subscriptions`, `notify_service.py` returns `{"status": "skipped", "reason":
+        # "invalid_grant"}` with an info log where a spent-token 503 previously reached Sentry via
+        # `log_and_capture_error`. That is intended, not a side effect — the condition is terminal
+        # until the member reconnects, and now that the revoke actually fires they will be asked
+        # to, so the event was reporting a state we had just stopped being able to act on. Written
+        # down because "fewer Sentry events" and "we stopped hearing about it" look identical six
+        # weeks later (Lucas, #14).
         spent_refresh_token = (
             task == "refresh_access_token"
             and withings_status == _INVALID_REFRESH_TOKEN_STATUS
