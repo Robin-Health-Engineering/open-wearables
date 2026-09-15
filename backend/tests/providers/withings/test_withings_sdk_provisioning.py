@@ -31,6 +31,8 @@ from sqlalchemy.orm import Session
 from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
 from app.models.user_connection import UserConnection
 from app.models.withings_sdk_account import WithingsSdkAccount
+from app.repositories.user_connection_repository import UserConnectionRepository
+from app.schemas.auth import ConnectionStatus
 from app.services.providers.withings.connections import device_connections, member_linked_connection
 from app.services.providers.withings.sdk_provisioning import provision_sdk_account
 from app.services.providers.withings.sdk_users import SdkTokens, SdkUser, WithingsSdkUserError
@@ -214,6 +216,64 @@ class TestProvisionSdkAccount:
         assert connection.refresh_token == "refresh-rotated"
         assert db.query(WithingsSdkAccount).one().csrf_token == "csrf-rotated"
 
+    def test_a_repeat_order_reactivates_a_revoked_connection(self, db: Session) -> None:
+        # A member can remove a device, or Withings can revoke upstream (`_revoke_local_connections`
+        # revokes EVERY Withings connection they hold), and then order again — and Withings hand
+        # back the SAME account, so reuse finds the revoked row.
+        #
+        # Writing live tokens onto a row that stays REVOKED is incoherent AND silent:
+        # `active_withings_connections` filters on ACTIVE, so the new device is invisible to sync
+        # and to `end_program` — the one with a SIM billing every month — while the route answers
+        # 201 and the parcel ships. `ensure_sdk_connection` and `base_oauth` both reactivate on
+        # their reuse paths; this one did not (Lucas, #13).
+        user = UserFactory()
+        _provision(db, user.id, withings_userid="withings-ours")
+        UserConnectionRepository().disconnect(db, user.id, "withings")
+
+        _provision(db, user.id, withings_userid="withings-ours")
+
+        connection = db.query(UserConnection).filter(UserConnection.user_id == user.id).one()
+        assert connection.status == ConnectionStatus.ACTIVE
+        assert connection.access_token == "access-withings-ours"
+        assert len(device_connections(db, user.id)) == 1
+
+    def test_an_account_the_member_linked_themselves_is_not_adopted(self, db: Session) -> None:
+        # `user_connection.py` keeps the three-column index as "the guard if Withings ever ADOPTS
+        # an existing account instead of creating one — that comes back as the same
+        # provider_user_id and fails loudly here". Reuse removes that loud failure unless this
+        # refuses: the member's own connection matches on provider_user_id, carries no
+        # withings_sdk_account row (connections.py: row absent means the member linked it), and
+        # would otherwise have its personal tokens overwritten with partner-minted ones and an SDK
+        # row attached — reclassifying their account as one we provisioned.
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user, provider="withings", provider_user_id="withings-theirs", access_token="their-token"
+        )
+
+        with pytest.raises(WithingsSdkUserError) as exc:
+            _provision(db, user.id, withings_userid="withings-theirs")
+
+        assert exc.value.already_exists is True
+        linked = member_linked_connection(db, user.id)
+        assert linked is not None
+        assert linked.access_token == "their-token", "the member's own tokens survive"
+
+    def test_a_repeat_order_does_not_re_announce_the_connection(self, db: Session) -> None:
+        # robin-backend was told about this connection by the first order; re-firing presents an
+        # existing connection as a new one to every consumer of that webhook.
+        #
+        # The FIRST call is asserted in the same body on purpose. An absence with no positive
+        # control beside it also passes when the announcement stops happening at all — which is
+        # the way this exact test usually rots.
+        user = UserFactory()
+
+        with patch("app.services.providers.withings.sdk_provisioning.on_connection_created") as emit:
+            _provision(db, user.id, withings_userid="withings-ours")
+            assert emit.call_count == 1, "the first provisioning must announce"
+
+            _provision(db, user.id, withings_userid="withings-ours")
+            assert emit.call_count == 1, "the repeat must not re-announce"
+
     def test_the_same_account_under_a_different_external_id_is_refused(self, db: Session) -> None:
         # The limit of reuse, and the reason it is an explicit check rather than a fallthrough.
         # external_id is the join robin-backend resolves an account by; one Withings account
@@ -248,14 +308,14 @@ class TestProvisionSdkAccount:
 class TestSubscriptionScheduling:
     """Provisioning must ask for a Notify subscription, because nothing else will.
 
-    ``WithingsNotifyService`` has been complete since the Notify work landed, but the task that
-    drives it was enqueued from exactly ONE place: the OAuth callback. A provisioned account never
-    goes through OAuth, so a member shipped a cellular device had a connection, live tokens and no
-    subscription — their scale would upload to Withings and nothing would ever tell us a
-    measurement existed.
+    ``WithingsNotifyService`` has been complete since the Notify work landed, but nothing on the
+    PROVISIONING path enqueued it. The two existing enqueue sites are the OAuth callback and the
+    ``register_subscriptions`` fan-out — and a provisioned account never goes through OAuth, while
+    the fan-out has no ``beat_schedule`` entry and runs only when an operator hits the admin route
+    or changes the live-sync mode.
 
     It failed silently in both directions. A missing subscription looks exactly like a member who
-    has not stepped on the scale, and there is no periodic reconcile to heal it.
+    has not stepped on the scale, so nothing surfaced it until someone went looking.
     """
 
     def test_provisioning_schedules_the_subscription_sync(self, db: Session) -> None:

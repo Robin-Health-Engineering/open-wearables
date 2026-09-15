@@ -39,6 +39,7 @@ from app.database import DbSession
 from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
 from app.models.user_connection import UserConnection
 from app.models.withings_sdk_account import WithingsSdkAccount
+from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionCreate
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
@@ -100,12 +101,15 @@ def _schedule_subscription_sync(user_id: UUID) -> None:
     """Ask the webhook worker to reconcile this member's Withings subscriptions.
 
     **The gap this closes.** ``WithingsNotifyService`` has been complete since the Notify work
-    landed, but the task that drives it was enqueued from exactly ONE place — the OAuth callback.
-    A provisioned account never goes through OAuth, so a member shipped a cellular device had a
-    connection, live tokens, and no Notify subscription: their scale would upload to Withings and
-    nothing would ever tell us a measurement existed. Nothing reported it either, because a
-    missing subscription looks exactly like a member who has not stepped on the scale, and there
-    is no periodic reconcile to heal it.
+    landed, but nothing on the PROVISIONING path enqueued it. The two existing enqueue sites are
+    the OAuth callback (``oauth.py:178``) and the ``register_subscriptions`` fan-out
+    (``notify_service.py:82``) — and a provisioned account never goes through OAuth, while the
+    fan-out is **not periodic**: it has no ``beat_schedule`` entry, and runs only when an operator
+    hits the admin route or changes the live-sync mode. So a member shipped a cellular device had
+    a connection, live tokens and no Notify subscription: their scale would upload to Withings and
+    nothing would ever tell us a measurement existed, until an operator did something unrelated.
+    Nothing reported it either, because a missing subscription looks exactly like a member who has
+    not stepped on the scale.
 
     Fire-and-forget, and unconditional on the gating the OAuth callback applies. The task itself
     reads the configured live-sync mode and returns ``skipped`` when it is not WEBHOOK, so
@@ -202,14 +206,28 @@ def _store_provisioned_account(
     )
     reused = existing is not None
     if existing is not None:
-        # REUSE means the same account under the same name. If this connection already carries a
-        # DIFFERENT external_id, the two identifiers have come apart — one Withings account is
-        # being provisioned under two names, or one name has been pointed at two accounts — and
-        # the right answer is to refuse rather than to quietly rewrite the row. `external_id` is
-        # the join robin-backend resolves an account by; silently moving it breaks that link with
-        # no error anywhere, which is strictly worse than a 409 on an order that can be reconciled.
+        # REUSE means the same account, under the same name, and an account that is OURS. Two
+        # ways that can fail, and both refuse rather than rewrite:
+        #
+        # * NO `withings_sdk_account` row — per `withings/connections.py` that is the
+        #   discriminator for the opposite thing: "Row present means we created the account; row
+        #   absent means the member did." Falling through would overwrite the member's own tokens
+        #   with partner-minted ones and then attach an SDK row, silently reclassifying their
+        #   account as one we provisioned — the incident this module exists to prevent, reached
+        #   through a different door. It is also the case `user_connection.py` keeps the
+        #   three-column index for ("the guard if Withings ever ADOPTS an existing account …
+        #   fails loudly here"), and before the reuse branch the unconditional insert delivered
+        #   that loud failure. It has to stay loud (Lucas, #13).
+        # * a DIFFERENT external_id — the two identifiers have come apart. `external_id` is the
+        #   join robin-backend resolves an account by; silently moving it breaks that link with no
+        #   error anywhere, which is strictly worse than a 409 someone can reconcile.
         held = db.query(WithingsSdkAccount).filter(WithingsSdkAccount.user_connection_id == existing.id).one_or_none()
-        if held is not None and held.external_id != external_id:
+        if held is None:
+            raise store_error(
+                detail="this Withings account is the member's own linked connection, not one we provisioned",
+                already_exists=True,
+            )
+        if held.external_id != external_id:
             raise store_error(
                 detail="this Withings account is already provisioned under a different external_id",
                 already_exists=True,
@@ -220,6 +238,16 @@ def _store_provisioned_account(
         existing.refresh_token = tokens.refresh_token
         existing.token_expires_at = expires_at
         existing.scope = tokens.scope
+        # REVOKED is an ORDINARY state on this path, not an exotic one. A member who disconnected
+        # a device and then ordered another comes back to the same Withings account, and
+        # `_revoke_local_connections` revokes EVERY Withings connection a member has when Withings
+        # revoke upstream. Leaving the row revoked while writing live tokens onto it is incoherent
+        # and silent: `active_withings_connections` filters on ACTIVE, so the new device is
+        # invisible to sync AND to `end_program` — the one with a SIM billing every month — while
+        # the route answers 201 and the parcel ships. `ensure_sdk_connection` and `base_oauth`
+        # both reactivate on their own reuse paths; this was the outlier (Lucas, #13).
+        existing.status = ConnectionStatus.ACTIVE
+        existing.updated_at = datetime.now(timezone.utc)
         connection = existing
     else:
         connection = UserConnection(

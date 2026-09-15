@@ -56,9 +56,10 @@ class DropshipOrder(BaseModel):
     """One order: an address and the products going to it.
 
     ``customer_ref_id`` is OURS and must be unique per order. It is the join back to the
-    robin-backend row that owns this order's status, and it is also the suffix of the
-    ``external_id`` we send for the account — so the same value ties the Withings account, the
-    Withings order and our own record together.
+    robin-backend row that owns this order's status, and it is what Withings name in their
+    dropshipment notifications — so it, and not ``external_id``, is what ties a shipment to one
+    of our records. It briefly WAS the suffix of ``external_id``; that stopped being true when
+    the account became per member rather than per order.
     """
 
     customer_ref_id: str = Field(max_length=64)

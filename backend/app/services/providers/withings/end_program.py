@@ -43,8 +43,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.services.providers.withings._body_logging import describe_body
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
-from app.services.providers.withings.oauth import describe_body
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.sdk_users import STATUS_OK
 from app.services.providers.withings.signature import sign_payload

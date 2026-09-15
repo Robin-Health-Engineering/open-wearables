@@ -38,8 +38,8 @@ import httpx
 from pydantic import ValidationError
 
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult, DropshipUserOrder
+from app.services.providers.withings._body_logging import describe_body
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
-from app.services.providers.withings.oauth import describe_body
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.sdk_users import (
     SHORTNAME_RE,

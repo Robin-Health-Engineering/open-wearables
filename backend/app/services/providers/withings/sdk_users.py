@@ -25,8 +25,9 @@ from typing import Any
 
 import httpx
 
+from app.services.providers.withings._body_logging import describe_body
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL
-from app.services.providers.withings.oauth import describe_body, redact_body
+from app.services.providers.withings.oauth import redact_body
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.services.providers.withings.signature import sign_payload
 from app.utils.structured_logging import log_structured

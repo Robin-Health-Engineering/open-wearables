@@ -75,9 +75,10 @@ def member_linked_connection(db: DbSession, user_id: UUID) -> UserConnection | N
 def device_connections(db: DbSession, user_id: UUID) -> list[UserConnection]:
     """The accounts WE created in order to ship this member a device, oldest first.
 
-    A list, not an optional. Withings creates an account on every provisioning path and a device
-    cannot be added to an account that already exists, so a member accumulates one of these per
-    cellular order.
+    A list, not an optional. A member holds at most one provisioned account today — Withings
+    reuse the one createuserorder made on their later orders — but the shape is what stops a
+    caller writing ``the`` provisioned connection: historic members can hold more than one, and
+    what matters here is the personal-versus-provisioned split, not the count.
     """
     connections = active_withings_connections(db, user_id)
     provisioned = _provisioned_connection_ids(db, [c.id for c in connections])

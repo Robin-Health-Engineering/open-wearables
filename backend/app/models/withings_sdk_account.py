@@ -19,11 +19,12 @@ class WithingsSdkAccount(BaseDbModel):
     * ``external_id`` is the identifier WE minted for this account, and the join back to the
       member; nothing in the other twelve providers has an equivalent.
 
-    Hangs off ONE ``user_connection``, and a member can have several — their own linked
-    Withings account, plus an account we created for each cellular order, because Withings
-    creates an account on every provisioning path and a device cannot join one that already
-    exists. So there is one of these rows per account we provisioned — at most two per member,
-    theirs and ours.
+    Hangs off ONE ``user_connection``. A member can hold two Withings CONNECTIONS — their own
+    linked account and the one we created — but at most ONE of these rows: a consumer-OAuth
+    callback never writes one, which is exactly what makes presence the discriminator
+    (``withings/connections.py``: "Row present means we created the account; row absent means the
+    member did"). Their later orders ship to the account their first one created rather than
+    making another, so the count does not grow with orders either.
 
     ``external_id`` is the value WE minted and is the join back to the member, and it is the bare
     CustomerProfile id: stable across that member's orders, because Withings reuse the account

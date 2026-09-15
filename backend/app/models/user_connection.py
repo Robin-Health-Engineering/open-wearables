@@ -22,9 +22,14 @@ class UserConnection(BaseDbModel):
         #
         # Withings is why. A cellular device cannot be activated onto an account the partner did
         # not create, so a member who links their own Withings account and is then shipped a
-        # device legitimately holds two accounts — and another for every later order. The
-        # two-column form forbade that, and provisioning resolved the collision by overwriting,
-        # which silently stopped the member's own scale and watch from syncing.
+        # device legitimately holds two accounts. The two-column form forbade that, and
+        # provisioning resolved the collision by overwriting, which silently stopped the member's
+        # own scale and watch from syncing.
+        #
+        # TWO, not one per order: Withings reuse the account createuserorder made on that
+        # member's later orders (confirmed 2026-09-15), so provisioning REUSES the matching
+        # connection rather than adding one. See `sdk_provisioning._store_provisioned_account`,
+        # which is also where the "fails loudly" promise below is kept.
         #
         # Still unique, and deliberately: two rows for the SAME provider account on the same
         # member is a bug worth a constraint. It is also the guard if Withings ever ADOPTS an

@@ -291,11 +291,18 @@ def create_withings_cellular_order(
     # authority, and it is the difference between a retry costing a round trip and a retry costing
     # a second parcel.
     #
-    # It is NOT best-effort: a getdetail that fails is answered 502 rather than shrugged off and
-    # pushed through. "We could not find out whether this order exists" and "this order does not
-    # exist" are different facts, and treating the first as the second is precisely how a retry
-    # ships twice. getdetail changes nothing at Withings, so a 502 here is safe to retry — which
-    # is the opposite of a 502 from the order call itself.
+    # It is NOT best-effort. "We could not find out whether this order exists" and "this order
+    # does not exist" are different facts, and treating the first as the second is precisely how a
+    # retry ships twice — so every failure REFUSES, and only an empty answer falls through.
+    #
+    # The refusal is not always this 502, and the difference is worth knowing when reading logs:
+    # `acquire_request_slot()` sits outside `get_order_detail`'s try, so an exhausted shared
+    # Withings budget escapes as 429 and an unreachable Redis as 503, neither reaching the handler
+    # below. Three answers, one property — nothing degrades to "no order, ship it". The 429 is not
+    # hypothetical now that the pre-flight spends a slot on every fulfilment (Lucas, #13).
+    #
+    # 502 rather than 409 because getdetail changes nothing at Withings: this one IS safe to
+    # retry, which is the opposite of a 502 from the order call itself.
     refs = [order.customer_ref_id for order in payload.orders]
     try:
         placed = get_order_detail(
@@ -304,9 +311,14 @@ def create_withings_cellular_order(
             customer_ref_ids=refs,
         )
     except WithingsOrderDetailError as e:
+        # `withings_status` is None for everything except a non-zero Withings envelope — the HTTP
+        # and transport branches construct the error with `detail=` only — so the message is
+        # carried too rather than leaving an uninformative line at the place someone looks first.
+        # It is safe to echo for the reason audited on the branch below: every `detail=` handed to
+        # a WithingsOrderDetailError is a fixed string this codebase writes, never a response body.
         logger.error(
             "Withings cellular order: could not check whether the order was already placed",
-            extra={"withings_status": e.withings_status},
+            extra={"withings_status": e.withings_status, "reason": str(e)},
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
