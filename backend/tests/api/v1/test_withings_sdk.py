@@ -25,6 +25,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.orm import Session
@@ -390,6 +391,213 @@ class TestCellularOrderRoute:
         assert [type(o) for o in orders] == [DropshipOrder]
         assert orders[0].customer_ref_id == "01K5ZQ8MZ0XJ7R2T4V6W8Y"
         assert orders[0].address.country == "IT"
+
+    def test_an_order_with_no_orderid_is_resolved_from_getdetail(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+        withings_configured: None,
+    ) -> None:
+        """The 2026-09-16 shape: status 0, a real order, and no `orderid` on it.
+
+        Withings answered a LIVE createuserorder this way and a device shipped against order
+        `D0820568`. The documented example has `orderid` present, so nothing in the contract said
+        to expect this — and the caller reads a missing id as "no order was placed", which is the
+        opposite of the truth and leaves a parcel nothing can name.
+        """
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+        # A local patch shadows the class-wide autouse stub: empty for the pre-flight, then the
+        # placed order for the resolve. The order mirrors the real sequence.
+        detail = [
+            [],
+            [OrderDetail(order_id="D0820568", customer_ref_id="01K5ZQ8MZ0XJ7R2T4V6W8Y", status="VERIFIED")],
+        ]
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning), patch(_GET_ORDER_DETAIL, side_effect=detail):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert [o["orderid"] for o in response.json()["orders"]] == ["D0820568"]
+
+    def test_a_resolvable_id_costs_no_extra_call_when_withings_already_sent_one(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+        withings_configured: None,
+    ) -> None:
+        # The common path must not spend a second signed request — the Withings budget is shared
+        # and the pre-flight already spends one per fulfilment. One call, the pre-flight's.
+        with (
+            patch(_PROVISION_CELLULAR, return_value=_provisioning()),
+            patch(_GET_ORDER_DETAIL, return_value=[]) as detail,
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert detail.call_count == 1
+
+    def test_the_order_still_comes_back_when_the_resolve_fails(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+        withings_configured: None,
+    ) -> None:
+        # By the time this runs the order is placed and the csrf_token is single-use. Raising here
+        # would lose the member their account to save a field — so a failed resolve degrades to
+        # the id-less order, which is exactly what Withings said.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+        detail = [[], WithingsOrderDetailError(withings_status=503)]
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning), patch(_GET_ORDER_DETAIL, side_effect=detail):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert response.json()["csrf_token"] == "csrf-new"
+        assert [o["orderid"] for o in response.json()["orders"]] == [None]
+
+    def test_the_order_still_comes_back_when_the_budget_is_exhausted(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        """The escape that actually threatens the account, and it is not this module's own error.
+
+        `get_order_detail` calls `acquire_request_slot()` outside its try, so an exhausted Withings
+        budget leaves as `HTTPException` 429 — and the pre-flight on this very request has already
+        spent a slot, so it is the likely failure rather than a theoretical one. Uncaught it
+        escapes AFTER the order shipped and the single-use csrf_token was minted, which loses the
+        member their account to enrich a field (ross, #15).
+        """
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+        budget_exhausted = HTTPException(status_code=429, detail="Withings request budget exhausted")
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], budget_exhausted]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201, "a 429 on an optional enrichment must not become the answer"
+        assert response.json()["csrf_token"] == "csrf-new"
+
+    def test_the_order_still_comes_back_when_signing_fails_on_the_resolve(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The other way out that is not a WithingsOrderDetailError: `sign_payload` also sits outside
+        # that try. Different cause, identical stake — so the catch is on Exception, and this is the
+        # case that stops it being narrowed back to a tidy-looking union.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], RuntimeError("could not sign the payload")]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert response.json()["csrf_token"] == "csrf-new"
+
+    def test_it_fills_nothing_when_withings_know_no_order_for_the_ref(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        """Pins the SECOND half of the match guard, which nothing else here reaches.
+
+        `getdetail` can succeed and still know nothing for a ref `createuserorder` acknowledged
+        seconds earlier — the same race this PR exists for, one step later. It also happens
+        whenever every id it returns is one we already hold.
+
+        Delete ` and len(unaccounted) == 1` from the guard and every other test in this class still
+        passes, while `unaccounted[0]` becomes an IndexError on an empty list — raised OUTSIDE the
+        try, which wraps only the `get_order_detail` call. That escapes, 500s the handler, and
+        loses the member the account that was just created with the parcel already committed:
+        exactly the outcome the docstring's first bullet forbids, reached through the match rather
+        than through the call (Lucas, #15).
+        """
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], []]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert response.json()["csrf_token"] == "csrf-new"
+        assert [o["orderid"] for o in response.json()["orders"]] == [None]
+
+    def test_it_fills_nothing_when_every_id_getdetail_knows_is_one_we_hold(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The other way to reach an empty `unaccounted` with one order still missing: two orders,
+        # one already identified, and getdetail answering only about that one. Same IndexError, and
+        # it does not need a race to happen.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid="D0820568"), DropshipOrderResult(orderid=None)],
+        )
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], [OrderDetail(order_id="D0820568", customer_ref_id="ref-a")]]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert [o["orderid"] for o in response.json()["orders"]] == ["D0820568", None]
+
+    def test_it_refuses_to_guess_which_parcel_an_id_belongs_to(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+        withings_configured: None,
+    ) -> None:
+        # createuserorder echoes no customer_ref_id on its order entries, so with two unidentified
+        # orders the only link is position. Writing one parcel's id onto another is invisible until
+        # someone terminates the wrong device, so the ambiguous case fills nothing.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED"), DropshipOrderResult(orderid=None)],
+        )
+        detail = [
+            [],
+            [
+                OrderDetail(order_id="D0820568", customer_ref_id="ref-a"),
+                OrderDetail(order_id="D0820569", customer_ref_id="ref-b"),
+            ],
+        ]
+
+        with patch(_PROVISION_CELLULAR, return_value=provisioning), patch(_GET_ORDER_DETAIL, side_effect=detail):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert [o["orderid"] for o in response.json()["orders"]] == [None, None]
 
     def test_requires_authentication(self, client: TestClient) -> None:
         response = client.post(_CELLULAR_URL, json=_valid_cellular_payload())
