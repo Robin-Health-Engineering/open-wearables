@@ -20,6 +20,7 @@ from app.schemas.model_crud.credentials import (
     ProviderEndpoints,
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.withings._body_logging import upstream_reason
 from app.services.providers.withings.request_budget import acquire_request_slot
 from app.utils.structured_logging import log_structured
 
@@ -60,6 +61,23 @@ _TOKEN_CLIENT_ERROR_STATUSES = {247, 250, 283, 286, 293, 303, 304, 342}
 _AUTHENTICATION_FAILED_STATUSES = {100, 101, 102, 200, 401}
 _RATE_LIMIT_STATUS = 601
 
+# Withings also retire a refresh token with a GENERIC status and a specific sentence:
+#
+#     HTTP 200, {"status": 503, "error": "Invalid Params: invalid refresh_token"}
+#
+# 503 alone cannot mean "spent grant" — it is their catch-all Invalid Params, the same code a
+# dropshipment order returns for a missing unit_pref key — so the reason string is the only thing
+# that separates a dead token from an unrelated validation error. Matched on the token NAME rather
+# than on the whole sentence, which is theirs to reword.
+#
+# Until this existed the classifier saw HTTP 200 and a status outside every set, called it a 500,
+# and left `invalid_grant` False. `_revoke_connection` therefore never ran: the connection stayed
+# ACTIVE with a dead token, `sync_vendor_data` retried it every cycle, and the member was never
+# prompted to reconnect. Nineteen Sentry events over five days on staging, with their Withings data
+# silently not syncing the whole time (OW-BACKEND-4).
+_INVALID_REFRESH_TOKEN_STATUS = 503
+_INVALID_REFRESH_TOKEN_MARKER = "refresh_token"
+
 # Preserve the short-lived authorization code by bounding request-budget wait time.
 _EXCHANGE_MAX_WAIT_SECONDS = 5
 
@@ -74,14 +92,38 @@ class WithingsTokenError(HTTPException):
         withings_status: int | None = None,
         http_status: int | None = None,
         detail: str | None = None,
+        upstream_reason: str | None = None,
     ) -> None:
         self.withings_status = withings_status
         self.http_status = http_status
+        self.upstream_reason = upstream_reason
         authentication_failed = withings_status in _AUTHENTICATION_FAILED_STATUSES or http_status in {400, 401}
-        self.invalid_grant = task == "refresh_access_token" and authentication_failed
+        # See _INVALID_REFRESH_TOKEN_STATUS: a generic 503 whose reason names the refresh token is
+        # a spent grant, and nothing else about a 503 is.
+        #
+        # Scoped to the refresh task in the CONDITION rather than only where invalid_grant is set,
+        # so the HTTP status below cannot disagree with it. Computing it task-independently made an
+        # exchange_code failure answer 401 while reporting invalid_grant False — harmless today,
+        # and exactly the kind of drift between two readings of one fact that this file has been
+        # bitten by before.
+        #
+        # `invalid_grant` has a SECOND consumer, and widening it changes that one too: on a failed
+        # `_list_subscriptions`, `notify_service.py` returns `{"status": "skipped", "reason":
+        # "invalid_grant"}` with an info log where a spent-token 503 previously reached Sentry via
+        # `log_and_capture_error`. That is intended, not a side effect — the condition is terminal
+        # until the member reconnects, and now that the revoke actually fires they will be asked
+        # to, so the event was reporting a state we had just stopped being able to act on. Written
+        # down because "fewer Sentry events" and "we stopped hearing about it" look identical six
+        # weeks later (Lucas, #14).
+        spent_refresh_token = (
+            task == "refresh_access_token"
+            and withings_status == _INVALID_REFRESH_TOKEN_STATUS
+            and _INVALID_REFRESH_TOKEN_MARKER in (upstream_reason or "").lower()
+        )
+        self.invalid_grant = spent_refresh_token or (task == "refresh_access_token" and authentication_failed)
         if withings_status == _RATE_LIMIT_STATUS or http_status == 429:
             status_code = 429
-        elif authentication_failed:
+        elif authentication_failed or spent_refresh_token:
             status_code = 401
         elif withings_status in _TOKEN_CLIENT_ERROR_STATUSES or (http_status is not None and http_status < 500):
             status_code = 400
@@ -283,6 +325,7 @@ class WithingsOAuth(BaseOAuthTemplate):
 
         status = envelope.get("status")
         if status != 0:
+            reason = upstream_reason(envelope)
             log_structured(
                 logger,
                 "error",
@@ -290,8 +333,9 @@ class WithingsOAuth(BaseOAuthTemplate):
                 provider=self.provider_name,
                 task=task,
                 withings_status=status,
+                withings_error=reason,
             )
-            raise WithingsTokenError(task=task, withings_status=status)
+            raise WithingsTokenError(task=task, withings_status=status, upstream_reason=reason)
 
         body = envelope.get("body", {})
         # Stash the raw body for callers that need a field OAuthTokenResponse does not model.

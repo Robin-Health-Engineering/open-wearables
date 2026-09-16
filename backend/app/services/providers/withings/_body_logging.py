@@ -31,3 +31,30 @@ def describe_body(text: str | None) -> str:
     whose responses echo the member's own data. Use `redact_body` only on the token endpoint.
     """
     return f"{len(text or '')} bytes, not logged (may echo member data)"
+
+
+# Withings' envelope on a non-zero status is `{"status": N, "error": "...", "body": {...}}`, and the
+# `error` string is the ONLY thing that says which parameter they objected to. Measured, not
+# assumed: a real 503 from the token endpoint carried
+# `{"body":{},"error":"Invalid Params: invalid refresh_token","status":503}` — a parameter NAME, no
+# member data.
+#
+# Withholding it made a diagnosable failure undiagnosable. A cellular order came back 503 on
+# staging and it took a Sentry frame-locals dump and an hour of reading Withings' OpenAPI document
+# to get no further than "some parameter is wrong", because the one sentence naming it had been
+# dropped one line from where it was received.
+#
+# Bounded and stripped of newlines all the same: it is an upstream string, and the guarantee that
+# it only ever names parameters is Withings' to keep, not ours. If they ever echo a submitted value
+# the cap limits what lands in a log line, and `describe_body` above remains the rule for the BODY.
+_MAX_UPSTREAM_REASON = 200
+
+
+def upstream_reason(envelope: object) -> str | None:
+    """Withings' own `error` string from a response envelope, bounded — or None if absent."""
+    if not isinstance(envelope, dict):
+        return None
+    reason = envelope.get("error")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return " ".join(reason.split())[:_MAX_UPSTREAM_REASON]
