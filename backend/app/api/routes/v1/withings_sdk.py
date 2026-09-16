@@ -302,10 +302,20 @@ def _fill_missing_order_ids(
         )
         return
 
+    # The candidates are carried, not just counted: this line fires exactly when a human has to
+    # reconcile, and without them they would re-run `getdetail` with these refs to learn what was
+    # already in hand — another signed request against the shared budget, and a step they may not
+    # know is available. Withings' own references, so nothing about the PII posture changes (Lucas,
+    # #15).
     logger.error(
         "Withings acknowledged an order with no orderid and it cannot be matched unambiguously — "
         "the order IS placed; recover it by customer_ref_id",
-        extra={"customer_ref_ids": refs, "missing": len(missing), "unaccounted": len(unaccounted)},
+        extra={
+            "customer_ref_ids": refs,
+            "missing": len(missing),
+            "unaccounted": len(unaccounted),
+            "candidates": [{"order_id": d.order_id, "customer_ref_id": d.customer_ref_id} for d in unaccounted],
+        },
     )
 
 

@@ -515,6 +515,61 @@ class TestCellularOrderRoute:
         assert response.status_code == 201
         assert response.json()["csrf_token"] == "csrf-new"
 
+    def test_it_fills_nothing_when_withings_know_no_order_for_the_ref(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        """Pins the SECOND half of the match guard, which nothing else here reaches.
+
+        `getdetail` can succeed and still know nothing for a ref `createuserorder` acknowledged
+        seconds earlier — the same race this PR exists for, one step later. It also happens
+        whenever every id it returns is one we already hold.
+
+        Delete ` and len(unaccounted) == 1` from the guard and every other test in this class still
+        passes, while `unaccounted[0]` becomes an IndexError on an empty list — raised OUTSIDE the
+        try, which wraps only the `get_order_detail` call. That escapes, 500s the handler, and
+        loses the member the account that was just created with the parcel already committed:
+        exactly the outcome the docstring's first bullet forbids, reached through the match rather
+        than through the call (Lucas, #15).
+        """
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], []]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert response.json()["csrf_token"] == "csrf-new"
+        assert [o["orderid"] for o in response.json()["orders"]] == [None]
+
+    def test_it_fills_nothing_when_every_id_getdetail_knows_is_one_we_hold(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The other way to reach an empty `unaccounted` with one order still missing: two orders,
+        # one already identified, and getdetail answering only about that one. Same IndexError, and
+        # it does not need a race to happen.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid="D0820568"), DropshipOrderResult(orderid=None)],
+        )
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], [OrderDetail(order_id="D0820568", customer_ref_id="ref-a")]]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert [o["orderid"] for o in response.json()["orders"]] == ["D0820568", None]
+
     def test_it_refuses_to_guess_which_parcel_an_id_belongs_to(
         self,
         client: TestClient,
