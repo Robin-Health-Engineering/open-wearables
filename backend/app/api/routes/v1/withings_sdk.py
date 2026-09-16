@@ -223,6 +223,75 @@ class CellularOrderResponse(BaseModel):
     orders: list[DropshipOrderResult]
 
 
+def _fill_missing_order_ids(orders: list[DropshipOrderResult], refs: list[str]) -> None:
+    """Resolve an order id Withings acknowledged the order WITHOUT, by asking getdetail.
+
+    Withings answered a live `createuserorder` with status 0 and an order entry carrying no
+    `orderid` (2026-09-16, order `D0820568`). The order was real and a device shipped against it;
+    `getdetail` on the same `customer_ref_id` returned the id seconds later. The documented
+    response example shows `orderid` present, so this is an undocumented shape rather than a
+    parsing mistake — we read the right key and it was not there.
+
+    **What made that expensive is what the CALLER does with an id-less order.** robin-backend
+    treats a missing id as "no order was placed" and records a fulfilment failure, which is the
+    correct reading of the documented contract and the exact opposite of the truth: the parcel was
+    already on its way, with nothing in our systems naming it. The device MAC — the only thing
+    `Devicev2-endpartnerprogram` can be addressed by — is fetched against that order, so an
+    untracked order is a SIM that cannot be terminated when the member leaves.
+
+    So the contract this route offers is tightened rather than the caller being taught the
+    exception: an order in the response carries its id whenever Withings know one.
+
+    Two things it deliberately does NOT do:
+
+    * **It never raises.** The order exists by the time this runs, and the `csrf_token` beside it
+      is single-use — failing here would lose the member's account to save a field. A resolve that
+      fails logs and returns; the caller gets what Withings actually said.
+    * **It never guesses which order is which.** `createuserorder` echoes no `customer_ref_id` on
+      its order entries, so with several orders in flight the only link is position, and a wrong
+      pairing writes one parcel's id onto another — invisible until someone terminates the wrong
+      device. It fills only the unambiguous case (one unidentified order, one unaccounted-for ref)
+      and logs the rest for a human.
+
+    Note the field names differ by endpoint and that is not a typo here: `createuserorder` answers
+    `orderid`, `getdetail` answers `order_id`.
+    """
+    missing = [order for order in orders if not order.orderid]
+    if not missing:
+        return
+
+    try:
+        known = get_order_detail(
+            client_id=settings.withings_client_id,
+            client_secret=settings.withings_client_secret.get_secret_value(),
+            customer_ref_ids=refs,
+        )
+    except WithingsOrderDetailError as e:
+        logger.error(
+            "Withings acknowledged an order with no orderid and getdetail could not resolve it — "
+            "the order IS placed; recover it by customer_ref_id",
+            extra={"withings_status": e.withings_status, "reason": str(e), "customer_ref_ids": refs},
+        )
+        return
+
+    already = {order.orderid for order in orders if order.orderid}
+    unaccounted = [detail for detail in known if detail.order_id and detail.order_id not in already]
+
+    if len(missing) == 1 and len(unaccounted) == 1:
+        missing[0].orderid = unaccounted[0].order_id
+        logger.warning(
+            "Withings acknowledged an order with no orderid; resolved it from getdetail",
+            extra={"customer_ref_id": unaccounted[0].customer_ref_id, "order_id": unaccounted[0].order_id},
+        )
+        return
+
+    logger.error(
+        "Withings acknowledged an order with no orderid and it cannot be matched unambiguously — "
+        "the order IS placed; recover it by customer_ref_id",
+        extra={"customer_ref_ids": refs, "missing": len(missing), "unaccounted": len(unaccounted)},
+    )
+
+
 @router.post(
     "/withings/cellular/orders",
     summary="Create a Withings account and ship a cellular device to the member",
@@ -442,6 +511,11 @@ def create_withings_cellular_order(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Withings returned no csrf_token; the account cannot open a WebView",
         )
+
+    # After the csrf_token guard, not before it: that branch already logs the order ids and
+    # raises, so a resolve there would spend a Withings request to enrich a value about to be
+    # discarded.
+    _fill_missing_order_ids(result.orders, refs)
 
     return CellularOrderResponse(
         external_id=result.account.external_id,
