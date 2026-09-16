@@ -25,6 +25,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.orm import Session
@@ -410,8 +411,6 @@ class TestCellularOrderRoute:
             ),
             orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
         )
-        # Empty for the pre-flight, then the placed order for the resolve — the same stub answers
-        # both calls, so the order of these matters and mirrors the real sequence.
         # A local patch shadows the class-wide autouse stub: empty for the pre-flight, then the
         # placed order for the resolve. The order mirrors the real sequence.
         detail = [
@@ -465,6 +464,56 @@ class TestCellularOrderRoute:
         assert response.status_code == 201
         assert response.json()["csrf_token"] == "csrf-new"
         assert [o["orderid"] for o in response.json()["orders"]] == [None]
+
+    def test_the_order_still_comes_back_when_the_budget_is_exhausted(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        """The escape that actually threatens the account, and it is not this module's own error.
+
+        `get_order_detail` calls `acquire_request_slot()` outside its try, so an exhausted Withings
+        budget leaves as `HTTPException` 429 — and the pre-flight on this very request has already
+        spent a slot, so it is the likely failure rather than a theoretical one. Uncaught it
+        escapes AFTER the order shipped and the single-use csrf_token was minted, which loses the
+        member their account to enrich a field (ross, #15).
+        """
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+        budget_exhausted = HTTPException(status_code=429, detail="Withings request budget exhausted")
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], budget_exhausted]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201, "a 429 on an optional enrichment must not become the answer"
+        assert response.json()["csrf_token"] == "csrf-new"
+
+    def test_the_order_still_comes_back_when_signing_fails_on_the_resolve(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The other way out that is not a WithingsOrderDetailError: `sign_payload` also sits outside
+        # that try. Different cause, identical stake — so the catch is on Exception, and this is the
+        # case that stops it being narrowed back to a tidy-looking union.
+        provisioning = CellularProvisioning(
+            account=WithingsSdkAccount(
+                id=uuid4(), user_connection_id=uuid4(), external_id=_EXTERNAL_ID, csrf_token="csrf-new"
+            ),
+            orders=[DropshipOrderResult(orderid=None, status="VERIFIED")],
+        )
+
+        with (
+            patch(_PROVISION_CELLULAR, return_value=provisioning),
+            patch(_GET_ORDER_DETAIL, side_effect=[[], RuntimeError("could not sign the payload")]),
+        ):
+            response = client.post(_CELLULAR_URL, json=_valid_cellular_payload(), headers=api_key_header)
+
+        assert response.status_code == 201
+        assert response.json()["csrf_token"] == "csrf-new"
 
     def test_it_refuses_to_guess_which_parcel_an_id_belongs_to(
         self,

@@ -223,7 +223,9 @@ class CellularOrderResponse(BaseModel):
     orders: list[DropshipOrderResult]
 
 
-def _fill_missing_order_ids(orders: list[DropshipOrderResult], refs: list[str]) -> None:
+def _fill_missing_order_ids(
+    orders: list[DropshipOrderResult], refs: list[str], *, client_id: str, client_secret: str
+) -> None:
     """Resolve an order id Withings acknowledged the order WITHOUT, by asking getdetail.
 
     Withings answered a live `createuserorder` with status 0 and an order entry carrying no
@@ -244,9 +246,16 @@ def _fill_missing_order_ids(orders: list[DropshipOrderResult], refs: list[str]) 
 
     Two things it deliberately does NOT do:
 
-    * **It never raises.** The order exists by the time this runs, and the `csrf_token` beside it
-      is single-use — failing here would lose the member's account to save a field. A resolve that
-      fails logs and returns; the caller gets what Withings actually said.
+    * **It never raises, and the catch is deliberately broad.** The order exists by the time this
+      runs and the `csrf_token` beside it is single-use, so ANY exception escaping here loses the
+      member their account to save a field. `WithingsOrderDetailError` is not the only way out:
+      `get_order_detail` calls `acquire_request_slot()` and `sign_payload()` OUTSIDE its own try,
+      so an exhausted Withings budget escapes as `HTTPException` 429, an unreachable Redis as 503,
+      and a signing failure as `WithingsSignatureError` — none of them subclasses of this module's
+      error. The pre-flight above documents that same mechanism and has already spent a slot on
+      this request, which makes the 429 the LIKELY escape rather than a theoretical one (ross,
+      #15). So this catches `Exception`: there is no failure of an optional enrichment that is
+      worth more than the account it would destroy.
     * **It never guesses which order is which.** `createuserorder` echoes no `customer_ref_id` on
       its order entries, so with several orders in flight the only link is position, and a wrong
       pairing writes one parcel's id onto another — invisible until someone terminates the wrong
@@ -255,22 +264,30 @@ def _fill_missing_order_ids(orders: list[DropshipOrderResult], refs: list[str]) 
 
     Note the field names differ by endpoint and that is not a typo here: `createuserorder` answers
     `orderid`, `getdetail` answers `order_id`.
+
+    Credentials are passed in rather than read from `settings` here: the handler has already
+    checked they are present (and answered 503 if not), and re-reading them in a module-level
+    helper widens them back to `str | None` for no gain.
     """
     missing = [order for order in orders if not order.orderid]
     if not missing:
         return
 
     try:
-        known = get_order_detail(
-            client_id=settings.withings_client_id,
-            client_secret=settings.withings_client_secret.get_secret_value(),
-            customer_ref_ids=refs,
-        )
-    except WithingsOrderDetailError as e:
+        known = get_order_detail(client_id=client_id, client_secret=client_secret, customer_ref_ids=refs)
+    except Exception as e:
+        # Broad on purpose — see the docstring. `withings_status` exists only on this module's own
+        # error, so it is read defensively rather than assumed; the type name is logged because a
+        # 429 here and a Withings 503 are different operational problems with the same outcome.
         logger.error(
             "Withings acknowledged an order with no orderid and getdetail could not resolve it — "
             "the order IS placed; recover it by customer_ref_id",
-            extra={"withings_status": e.withings_status, "reason": str(e), "customer_ref_ids": refs},
+            extra={
+                "error_type": type(e).__name__,
+                "withings_status": getattr(e, "withings_status", None),
+                "reason": str(e),
+                "customer_ref_ids": refs,
+            },
         )
         return
 
@@ -515,7 +532,12 @@ def create_withings_cellular_order(
     # After the csrf_token guard, not before it: that branch already logs the order ids and
     # raises, so a resolve there would spend a Withings request to enrich a value about to be
     # discarded.
-    _fill_missing_order_ids(result.orders, refs)
+    _fill_missing_order_ids(
+        result.orders,
+        refs,
+        client_id=settings.withings_client_id,
+        client_secret=settings.withings_client_secret.get_secret_value(),
+    )
 
     return CellularOrderResponse(
         external_id=result.account.external_id,
