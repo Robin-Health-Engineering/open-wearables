@@ -4,14 +4,41 @@ Tests for sync_vendor_data Celery task.
 Tests synchronization of workout data from external providers (Garmin, Polar, Suunto).
 """
 
-from unittest.mock import MagicMock, patch
+from typing import Any
+from unittest.mock import MagicMock, create_autospec, patch
 
+import pytest
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
 from app.schemas.auth import ConnectionStatus, LiveSyncMode
+from app.schemas.enums import ProviderName
+from app.services.providers.factory import ProviderFactory
 from app.utils.sync_params import build_sync_params
 from tests.factories import ProviderSettingFactory, UserConnectionFactory, UserFactory
+
+
+def _247_implementations() -> dict[str, type]:
+    """The real 247 class each provider carries, resolved before any patching.
+
+    Built from the factory rather than a hand-written list so a tenth provider cannot
+    quietly stay off this path; ``test_every_247_provider_is_on_the_pull_path`` pins what
+    the discovery must return, so an empty or shrunken mapping fails instead of passing.
+    """
+    implementations: dict[str, type] = {}
+    factory = ProviderFactory()
+    for provider in ProviderName:
+        try:
+            strategy = factory.get_provider(provider.value)
+        except ValueError:
+            continue
+        data_247 = getattr(strategy, "data_247", None)
+        if data_247 is not None:
+            implementations[provider.value] = type(data_247)
+    return implementations
+
+
+PROVIDER_247_IMPLEMENTATIONS = _247_implementations()
 
 
 def _strategy_mock(*, rest_pull: bool = True, live_sync_mode: LiveSyncMode | None = LiveSyncMode.PULL) -> MagicMock:
@@ -431,3 +458,71 @@ class TestBuildSyncParams:
         assert mock_capture.call_args.args[0] is failure
         db.refresh(connection)
         assert connection.last_synced_at is not None
+
+
+class TestSync247Signatures:
+    """The 247 pull path has to fit every provider's real ``load_and_save_all``.
+
+    Tests elsewhere in this file hand the task a bare ``MagicMock`` for ``data_247``,
+    which swallows any keyword — so they kept passing while eight of the nine providers
+    raised ``TypeError: load_and_save_all() got an unexpected keyword argument
+    'connection_id'`` on every pull. These doubles are autospecced from the real classes,
+    so the signature is the one that ships.
+    """
+
+    def test_every_247_provider_is_on_the_pull_path(self) -> None:
+        """Pin the discovered set: a shrunken mapping must fail, not silently skip."""
+        assert set(PROVIDER_247_IMPLEMENTATIONS) == {
+            "garmin",
+            "google",
+            "oura",
+            "polar",
+            "sensorbio",
+            "suunto",
+            "ultrahuman",
+            "whoop",
+            "withings",
+        }
+
+    @pytest.mark.parametrize("provider_name", sorted(PROVIDER_247_IMPLEMENTATIONS))
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_247_sync_calls_each_provider_with_a_signature_it_accepts(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        provider_name: str,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """Every provider syncs 247 data, and only those that accept it are given
+        ``connection_id`` — the keyword that names which connection this pass is for."""
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider=provider_name,
+            status=ConnectionStatus.ACTIVE,
+        )
+
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        data_247: Any = create_autospec(PROVIDER_247_IMPLEMENTATIONS[provider_name], instance=True)
+        data_247.load_and_save_all.return_value = {}
+
+        mock_strategy = _strategy_mock()
+        mock_strategy.data_247 = data_247
+        mock_strategy.workouts.load_data.return_value = True
+        mock_get_provider.return_value = mock_strategy
+
+        result = sync_vendor_data(str(user.id))
+
+        reported = result["providers_synced"][provider_name]["params"]["data_247"]
+        assert reported["success"] is True, reported.get("error")
+        data_247.load_and_save_all.assert_called_once()
+
+        passed = data_247.load_and_save_all.call_args.kwargs
+        if provider_name == "withings":
+            assert passed["connection_id"] == connection.id
+        else:
+            assert "connection_id" not in passed

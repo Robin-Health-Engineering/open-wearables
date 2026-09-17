@@ -1,3 +1,4 @@
+import inspect
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
@@ -36,6 +37,28 @@ def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
             "Failed to emit sync status event",
             extra={"detail": str(exc)},
         )
+
+
+def _accepts_connection_id(fn: Any) -> bool:
+    """Whether ``fn`` takes a ``connection_id`` keyword argument.
+
+    The 247 gate below used to read ``hasattr(strategy.data_247, "load_and_save_all")``
+    and take a hit for "this is Withings". It never was: all nine 247 providers define
+    ``load_and_save_all`` — only Withings' signature accepts ``connection_id``, so the
+    other eight took the Withings branch and raised TypeError on every pull. Ask the
+    implementation what it accepts instead of inferring it from the provider.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - a non-introspectable callable
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    param = params.get("connection_id")
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def _log_provider_sync_failure(
@@ -370,17 +393,17 @@ def sync_vendor_data(
                                 # above already iterates every active connection, but everything
                                 # below it re-resolves from user_id alone — so without this a
                                 # member with two Withings accounts has the first read twice and
-                                # the second never. Only Withings implements load_and_save_all,
-                                # which is why the other providers' load_all_247_data below is
-                                # untouched: they can hold one connection each.
-                                results_247 = provider_any.load_and_save_all(
-                                    db,
-                                    user_uuid,
-                                    start_time=start_dt,
-                                    end_time=end_dt,
-                                    is_first_sync=is_first_sync,
-                                    connection_id=connection.id,
-                                )
+                                # the second never. Only Withings threads it that far; the other
+                                # eight providers hold one connection each and their signature
+                                # has no room for it, so they are called without it.
+                                kwargs_247: dict[str, Any] = {
+                                    "start_time": start_dt,
+                                    "end_time": end_dt,
+                                    "is_first_sync": is_first_sync,
+                                }
+                                if _accepts_connection_id(provider_any.load_and_save_all):
+                                    kwargs_247["connection_id"] = connection.id
+                                results_247 = provider_any.load_and_save_all(db, user_uuid, **kwargs_247)
                                 provider_result.params["data_247"] = {"success": True, "saved": True, **results_247}
                                 for _count in results_247.values():
                                     pull_inserted += getattr(_count, "inserted", 0)
