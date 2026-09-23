@@ -21,6 +21,7 @@ from app.services.providers.withings.sdk_users import (
     WithingsSdkUserError,
     create_sdk_user,
     exchange_sdk_code,
+    recover_authorization_code,
 )
 
 VALID: dict[str, Any] = {
@@ -252,3 +253,70 @@ class TestExchangeSdkCode:
         with pytest.raises(WithingsSdkUserError) as e:
             exchange_sdk_code(**EXCHANGE)
         assert "supersecret" not in str(e.value)
+
+
+class TestRecoverAuthorizationCode:
+    """The way back in for a provisioned account whose refresh token died.
+
+    Worth its own class because the two ways it can fail both answer HTTP 200: Withings gate
+    this action to Mobile SDK and Cellular partners, so a deployment whose client_id is neither
+    gets a non-zero status rather than a 401, and the same is true of a userid outside our
+    namespace. Neither raises through `raise_for_status`.
+    """
+
+    RECOVERED = {"status": 0, "body": {"user": {"code": "recovered-code"}}}
+
+    def test_returns_the_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _post(monkeypatch, self.RECOVERED)
+        code = recover_authorization_code(client_id="cid", client_secret="csecret", userid="49550146")
+        assert code == "recovered-code"
+
+    def test_posts_the_recover_action_to_the_oauth2_endpoint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # /v2/oauth2, NOT /v2/sdk: it is a sibling action of requesttoken, and sending it to the
+        # SDK endpoint answers a non-zero status that reads like a permissions problem.
+        captured: dict[str, Any] = {}
+        _post(monkeypatch, self.RECOVERED, captured)
+        recover_authorization_code(client_id="cid", client_secret="csecret", userid="49550146")
+        assert captured["url"].endswith("/v2/oauth2")
+        assert captured["data"]["action"] == "recoverauthorizationcode"
+        assert captured["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+
+    def test_sends_the_userid_and_never_the_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, Any] = {}
+        _post(monkeypatch, self.RECOVERED, captured)
+        recover_authorization_code(client_id="cid", client_secret="csecret", userid="49550146")
+        assert captured["data"]["userid"] == "49550146"
+        assert captured["data"]["nonce"]
+        assert captured["data"]["signature"]
+        assert "client_secret" not in captured["data"]
+
+    def test_coerces_an_integer_userid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The column is a string but Withings' own examples show an int, and a caller passing one
+        # would otherwise be form-encoded by httpx into the same thing by accident rather than by
+        # rule. Pin it.
+        captured: dict[str, Any] = {}
+        _post(monkeypatch, self.RECOVERED, captured)
+        recover_authorization_code(client_id="cid", client_secret="csecret", userid=49550146)  # type: ignore[arg-type]
+        assert captured["data"]["userid"] == "49550146"
+
+    def test_non_zero_status_raises_with_the_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _post(monkeypatch, {"status": 601, "body": {}})
+        with pytest.raises(WithingsSdkUserError) as e:
+            recover_authorization_code(client_id="cid", client_secret="csecret", userid="49550146")
+        assert e.value.withings_status == 601
+
+    def test_status_zero_with_no_code_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A success envelope with nothing in it is a contract change. Returning "" would hand an
+        # empty code to the exchange, which fails one call later and further from the cause.
+        _post(monkeypatch, {"status": 0, "body": {"user": {}}})
+        with pytest.raises(WithingsSdkUserError):
+            recover_authorization_code(client_id="cid", client_secret="csecret", userid="49550146")
+
+    def test_http_error_raises_without_echoing_the_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_post(url: str, data: dict[str, str], headers: dict[str, str], timeout: float) -> httpx.Response:
+            return httpx.Response(500, text="secret-ish echo", request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(sdk_users.httpx, "post", fake_post)
+        with pytest.raises(WithingsSdkUserError) as e:
+            recover_authorization_code(client_id="cid", client_secret="csecret", userid="49550146")
+        assert "secret-ish echo" not in str(e.value)

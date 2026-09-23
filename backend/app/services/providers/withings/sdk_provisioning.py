@@ -50,6 +50,7 @@ from app.services.providers.withings.sdk_users import (
     WithingsSdkUserError,
     create_sdk_user,
     exchange_sdk_code,
+    recover_authorization_code,
 )
 from app.utils.structured_logging import log_structured
 
@@ -374,6 +375,92 @@ def provision_sdk_account(
         external_id=sdk_user.external_id,
     )
     return account
+
+
+def recover_sdk_account(
+    db: DbSession,
+    *,
+    user_id: UUID,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    api_base_url: str | None = None,
+) -> WithingsSdkAccount:
+    """Mint fresh tokens for a member's PROVISIONED Withings account and reactivate it.
+
+    The repair for the one state a provisioned account could not get out of: its refresh token
+    died, ``_revoke_connection`` marked the row revoked, and nothing in the product could reach
+    it again. ``requesttoken`` has no grant that helps — ``refresh_token`` is the thing that
+    failed, and ``authorization_code`` needs a code that only ``createuser`` or
+    ``createuserorder`` could produce, the second of which ships hardware. Withings' own
+    ``recoverauthorizationcode`` closes that gap, and this is the whole of it: recover a code,
+    exchange it, store it down the SAME path provisioning uses.
+
+    **It targets the connection holding a ``withings_sdk_account`` row, never the primary one.**
+    A member can hold two Withings accounts — their own, linked by consumer OAuth, and the one
+    we created — and `get_by_user_and_provider` answers "ACTIVE before revoked", so the primary
+    is precisely the WRONG one here: the provisioned account is revoked, which is why we are
+    called, so the primary is the member's personal account. Recovering that one would be both
+    useless (its tokens are fine) and wrong (it is not in our namespace, so Withings would
+    refuse), while leaving the actual problem untouched. The SDK row is the discriminator
+    `withings/connections.py` already documents: row present means we created the account.
+
+    Raises if the member has no provisioned account; a member who only linked their own is not
+    a recovery case, they are simply not a cellular member.
+    """
+    provider = ProviderName.WITHINGS.value
+    kwargs = {"api_base_url": api_base_url} if api_base_url else {}
+
+    row = (
+        db.query(UserConnection, WithingsSdkAccount)
+        .join(WithingsSdkAccount, WithingsSdkAccount.user_connection_id == UserConnection.id)
+        .filter(UserConnection.user_id == user_id, UserConnection.provider == provider)
+        .one_or_none()
+    )
+    if row is None:
+        raise WithingsSdkUserError(detail="this member has no provisioned Withings account to recover")
+    connection, account = row
+    if not connection.provider_user_id:
+        # Every provisioned connection is written with the userid the token exchange returned, so
+        # this is a contract violation rather than a state a member can be in. Refuse rather than
+        # send Withings an empty userid, which they would answer with an opaque non-zero status.
+        raise WithingsSdkUserError(detail="the provisioned connection has no provider_user_id to recover against")
+
+    code = recover_authorization_code(
+        client_id=client_id,
+        client_secret=client_secret,
+        userid=connection.provider_user_id,
+        **kwargs,
+    )
+    tokens: SdkTokens = exchange_sdk_code(
+        client_id=client_id,
+        client_secret=client_secret,
+        code=code,
+        redirect_uri=redirect_uri,
+        **kwargs,
+    )
+
+    # Deliberately the same store as provisioning. Its reuse branch matches on
+    # `provider_user_id`, so it can only ever touch the connection we just recovered, and it
+    # already does the two things recovery needs: write the new tokens, and set ACTIVE. Writing
+    # them here instead would be a second place that has to remember the second half.
+    stored = _store_provisioned_account(
+        db,
+        user_id=user_id,
+        external_id=account.external_id,
+        tokens=tokens,
+    )
+
+    log_structured(
+        logger,
+        "info",
+        "Withings SDK account recovered",
+        provider=provider,
+        task="recover_sdk_account",
+        user_id=str(user_id),
+        external_id=account.external_id,
+    )
+    return stored
 
 
 def provision_cellular_order(
