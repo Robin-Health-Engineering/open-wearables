@@ -199,6 +199,7 @@
               "GET /api/v1/oauth/providers",
               "GET /api/v1/oauth/{provider}/authorize",
               "POST /api/v1/providers/withings/sdk/accounts",
+              "POST /api/v1/providers/withings/sdk/accounts/recover",
               "GET /api/v1/providers/withings/sdk/session",
               "POST /api/v1/providers/withings/sdk/devices",
               "GET /api/v1/providers/withings/sdk/devices",

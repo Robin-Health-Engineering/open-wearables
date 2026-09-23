@@ -217,19 +217,28 @@ def recover_withings_sdk_account(
             redirect_uri=settings.oauth_redirect_uri(ProviderName.WITHINGS),
         )
     except WithingsSdkUserError as e:
-        if e.withings_status is None:
-            # Our own precondition — no provisioned account, or one with no provider_user_id —
-            # rather than anything Withings said. A 404: the thing to recover does not exist.
-            # `detail` is the exception's MESSAGE, not an attribute — the class passes it to
-            # `super().__init__` and keeps only `withings_status` and `already_exists`.
+        # Branch on the FLAGS, never on `withings_status is None`. Most failures in this path
+        # leave the status unset — an HTTP error or timeout talking to Withings, a response with
+        # no code, a token exchange that fails, a store that refuses — and reading "no status" as
+        # "no such account" answered 404 to every one of them. A caller then concludes the member
+        # has no provisioned account, and an upstream outage never surfaces as one.
+        #
+        # `detail` is the exception's MESSAGE rather than an attribute: the class hands it to
+        # `super().__init__` and keeps only the flags.
+        if e.not_found:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
-        # Never echo the upstream body; the status is what diagnoses it. Withings gate this
-        # action to Mobile SDK and Cellular partners, so a refusal here can also mean the
-        # deployment's client_id is not one of those.
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Withings declined the recovery (status={e.withings_status})",
-        ) from e
+        if e.already_exists:
+            # The store refused: the account is held under a different external_id, or the
+            # connection has no SDK row so it is the member's own. Same 409 the provisioning
+            # route answers, and for the same reason — it is the caller's state, not a fault.
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+        # Everything else is upstream. Never echo the body; it answers a signed request and may
+        # repeat our parameters. Withings gate this action to Mobile SDK and Cellular partners,
+        # so a refusal can also mean the deployment's client_id is not one of those.
+        detail = (
+            f"Withings declined the recovery (status={e.withings_status})" if e.withings_status is not None else str(e)
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from e
 
     if not account.csrf_token:
         raise HTTPException(

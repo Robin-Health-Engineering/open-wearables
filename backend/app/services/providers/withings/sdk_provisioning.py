@@ -418,13 +418,16 @@ def recover_sdk_account(
         .one_or_none()
     )
     if row is None:
-        raise WithingsSdkUserError(detail="this member has no provisioned Withings account to recover")
+        raise WithingsSdkUserError(detail="this member has no provisioned Withings account to recover", not_found=True)
     connection, account = row
     if not connection.provider_user_id:
         # Every provisioned connection is written with the userid the token exchange returned, so
         # this is a contract violation rather than a state a member can be in. Refuse rather than
         # send Withings an empty userid, which they would answer with an opaque non-zero status.
-        raise WithingsSdkUserError(detail="the provisioned connection has no provider_user_id to recover against")
+        raise WithingsSdkUserError(
+            detail="the provisioned connection has no provider_user_id to recover against",
+            not_found=True,
+        )
 
     code = recover_authorization_code(
         client_id=client_id,
