@@ -336,7 +336,13 @@ def recover_authorization_code(
             task="recoverauthorizationcode",
             withings_status=status,
         )
-        raise WithingsSdkUserError(withings_status=status)
+        # Detail spelled out rather than left to the default, which names `createuser` — the only
+        # caller when this class was written. `withings_status` still set, so the route keeps its
+        # 502-vs-404 branch.
+        raise WithingsSdkUserError(
+            withings_status=status,
+            detail=f"Withings recoverauthorizationcode failed (status={status})",
+        )
 
     code = ((envelope.get("body") or {}).get("user") or {}).get("code")
     if not code:

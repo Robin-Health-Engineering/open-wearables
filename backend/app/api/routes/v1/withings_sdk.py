@@ -220,7 +220,9 @@ def recover_withings_sdk_account(
         if e.withings_status is None:
             # Our own precondition — no provisioned account, or one with no provider_user_id —
             # rather than anything Withings said. A 404: the thing to recover does not exist.
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=e.detail) from e
+            # `detail` is the exception's MESSAGE, not an attribute — the class passes it to
+            # `super().__init__` and keeps only `withings_status` and `already_exists`.
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
         # Never echo the upstream body; the status is what diagnoses it. Withings gate this
         # action to Mobile SDK and Cellular partners, so a refusal here can also mean the
         # deployment's client_id is not one of those.
