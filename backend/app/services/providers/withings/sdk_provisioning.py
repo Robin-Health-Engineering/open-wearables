@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from celery import current_app as celery_app
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 
 from app.database import DbSession
 from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
@@ -411,12 +411,32 @@ def recover_sdk_account(
     provider = ProviderName.WITHINGS.value
     kwargs = {"api_base_url": api_base_url} if api_base_url else {}
 
-    row = (
-        db.query(UserConnection, WithingsSdkAccount)
-        .join(WithingsSdkAccount, WithingsSdkAccount.user_connection_id == UserConnection.id)
-        .filter(UserConnection.user_id == user_id, UserConnection.provider == provider)
-        .one_or_none()
-    )
+    try:
+        row = (
+            db.query(UserConnection, WithingsSdkAccount)
+            .join(WithingsSdkAccount, WithingsSdkAccount.user_connection_id == UserConnection.id)
+            .filter(UserConnection.user_id == user_id, UserConnection.provider == provider)
+            .one_or_none()
+        )
+    except MultipleResultsFound as e:
+        # TWO provisioned accounts for one member is a state the schema permits, so this query has
+        # to answer it rather than raise through. The only constraint is
+        # `ix_user_connection_user_provider` on (user_id, provider, provider_user_id): two
+        # provisioned connections with DIFFERENT `provider_user_id` satisfy it, and the reuse
+        # branch in `_store_provisioned_account` looks for that same triple — so a new userid
+        # misses and INSERTS. "Withings reuse the account" is a guarantee of `createuserorder`,
+        # not of `createuser`: two `POST /withings/sdk/accounts` with different `external_id`
+        # reach `create_sdk_user`, which really does create a second account, and the provisioning
+        # route has no guard. An upstream retry that regenerates the external_id gets there.
+        #
+        # Refusing rather than picking one: the two accounts hold different clinical data, and
+        # choosing by created_at would silently recover the wrong scale for a member whose readings
+        # are already missing. 409 for the same reason the other conflicts use it — it is the
+        # caller's state, reconcilable, not something to retry.
+        raise WithingsSdkUserError(
+            detail="this member holds more than one provisioned Withings account; recovery cannot choose",
+            already_exists=True,
+        ) from e
     if row is None:
         raise WithingsSdkUserError(detail="this member has no provisioned Withings account to recover", not_found=True)
     connection, account = row
