@@ -186,6 +186,39 @@ class SdkAccountRecoveryRequest(BaseModel):
     "/withings/sdk/accounts/recover",
     summary="Mint fresh tokens for a member's provisioned Withings account",
     tags=["External: Providers"],
+    # Declared, not just raised: `raise HTTPException` never reaches the OpenAPI schema, so the
+    # published reference would show this endpoint with a 200 and nothing else — and the whole
+    # point of the 404/409/502 split is that a caller can tell the three apart.
+    responses={
+        404: {
+            "description": "The member has no provisioned Withings account to recover",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "this member has no provisioned Withings account to recover"}
+                }
+            },
+        },
+        409: {
+            "description": "The account is the member's own connection, or held under a different external_id",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "this Withings account is already provisioned under a different external_id"}
+                }
+            },
+        },
+        502: {
+            "description": "Withings declined the recovery, or could not be reached",
+            "content": {"application/json": {"example": {"detail": "Withings declined the recovery (status=601)"}}},
+        },
+        503: {
+            "description": "Withings credentials are not configured on this deployment",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Withings credentials are not configured on this deployment"}
+                }
+            },
+        },
+    },
 )
 def recover_withings_sdk_account(
     payload: SdkAccountRecoveryRequest,
