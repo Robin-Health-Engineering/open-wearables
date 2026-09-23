@@ -51,6 +51,7 @@ from app.services.providers.withings.sdk_devices import (
 from app.services.providers.withings.sdk_provisioning import (
     provision_cellular_order,
     provision_sdk_account,
+    recover_sdk_account,
 )
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 
@@ -161,6 +162,117 @@ def create_withings_sdk_account(
 
     # csrf_token is written by provisioning and cannot be null here, but the column is
     # nullable, so assert the invariant rather than hand back a None the client cannot use.
+    if not account.csrf_token:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Withings returned no csrf_token; the account cannot open a WebView",
+        )
+
+    return SdkAccountResponse(external_id=account.external_id, csrf_token=account.csrf_token)
+
+
+class SdkAccountRecoveryRequest(BaseModel):
+    """Who to recover. Nothing else: everything needed is already stored.
+
+    No ``external_id`` and no profile fields, unlike provisioning. The account exists — this is
+    not creating one — so its ``external_id`` comes from the row we already hold, and taking one
+    from the caller would only introduce a way for the two to disagree.
+    """
+
+    user_id: UUID
+
+
+@router.post(
+    "/withings/sdk/accounts/recover",
+    summary="Mint fresh tokens for a member's provisioned Withings account",
+    tags=["External: Providers"],
+    # Declared, not just raised: `raise HTTPException` never reaches the OpenAPI schema, so the
+    # published reference would show this endpoint with a 200 and nothing else — and the whole
+    # point of the 404/409/502 split is that a caller can tell the three apart.
+    responses={
+        404: {
+            "description": "The member has no provisioned Withings account to recover",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "this member has no provisioned Withings account to recover"}
+                }
+            },
+        },
+        409: {
+            "description": "The account is the member's own connection, or held under a different external_id",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "this Withings account is already provisioned under a different external_id"}
+                }
+            },
+        },
+        502: {
+            "description": "Withings declined the recovery, or could not be reached",
+            "content": {"application/json": {"example": {"detail": "Withings declined the recovery (status=601)"}}},
+        },
+        503: {
+            "description": "Withings credentials are not configured on this deployment",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Withings credentials are not configured on this deployment"}
+                }
+            },
+        },
+    },
+)
+def recover_withings_sdk_account(
+    payload: SdkAccountRecoveryRequest,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> SdkAccountResponse:
+    """Recover a provisioned account whose refresh token has died.
+
+    Safe to call on a healthy account — it mints a fresh code and replaces the tokens, which is
+    a no-op in effect — so a caller that cannot tell whether the connection is revoked does not
+    have to find out first.
+
+    Does NOT create anything: no account, no order, no second connection. It acts only on the
+    connection that already holds a ``withings_sdk_account`` row, and 404s if the member has
+    none. The member's own linked Withings account, if they have one, is never touched.
+    """
+    if not settings.withings_client_id or not settings.withings_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Withings credentials are not configured on this deployment",
+        )
+
+    try:
+        account = recover_sdk_account(
+            db,
+            user_id=payload.user_id,
+            client_id=settings.withings_client_id,
+            client_secret=settings.withings_client_secret.get_secret_value(),
+            redirect_uri=settings.oauth_redirect_uri(ProviderName.WITHINGS),
+        )
+    except WithingsSdkUserError as e:
+        # Branch on the FLAGS, never on `withings_status is None`. Most failures in this path
+        # leave the status unset — an HTTP error or timeout talking to Withings, a response with
+        # no code, a token exchange that fails, a store that refuses — and reading "no status" as
+        # "no such account" answered 404 to every one of them. A caller then concludes the member
+        # has no provisioned account, and an upstream outage never surfaces as one.
+        #
+        # `detail` is the exception's MESSAGE rather than an attribute: the class hands it to
+        # `super().__init__` and keeps only the flags.
+        if e.not_found:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+        if e.already_exists:
+            # The store refused: the account is held under a different external_id, or the
+            # connection has no SDK row so it is the member's own. Same 409 the provisioning
+            # route answers, and for the same reason — it is the caller's state, not a fault.
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+        # Everything else is upstream. Never echo the body; it answers a signed request and may
+        # repeat our parameters. Withings gate this action to Mobile SDK and Cellular partners,
+        # so a refusal can also mean the deployment's client_id is not one of those.
+        detail = (
+            f"Withings declined the recovery (status={e.withings_status})" if e.withings_status is not None else str(e)
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from e
+
     if not account.csrf_token:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

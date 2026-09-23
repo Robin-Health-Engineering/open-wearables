@@ -57,6 +57,12 @@ STATUS_OK = 0
 class WithingsSdkUserError(RuntimeError):
     """Raised when Withings declines to create the SDK user, or when the result cannot be stored.
 
+    ``not_found`` is the same idea for the opposite state: the thing the caller asked us to act
+    on does not exist. It has to be a FLAG and cannot be inferred from ``withings_status is
+    None``, which is the reading that made the recovery route answer 404 to a Withings outage —
+    ten of the raise sites in this module leave the status unset, and only two of them mean
+    "no such account".
+
     ``already_exists`` distinguishes the one failure that is the CALLER's state rather than a
     fault: the account this provisioning produced is one we already hold. It exists so a route can
     answer 409 instead of 502 without matching on the message — the two mean opposite things to
@@ -70,9 +76,11 @@ class WithingsSdkUserError(RuntimeError):
         withings_status: int | None = None,
         detail: str | None = None,
         already_exists: bool = False,
+        not_found: bool = False,
     ) -> None:
         self.withings_status = withings_status
         self.already_exists = already_exists
+        self.not_found = not_found
         super().__init__(detail or f"Withings createuser failed (status={withings_status})")
 
 
@@ -254,6 +262,111 @@ def create_sdk_user(
             echoed_external_id=echoed,
         )
     return SdkUser(code=code, external_id=external_id)
+
+
+def recover_authorization_code(
+    *,
+    client_id: str,
+    client_secret: str,
+    userid: str,
+    api_base_url: str = WITHINGS_API_BASE_URL,
+) -> str:
+    """Get a fresh authorization code for an account in our namespace, without the member.
+
+    This is the recovery path for a provisioned account whose refresh token has died. Withings'
+    own description: *"retrieve a new authorization code in the event that the refresh token is
+    invalid for a user belonging to your namespace"*, and it is gated to partners with a Mobile
+    SDK or Cellular contract — which is exactly the accounts ``createuser`` and
+    ``createuserorder`` produce.
+
+    **It is the ONLY way back in.** ``requesttoken`` accepts two grants and no others:
+    ``refresh_token``, which is what has just failed, and ``authorization_code``, which needs a
+    code. For an account we provisioned there is no member to send through a redirect — the
+    address is synthetic and nobody can log into it — so before this, a single failed refresh
+    made the account unreachable and the only way to mint a code again was to place another
+    dropshipment order, which ships hardware and charges someone (Withings support confirmed
+    this route on 2026-09-23, after we asked precisely that).
+
+    Note ``recoverauthorizationcode`` is a sibling ACTION of ``requesttoken``, not a grant type
+    on it. Reading the grant list alone says there is no way to recover an account, and that
+    reading is wrong.
+
+    Returns the code, which the caller exchanges through :func:`exchange_sdk_code` exactly as it
+    would a freshly created account's.
+    """
+    payload = {"action": "recoverauthorizationcode", "userid": str(userid)}
+    # Same signing protocol as createuser: action, client_id and nonce, sorted, comma-joined,
+    # HMAC-SHA256 under client_secret. `userid` is NOT part of the signed string — only the
+    # three keys are, which is Withings' rule and not an omission here.
+    signed = sign_payload(payload, client_id, client_secret, api_base_url=api_base_url)
+
+    acquire_request_slot()
+    try:
+        response = httpx.post(
+            f"{api_base_url}{_TOKEN_PATH}",
+            data=signed,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        envelope = response.json()
+    except httpx.HTTPStatusError as e:
+        # Same posture as createuser: the body may echo our signed parameters, so it is described
+        # rather than logged.
+        log_structured(
+            logger,
+            "error",
+            f"Withings recoverauthorizationcode HTTP error ({describe_body(e.response.text)})",
+            provider="withings",
+            task="recoverauthorizationcode",
+            status_code=e.response.status_code,
+        )
+        raise WithingsSdkUserError(
+            detail=f"Withings recoverauthorizationcode failed (HTTP {e.response.status_code})"
+        ) from e
+    except Exception as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings recoverauthorizationcode request failed: {type(e).__name__}",
+            provider="withings",
+            task="recoverauthorizationcode",
+        )
+        raise WithingsSdkUserError(detail="Withings recoverauthorizationcode request failed") from e
+
+    status = envelope.get("status")
+    if status != STATUS_OK:
+        log_structured(
+            logger,
+            "error",
+            "Withings recoverauthorizationcode returned a non-zero status",
+            provider="withings",
+            task="recoverauthorizationcode",
+            withings_status=status,
+        )
+        # Detail spelled out rather than left to the default, which names `createuser` — the only
+        # caller when this class was written. `withings_status` still set, so the route keeps its
+        # 502-vs-404 branch.
+        raise WithingsSdkUserError(
+            withings_status=status,
+            detail=f"Withings recoverauthorizationcode failed (status={status})",
+        )
+
+    code = ((envelope.get("body") or {}).get("user") or {}).get("code")
+    if not code:
+        # status 0 with no code is a contract change, not a user-facing condition — same reading
+        # as createuser makes of the same shape.
+        raise WithingsSdkUserError(detail="Withings recoverauthorizationcode returned no code")
+
+    log_structured(
+        logger,
+        "info",
+        "Withings authorization code recovered",
+        provider="withings",
+        task="recoverauthorizationcode",
+        provider_user_id=str(userid),
+    )
+    return code
 
 
 def exchange_sdk_code(
