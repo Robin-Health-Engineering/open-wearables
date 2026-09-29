@@ -419,6 +419,44 @@ def test_post_event_disabled_without_secret(monkeypatch: pytest.MonkeyPatch) -> 
     post.assert_not_called()
 
 
+_BLANK_SETTINGS = [
+    pytest.param("", SecretStr("s3cret"), id="empty-url"),
+    pytest.param("   ", SecretStr("s3cret"), id="blank-url"),
+    pytest.param("https://robin.example/reading-event", SecretStr(""), id="empty-secret"),
+    pytest.param("https://robin.example/reading-event", SecretStr("  "), id="blank-secret"),
+]
+
+
+@pytest.mark.parametrize(("url", "secret"), _BLANK_SETTINGS)
+def test_an_empty_url_or_secret_counts_as_unset(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    make_provisioned_connection: ProvisionedConnectionMaker,
+    url: str,
+    secret: SecretStr,
+) -> None:
+    # An env var set to "" (a common deploy placeholder) must not enable signing with an empty key.
+    monkeypatch.setattr(settings, "robin_reading_event_url", url)
+    monkeypatch.setattr(settings, "robin_reading_event_secret", secret)
+    assert reading_events.is_enabled() is False
+    connection = _provisioned(db, make_provisioned_connection)
+    with patch(_SEND) as send:
+        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+    assert n == 0
+    send.assert_not_called()
+
+
+@pytest.mark.parametrize(("url", "secret"), _BLANK_SETTINGS)
+def test_post_event_disabled_with_an_empty_url_or_secret(
+    monkeypatch: pytest.MonkeyPatch, url: str, secret: SecretStr
+) -> None:
+    monkeypatch.setattr(settings, "robin_reading_event_url", url)
+    monkeypatch.setattr(settings, "robin_reading_event_secret", secret)
+    with patch(_POST) as post:
+        assert reading_events.post_event({"grpid": "1"}) == "disabled"
+    post.assert_not_called()
+
+
 def test_a_rejection_is_captured_and_leaks_nothing(enabled: None, caplog: pytest.LogCaptureFixture) -> None:
     payload = {"grpid": "77", "external_user_id": "member-secret-id"}
     with (

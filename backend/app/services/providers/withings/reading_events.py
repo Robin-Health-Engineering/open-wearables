@@ -8,7 +8,8 @@ Sent only for groups that are
 * NEW, i.e. just inserted into withings_measure_group (``record_new_groups``);
 * on a connection WE provisioned (a ``withings_sdk_account`` row), because a member's own
   Withings account is not the device we sold them;
-* device-captured (a ``deviceid``, attrib not 2/4 = manual entry);
+* device-captured (a ``deviceid``, attrib not 2/4 = manual entry; see ``_eligible`` for why
+  every other attrib, the ambiguous 1 included, is accepted);
 * carrying at least one C2 metric (a blood-pressure-only group has nothing to announce);
 * RECENT (``robin_reading_event_max_age_hours``), because backfills re-read history.
 
@@ -50,8 +51,22 @@ DeliveryOutcome = Literal["delivered", "rejected", "retry", "disabled"]
 _TIMEOUT_SECONDS = 28.0
 
 
+def _endpoint() -> tuple[str, str] | None:
+    """(url, secret) when delivery is configured, else None.
+
+    An empty or blank value counts as UNSET: an env var left as "" must not enable delivery,
+    and above all must not sign with an empty key.
+    """
+    url = (settings.robin_reading_event_url or "").strip()
+    secret_str = settings.robin_reading_event_secret
+    secret = secret_str.get_secret_value() if secret_str is not None else ""
+    if not url or not secret.strip():
+        return None
+    return url, secret
+
+
 def is_enabled() -> bool:
-    return bool(settings.robin_reading_event_url) and settings.robin_reading_event_secret is not None
+    return _endpoint() is not None
 
 
 def _iso_utc(value: datetime) -> str:
@@ -74,6 +89,14 @@ def build_payload(
 
 
 def _eligible(group: ParsedGroup, cutoff: datetime) -> bool:
+    """Only manual entries (attrib 2 and 4) are refused; every other device attrib is accepted.
+
+    That includes attrib 1, "device measure, ambiguous user": Withings could not tell which user
+    of the device stepped on it. A household sharing one cellular scale can therefore get another
+    person's weigh-in pushed to the member. Accepted for now, knowingly: dropping 1 would also
+    drop the member's own readings whenever the scale is unsure of the user. The push itself
+    carries ids and metric names only, never values.
+    """
     return (
         group.device_id is not None
         and group.attrib not in _MANUAL_ATTRIBS
@@ -234,10 +257,9 @@ def post_event(payload: dict[str, Any], *, now: int | None = None) -> DeliveryOu
     including ones it drops, so a 3xx/4xx means OUR request is wrong (bad secret, clock skew, wrong
     URL) and retrying cannot fix it. Never logs the secret, the signature or the external_user_id.
     """
-    url = settings.robin_reading_event_url
-    secret = settings.robin_reading_event_secret
     grpid = payload.get("grpid")
-    if not url or secret is None:
+    endpoint = _endpoint()
+    if endpoint is None:
         log_structured(
             logger,
             "info",
@@ -247,6 +269,7 @@ def post_event(payload: dict[str, Any], *, now: int | None = None) -> DeliveryOu
             grpid=grpid,
         )
         return "disabled"
+    url, secret = endpoint
     # Serialise once and send exactly these bytes: the signature covers the raw body.
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     timestamp = now if now is not None else int(time.time())
@@ -256,7 +279,7 @@ def post_event(payload: dict[str, Any], *, now: int | None = None) -> DeliveryOu
             content=body,
             headers={
                 "Content-Type": "application/json",
-                "X-Robin-Signature": sign(secret.get_secret_value(), timestamp, body),
+                "X-Robin-Signature": sign(secret, timestamp, body),
             },
             timeout=_TIMEOUT_SECONDS,
             follow_redirects=False,
