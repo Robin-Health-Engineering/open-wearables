@@ -69,10 +69,20 @@ def test_visceral_fat_and_bmr_live_in_the_robin_fork_id_range() -> None:
     assert get_aggregation_method(SeriesType.withings_basal_metabolic_rate) == AggregationMethod.AVG
 
 
+def test_series_type_definitions_have_unique_ids_and_enums() -> None:
+    # The lookup dicts are built from this list and keep the LAST entry per key, so a duplicate id
+    # or enum would silently shadow another series instead of failing.
+    ids = [type_id for type_id, _, _ in SERIES_TYPE_DEFINITIONS]
+    enums = [enum for _, enum, _ in SERIES_TYPE_DEFINITIONS]
+    assert len(ids) == len(set(ids)), sorted({i for i in ids if ids.count(i) > 1})
+    assert len(enums) == len(set(enums)), sorted({e.value for e in enums if enums.count(e) > 1})
+
+
 def test_the_robin_fork_id_range_holds_only_fork_series() -> None:
-    # Fails loudly if an upstream merge ever puts one of its series in the fork's range.
-    in_range = {type_id: enum for type_id, enum, _ in SERIES_TYPE_DEFINITIONS if 900 <= type_id < 1000}
-    assert in_range == {
-        900: SeriesType.withings_visceral_fat,
-        901: SeriesType.withings_basal_metabolic_rate,
-    }
+    # Fails loudly if an upstream merge ever puts one of its series in the fork's range. A list, not
+    # a dict: a dict would let a colliding upstream entry be overwritten by ours and still pass.
+    in_range = [(type_id, enum) for type_id, enum, _ in SERIES_TYPE_DEFINITIONS if 900 <= type_id < 1000]
+    assert in_range == [
+        (900, SeriesType.withings_visceral_fat),
+        (901, SeriesType.withings_basal_metabolic_rate),
+    ]
