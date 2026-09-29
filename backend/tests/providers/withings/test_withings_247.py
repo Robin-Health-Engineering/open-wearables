@@ -1,17 +1,28 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from pydantic import SecretStr
+from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.models import DataPointSeries, DataSource, WithingsMeasureGroupRecord
+from app.models.withings_device import WithingsDevice
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import SeriesType
 from app.services.providers.withings._client import PaginatedResult
 from app.services.providers.withings.coverage import MEASURE_TYPE_MAP
 from app.services.providers.withings.data_247 import Withings247Data, WithingsDataSyncError
+from app.services.providers.withings.measure_groups import ParsedGroup
+from tests.providers.withings.conftest import ProvisionedConnectionMaker
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _make_data_247() -> Withings247Data:
@@ -572,3 +583,132 @@ def test_load_and_save_all_reports_each_failure_once(mock_paginate: MagicMock, m
     assert exc_info.value.status_code == 429
     assert set(exc_info.value.failures) == {"measures", "activity", "sleep"}
     mock_capture.assert_not_called()
+
+
+@patch("app.services.providers.withings.data_247.enqueue_new_reading_events")
+@patch("app.services.providers.withings.data_247.record_new_groups")
+@patch("app.services.providers.withings.data_247.timeseries_service")
+@patch("app.services.providers.withings.data_247.paginate")
+def test_save_measures_records_groups_then_emits_after_commit(
+    mock_paginate: MagicMock, mock_ts: MagicMock, mock_record: MagicMock, mock_enqueue: MagicMock
+) -> None:
+    d = _make_data_247()
+    db = MagicMock()
+    connection_id = uuid4()
+    mock_paginate.return_value = PaginatedResult(
+        rows=[
+            {"date": 1728000000, "grpid": 9, "deviceid": "dev-1", "measures": [{"value": 7500, "type": 1, "unit": -2}]}
+        ],
+        envelope={},
+    )
+    mock_ts.bulk_create_samples.return_value = WriteCounts(inserted=1, updated=0)
+    order: list[str] = []
+
+    def _record(db: MagicMock, **kw: Any) -> list[ParsedGroup]:
+        order.append("record")
+        return kw["groups"]
+
+    mock_record.side_effect = _record
+    db.commit.side_effect = lambda: order.append("commit")
+    mock_enqueue.side_effect = lambda *a, **kw: order.append("enqueue") or 1
+
+    d.save_measures(db, uuid4(), datetime.now(timezone.utc), datetime.now(timezone.utc), connection_id)
+
+    recorded = mock_record.call_args.kwargs
+    assert recorded["user_connection_id"] == connection_id
+    assert [g.grpid for g in recorded["groups"]] == ["9"]
+    assert recorded["groups"][0].device_id == "dev-1"
+    assert order == ["record", "commit", "enqueue"]
+    assert mock_enqueue.call_args.kwargs["user_connection_id"] == connection_id
+    assert mock_enqueue.call_args.kwargs["oauth"] is d.oauth  # enables the null-hash Getdevice refresh
+
+
+@patch("app.services.providers.withings.data_247.enqueue_new_reading_events")
+@patch("app.services.providers.withings.data_247.record_new_groups", return_value=[])
+@patch("app.services.providers.withings.data_247.timeseries_service")
+@patch("app.services.providers.withings.data_247.paginate")
+def test_save_measures_emits_nothing_when_no_group_is_new(
+    mock_paginate: MagicMock, mock_ts: MagicMock, mock_record: MagicMock, mock_enqueue: MagicMock
+) -> None:
+    d = _make_data_247()
+    mock_paginate.return_value = PaginatedResult(
+        rows=[{"date": 1728000000, "grpid": 9, "measures": [{"value": 7500, "type": 1, "unit": -2}]}], envelope={}
+    )
+    mock_ts.bulk_create_samples.return_value = WriteCounts(inserted=0, updated=1)
+    d.save_measures(MagicMock(), uuid4(), datetime.now(timezone.utc), datetime.now(timezone.utc), uuid4())
+    mock_record.assert_called_once()
+    mock_enqueue.assert_not_called()
+
+
+@patch("app.services.providers.withings.data_247.enqueue_new_reading_events")
+@patch("app.services.providers.withings.data_247.record_new_groups")
+@patch("app.services.providers.withings.data_247.timeseries_service")
+@patch("app.services.providers.withings.data_247.paginate")
+def test_save_measures_without_a_connection_records_nothing(
+    mock_paginate: MagicMock, mock_ts: MagicMock, mock_record: MagicMock, mock_enqueue: MagicMock
+) -> None:
+    d = _make_data_247()
+    mock_paginate.return_value = PaginatedResult(
+        rows=[{"date": 1728000000, "grpid": 9, "measures": [{"value": 7500, "type": 1, "unit": -2}]}], envelope={}
+    )
+    mock_ts.bulk_create_samples.return_value = WriteCounts(inserted=1, updated=0)
+    with patch.object(d.connection_repo, "get_active_connection", return_value=None):
+        d.save_measures(MagicMock(), uuid4(), datetime.now(timezone.utc), datetime.now(timezone.utc))
+    mock_record.assert_not_called()
+    mock_enqueue.assert_not_called()
+
+
+@patch("app.services.providers.withings.reading_events.log_and_capture_error")
+@patch("app.services.providers.withings.reading_events.celery_app.send_task", side_effect=ConnectionError("redis down"))
+@patch("app.services.providers.withings.data_247.paginate")
+def test_enqueue_failure_does_not_fail_the_save(
+    mock_paginate: MagicMock,
+    mock_send: MagicMock,
+    mock_capture: MagicMock,
+    db: Session,
+    make_provisioned_connection: ProvisionedConnectionMaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real DB, real record_new_groups and enqueue: only the broker call is broken, and it raises."""
+    monkeypatch.setattr(settings, "robin_reading_event_url", "https://robin.example/reading-event")
+    monkeypatch.setattr(settings, "robin_reading_event_secret", SecretStr("s3cret"))
+    user, connection = make_provisioned_connection()
+    db.add(
+        WithingsDevice(
+            id=uuid4(), user_connection_id=connection.id, device_id="dev-1", hash_device_id="h", updated_at=_utcnow()
+        )
+    )
+    db.flush()
+    measured = int((_utcnow() - timedelta(minutes=5)).timestamp())
+    mock_paginate.return_value = PaginatedResult(
+        rows=[
+            {
+                "date": measured,
+                "grpid": 90210,
+                "deviceid": "dev-1",
+                "attrib": 0,
+                "measures": [{"value": 7500, "type": 1, "unit": -2}],
+            }
+        ],
+        envelope={},
+    )
+
+    count = _make_data_247().save_measures(db, user.id, _utcnow(), _utcnow(), connection.id)
+
+    assert count.inserted == 1
+    mock_send.assert_called_once()  # the enqueue really was attempted, and raised
+    mock_capture.assert_called_once()
+    measured_at = datetime.fromtimestamp(measured, tz=timezone.utc)
+    stored = (
+        db.query(DataPointSeries.value)
+        .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+        .filter(DataSource.user_id == user.id, DataPointSeries.recorded_at == measured_at)
+        .all()
+    )
+    assert [row.value for row in stored] == [Decimal("75.000")]
+    assert (
+        db.query(WithingsMeasureGroupRecord.grpid)
+        .filter(WithingsMeasureGroupRecord.user_connection_id == connection.id)
+        .scalar()
+        == "90210"
+    )

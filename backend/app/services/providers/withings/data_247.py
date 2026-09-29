@@ -35,6 +35,8 @@ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import paginate, scale_measure
 from app.services.providers.withings.coverage import ACTIVITY_FIELD_MAP, MEASURE_TYPE_MAP
 from app.services.providers.withings.data_requests import ACTIVITY, MEASURES, SLEEP_SUMMARY
+from app.services.providers.withings.measure_groups import ParsedGroup, parsed_group_of, record_new_groups
+from app.services.providers.withings.reading_events import enqueue_new_reading_events
 from app.services.providers.withings.timezone import local_day_start, zone_offset_at
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
@@ -91,20 +93,12 @@ class Withings247Data(Base247DataTemplate):
         connection = self.connection_repo.get_active_connection(db, user_id, self.provider_name)
         return connection.id if connection is not None and isinstance(connection.id, UUID) else None
 
-    def normalize_measures(
-        self,
-        groups: list[dict],
-        user_id: UUID,
-        user_connection_id: UUID | None = None,
-        *,
-        default_timezone: str | None = None,
-    ) -> list[TimeSeriesSampleCreate]:
-        """Normalize measure groups, preferring each group timezone over the response timezone."""
-        samples: list[TimeSeriesSampleCreate] = []
+    def _parse_measure_groups(self, groups: list[dict], user_id: UUID) -> list[WithingsMeasureGroup]:
+        parsed: list[WithingsMeasureGroup] = []
         for group in groups:
             # Tolerate a malformed group without dropping the rest of the batch.
             try:
-                parsed = WithingsMeasureGroup.model_validate(group)
+                parsed.append(WithingsMeasureGroup.model_validate(group))
             except ValidationError as e:
                 log_structured(
                     logger,
@@ -115,7 +109,30 @@ class Withings247Data(Base247DataTemplate):
                     user_id=str(user_id),
                     error=str(e),
                 )
-                continue
+        return parsed
+
+    def normalize_measures(
+        self,
+        groups: list[dict],
+        user_id: UUID,
+        user_connection_id: UUID | None = None,
+        *,
+        default_timezone: str | None = None,
+    ) -> list[TimeSeriesSampleCreate]:
+        """Normalize measure groups, preferring each group timezone over the response timezone."""
+        return self._normalize_parsed(
+            self._parse_measure_groups(groups, user_id), user_id, user_connection_id, default_timezone
+        )
+
+    def _normalize_parsed(
+        self,
+        groups: list[WithingsMeasureGroup],
+        user_id: UUID,
+        user_connection_id: UUID | None,
+        default_timezone: str | None,
+    ) -> list[TimeSeriesSampleCreate]:
+        samples: list[TimeSeriesSampleCreate] = []
+        for parsed in groups:
             samples.extend(self._normalize_measure_group(parsed, user_id, user_connection_id, default_timezone))
         return samples
 
@@ -185,16 +202,24 @@ class Withings247Data(Base247DataTemplate):
             list_key=MEASURES.list_key,
             connection_id=user_connection_id,
         )
-        samples = self.normalize_measures(
-            page.rows,
-            user_id,
-            user_connection_id,
-            default_timezone=page.envelope.get("timezone"),
-        )
+        groups = self._parse_measure_groups(page.rows, user_id)
+        samples = self._normalize_parsed(groups, user_id, user_connection_id, page.envelope.get("timezone"))
         if not samples:
             return WriteCounts(0, 0)
         counts = timeseries_service.bulk_create_samples(db, samples)
+        new_groups: list[ParsedGroup] = []
+        if user_connection_id is not None:
+            # Same transaction as the samples: a group is "recorded" only if its samples are.
+            new_groups = record_new_groups(
+                db,
+                user_id=user_id,
+                user_connection_id=user_connection_id,
+                groups=[g for g in (parsed_group_of(x) for x in groups) if g is not None],
+            )
         db.commit()
+        if new_groups and user_connection_id is not None:
+            # After commit: Robin reads the reading back as soon as it gets the event. Never raises.
+            enqueue_new_reading_events(db, user_connection_id=user_connection_id, groups=new_groups, oauth=self.oauth)
         return counts
 
     # ---------------------- Daily activity (getactivity) ----------------------
