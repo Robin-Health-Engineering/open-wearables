@@ -162,7 +162,7 @@ def test_list_of_another_members_device_is_empty(
 
 def test_bad_cursor_raises(db: Session, make_provisioned_connection: ProvisionedConnectionMaker) -> None:
     user, _ = make_provisioned_connection()
-    for cursor in ("not-a-cursor", "", "a.b", "x" * 10_000):
+    for cursor in ("not-a-cursor", "", "a.b", "a.é", "x" * 10_000):
         with pytest.raises(InvalidReadingCursor):
             list_device_readings(db, user_id=user.id, device_id="dev-1", cursor=cursor)
 

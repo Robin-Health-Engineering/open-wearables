@@ -75,7 +75,7 @@ def _encode_cursor(user_id: UUID, device_id: str, record: WithingsMeasureGroupRe
 
 
 def _decode_cursor(user_id: UUID, device_id: str, cursor: str) -> tuple[datetime, str]:
-    if not cursor or len(cursor) > _MAX_CURSOR_LENGTH or cursor.count(".") != 1:
+    if not cursor or len(cursor) > _MAX_CURSOR_LENGTH or not cursor.isascii() or cursor.count(".") != 1:
         raise InvalidReadingCursor("invalid cursor")
     body, signature = cursor.split(".")
     if not hmac.compare_digest(signature, _signature(user_id, device_id, body)):
@@ -118,6 +118,7 @@ def _metrics(db: DbSession, user_id: UUID, records: list[WithingsMeasureGroupRec
             DataSource.provider == ProviderName.WITHINGS,
             DataPointSeries.external_id.in_(list(measured_at)),
             DataPointSeries.series_type_definition_id.in_(list(_TYPE_IDS)),
+            DataPointSeries.recorded_at.in_(set(measured_at.values())),
         )
         .all()
     )
