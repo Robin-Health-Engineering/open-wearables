@@ -53,6 +53,7 @@ from app.services.providers.withings.sdk_devices import (
     list_devices,
     mark_dissociated,
     record_installed_device,
+    set_order_ref,
     sync_devices_from_withings,
 )
 from app.services.providers.withings.sdk_provisioning import (
@@ -999,6 +1000,32 @@ def dissociate_withings_device(
     except WithingsDeviceError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     return SdkDeviceResponse.of(device) if device else None
+
+
+class SdkDeviceOrderRefRequest(BaseModel):
+    order_ref: str = Field(min_length=1, max_length=64, description="robin-backend orderRef this device shipped on")
+
+
+@router.put(
+    "/withings/sdk/devices/{device_id}/order-ref",
+    summary="Record which order shipped a device",
+    tags=["External: Providers"],
+)
+def set_withings_device_order_ref(
+    device_id: str,
+    user_id: UUID,
+    payload: SdkDeviceOrderRefRequest,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> SdkDeviceResponse:
+    """Idempotent. 404 unless the device is on one of this member's Withings accounts.
+
+    A different ``order_ref`` than the one held overwrites it: Robin is the authority on orders.
+    """
+    device = set_order_ref(db, user_id=user_id, device_id=device_id, order_ref=payload.order_ref)
+    if device is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such device for this member")
+    return SdkDeviceResponse.of(device)
 
 
 def _utc_z(value: datetime) -> str:

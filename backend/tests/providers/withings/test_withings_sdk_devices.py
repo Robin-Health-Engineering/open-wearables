@@ -19,11 +19,13 @@ that is left behind.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
+import pytest
 from sqlalchemy.orm import Session
 
 from app.models.withings_device import WithingsDevice
@@ -31,6 +33,7 @@ from app.services.providers.withings.sdk_devices import (
     list_devices,
     mark_dissociated,
     record_installed_device,
+    set_order_ref,
     sync_devices_from_withings,
 )
 from tests.factories import UserConnectionFactory, UserFactory
@@ -325,3 +328,63 @@ class TestSeveralConnections:
 
         surviving = {d.device_id for d in list_devices(db, user_id=user_id)}
         assert surviving == {"personal-scale", "shipped-bpm"}
+
+
+class TestSetOrderRef:
+    def test_sets_and_is_idempotent(self, db: Session) -> None:
+        user_id = _member(db)
+        _sync(db, user_id, _entry())
+        first = set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+        assert first is not None
+        stamp = first.updated_at
+        again = set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+        assert again is not None
+        assert again.order_ref == "REF-1"
+        assert again.updated_at == stamp  # no write on a repeat
+
+    def test_a_different_ref_overwrites_and_is_logged(self, db: Session, capsys: pytest.CaptureFixture[str]) -> None:
+        user_id = _member(db)
+        _sync(db, user_id, _entry())
+        set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+        capsys.readouterr()
+
+        replaced = set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-2")
+
+        assert replaced is not None
+        assert replaced.order_ref == "REF-2"
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+        (event,) = [e for e in events if e.get("action") == "order_ref_replaced"]
+        assert event["level"] == "info"
+        assert (event["previous"], event["current"]) == ("REF-1", "REF-2")
+
+    def test_the_first_link_and_a_repeat_log_nothing(self, db: Session, capsys: pytest.CaptureFixture[str]) -> None:
+        user_id = _member(db)
+        _sync(db, user_id, _entry())
+        capsys.readouterr()
+        set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+        set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+        assert "order_ref_replaced" not in capsys.readouterr().out
+
+    def test_unknown_device_is_none(self, db: Session) -> None:
+        user_id = _member(db)
+        assert set_order_ref(db, user_id=user_id, device_id="nope", order_ref="REF-1") is None
+
+    def test_member_without_a_withings_connection_is_none(self, db: Session) -> None:
+        user = UserFactory()
+        assert set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1") is None
+
+    def test_finds_the_device_on_a_second_account(self, db: Session) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="withings", provider_user_id="own")
+        provisioned = _second_withings_connection(user)
+        with patch(_GETDEVICE, side_effect=_getdevice_per_account({provisioned: "cell-1"})):
+            sync_devices_from_withings(db, user_id=user.id, oauth=MagicMock(), connection_id=provisioned)
+        found = set_order_ref(db, user_id=user.id, device_id="cell-1", order_ref="REF-9")
+        assert found is not None
+        assert found.order_ref == "REF-9"
+
+    def test_another_members_device_is_none(self, db: Session) -> None:
+        owner = _member(db)
+        _sync(db, owner, _entry())
+        stranger = _member(db)
+        assert set_order_ref(db, user_id=stranger, device_id="device-1", order_ref="REF-1") is None

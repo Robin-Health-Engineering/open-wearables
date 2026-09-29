@@ -318,6 +318,48 @@ def _sync_one(
     return devices
 
 
+def set_order_ref(db: DbSession, *, user_id: UUID, device_id: str, order_ref: str) -> WithingsDevice | None:
+    """Record which robin-backend order shipped this device. Idempotent; None if not the member's.
+
+    Across every one of the member's Withings accounts, as ``mark_dissociated`` does: the caller
+    names a DEVICE, and which account it hangs off is our bookkeeping.
+
+    Robin re-issues this on every match, so a repeat must cost a read and nothing more. A
+    DIFFERENT value overwrites: Robin is authoritative for orders, and a replacement order
+    legitimately re-links the same account's new device.
+    """
+    try:
+        connection_ids = [c.id for c in _connections(db, user_id)]
+    except WithingsDeviceError:
+        return None
+    device = (
+        db.query(WithingsDevice)
+        .filter(WithingsDevice.user_connection_id.in_(connection_ids), WithingsDevice.device_id == device_id)
+        .first()
+    )
+    if device is None:
+        return None
+    if device.order_ref == order_ref:
+        return device
+    previous = device.order_ref
+    device.order_ref = order_ref
+    device.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    if previous is not None:
+        log_structured(
+            logger,
+            "info",
+            "Withings device order_ref replaced",
+            provider=ProviderName.WITHINGS.value,
+            action="order_ref_replaced",
+            user_id=str(user_id),
+            device_id=device_id,
+            previous=previous,
+            current=order_ref,
+        )
+    return device
+
+
 def mark_dissociated(db: DbSession, *, user_id: UUID, device_id: str) -> WithingsDevice | None:
     """Record that a device was removed, from the SDK's dissociation-success notification.
 
