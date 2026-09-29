@@ -330,25 +330,37 @@ class TestSeveralConnections:
         assert surviving == {"personal-scale", "shipped-bpm"}
 
 
+def _shipped(db: Session, make: Any, device_id: str = "device-1", user: Any = None) -> tuple[Any, Any]:
+    """A member with a device on an SDK-provisioned account (one we shipped), synced from Getdevice."""
+    user, connection = make(user=user)
+    with patch(_GETDEVICE, return_value={"devices": [_entry(deviceid=device_id)]}):
+        sync_devices_from_withings(db, user_id=user.id, oauth=MagicMock(), connection_id=connection.id)
+    return user, connection
+
+
+def _order_ref(db: Session, device_id: str) -> str | None:
+    return db.query(WithingsDevice).filter_by(device_id=device_id).one().order_ref
+
+
 class TestSetOrderRef:
-    def test_sets_and_is_idempotent(self, db: Session) -> None:
-        user_id = _member(db)
-        _sync(db, user_id, _entry())
-        first = set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+    def test_sets_and_is_idempotent(self, db: Session, make_provisioned_connection: Any) -> None:
+        user, _ = _shipped(db, make_provisioned_connection)
+        first = set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1")
         assert first is not None
         stamp = first.updated_at
-        again = set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+        again = set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1")
         assert again is not None
         assert again.order_ref == "REF-1"
         assert again.updated_at == stamp  # no write on a repeat
 
-    def test_a_different_ref_overwrites_and_is_logged(self, db: Session, capsys: pytest.CaptureFixture[str]) -> None:
-        user_id = _member(db)
-        _sync(db, user_id, _entry())
-        set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+    def test_a_different_ref_overwrites_and_is_logged(
+        self, db: Session, make_provisioned_connection: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        user, _ = _shipped(db, make_provisioned_connection)
+        set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1")
         capsys.readouterr()
 
-        replaced = set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-2")
+        replaced = set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-2")
 
         assert replaced is not None
         assert replaced.order_ref == "REF-2"
@@ -357,34 +369,50 @@ class TestSetOrderRef:
         assert event["level"] == "info"
         assert (event["previous"], event["current"]) == ("REF-1", "REF-2")
 
-    def test_the_first_link_and_a_repeat_log_nothing(self, db: Session, capsys: pytest.CaptureFixture[str]) -> None:
-        user_id = _member(db)
-        _sync(db, user_id, _entry())
+    def test_the_first_link_and_a_repeat_log_nothing(
+        self, db: Session, make_provisioned_connection: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        user, _ = _shipped(db, make_provisioned_connection)
         capsys.readouterr()
-        set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
-        set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+        set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1")
+        set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1")
         assert "order_ref_replaced" not in capsys.readouterr().out
 
-    def test_unknown_device_is_none(self, db: Session) -> None:
-        user_id = _member(db)
-        assert set_order_ref(db, user_id=user_id, device_id="nope", order_ref="REF-1") is None
+    def test_unknown_device_is_none(self, db: Session, make_provisioned_connection: Any) -> None:
+        user, _ = _shipped(db, make_provisioned_connection)
+        assert set_order_ref(db, user_id=user.id, device_id="nope", order_ref="REF-1") is None
 
     def test_member_without_a_withings_connection_is_none(self, db: Session) -> None:
         user = UserFactory()
         assert set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1") is None
 
-    def test_finds_the_device_on_a_second_account(self, db: Session) -> None:
+    def test_finds_the_device_on_the_provisioned_account_beside_a_self_link(
+        self, db: Session, make_provisioned_connection: Any
+    ) -> None:
         user = UserFactory()
         UserConnectionFactory(user=user, provider="withings", provider_user_id="own")
-        provisioned = _second_withings_connection(user)
-        with patch(_GETDEVICE, side_effect=_getdevice_per_account({provisioned: "cell-1"})):
-            sync_devices_from_withings(db, user_id=user.id, oauth=MagicMock(), connection_id=provisioned)
+        _shipped(db, make_provisioned_connection, device_id="cell-1", user=user)
         found = set_order_ref(db, user_id=user.id, device_id="cell-1", order_ref="REF-9")
         assert found is not None
         assert found.order_ref == "REF-9"
 
-    def test_another_members_device_is_none(self, db: Session) -> None:
-        owner = _member(db)
-        _sync(db, owner, _entry())
-        stranger = _member(db)
-        assert set_order_ref(db, user_id=stranger, device_id="device-1", order_ref="REF-1") is None
+    def test_a_device_on_a_self_linked_account_is_none_and_untouched(self, db: Session) -> None:
+        user_id = _member(db)  # self-linked only: no withings_sdk_account row
+        _sync(db, user_id, _entry())
+
+        assert set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1") is None
+        assert _order_ref(db, "device-1") is None
+
+    def test_a_dissociated_device_can_still_be_tagged(self, db: Session, make_provisioned_connection: Any) -> None:
+        user, _ = _shipped(db, make_provisioned_connection)
+        mark_dissociated(db, user_id=user.id, device_id="device-1")
+
+        found = set_order_ref(db, user_id=user.id, device_id="device-1", order_ref="REF-1")
+
+        assert found is not None
+        assert found.order_ref == "REF-1"
+
+    def test_another_members_device_is_none(self, db: Session, make_provisioned_connection: Any) -> None:
+        _shipped(db, make_provisioned_connection)
+        stranger, _ = make_provisioned_connection()
+        assert set_order_ref(db, user_id=stranger.id, device_id="device-1", order_ref="REF-1") is None

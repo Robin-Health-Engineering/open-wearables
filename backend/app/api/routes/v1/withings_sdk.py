@@ -26,7 +26,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_serializer
 
 from app.config import settings
 from app.database import DbSession
@@ -1003,7 +1003,11 @@ def dissociate_withings_device(
 
 
 class SdkDeviceOrderRefRequest(BaseModel):
-    order_ref: str = Field(min_length=1, max_length=64, description="robin-backend orderRef this device shipped on")
+    order_ref: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
+        Field(description="robin-backend orderRef this device shipped on"),
+    ]
 
 
 @router.put(

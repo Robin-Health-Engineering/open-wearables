@@ -1032,3 +1032,38 @@ class TestOrderRefRoute:
     def test_requires_authentication(self, client: TestClient, db: Session, make_provisioned_connection: Any) -> None:
         user, _ = self._device(db, make_provisioned_connection)
         assert self._put(client, user, {"order_ref": "REF-1"}).status_code == 401
+
+    def test_a_padded_ref_is_stored_stripped_and_a_clean_resend_is_a_noop(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        assert self._put(client, user, {"order_ref": " REF-1 "}, api_key_header).status_code == 200
+        stamp = db.query(WithingsDevice).filter_by(device_id="dev-1").one().updated_at
+
+        assert self._put(client, user, {"order_ref": "REF-1"}, api_key_header).status_code == 200
+
+        db.expire_all()
+        device = db.query(WithingsDevice).filter_by(device_id="dev-1").one()
+        assert device.order_ref == "REF-1"
+        assert device.updated_at == stamp
+
+    def test_400_on_a_whitespace_only_ref(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        assert self._put(client, user, {"order_ref": "   "}, api_key_header).status_code == 400
+
+    def test_404_and_no_write_for_a_device_on_a_self_linked_account(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str]
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="withings", provider_user_id="own")
+        db.add(
+            WithingsDevice(
+                id=uuid4(), user_connection_id=connection.id, device_id="dev-1", updated_at=connection.updated_at
+            )
+        )
+        db.commit()
+
+        assert self._put(client, user, {"order_ref": "REF-1"}, api_key_header).status_code == 404
+        assert db.query(WithingsDevice).filter_by(device_id="dev-1").one().order_ref is None

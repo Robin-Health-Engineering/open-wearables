@@ -40,7 +40,7 @@ from app.schemas.enums import ProviderName
 from app.schemas.providers.withings.devices import WithingsDeviceEntry, WithingsGetdeviceBody
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL, withings_request
-from app.services.providers.withings.connections import active_withings_connections
+from app.services.providers.withings.connections import active_withings_connections, device_connections
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -321,16 +321,17 @@ def _sync_one(
 def set_order_ref(db: DbSession, *, user_id: UUID, device_id: str, order_ref: str) -> WithingsDevice | None:
     """Record which robin-backend order shipped this device. Idempotent; None if not the member's.
 
-    Across every one of the member's Withings accounts, as ``mark_dissociated`` does: the caller
-    names a DEVICE, and which account it hangs off is our bookkeeping.
+    Across the member's SDK-provisioned accounts only, the ones WE created to ship a device. The
+    member's own self-linked account is excluded: hardware on it is not something we shipped, so
+    Robin's order link must never be stamped there. The caller names a DEVICE, and which
+    provisioned account it hangs off is our bookkeeping.
 
     Robin re-issues this on every match, so a repeat must cost a read and nothing more. A
     DIFFERENT value overwrites: Robin is authoritative for orders, and a replacement order
     legitimately re-links the same account's new device.
     """
-    try:
-        connection_ids = [c.id for c in _connections(db, user_id)]
-    except WithingsDeviceError:
+    connection_ids = [c.id for c in device_connections(db, user_id)]
+    if not connection_ids:
         return None
     device = (
         db.query(WithingsDevice)
@@ -339,6 +340,7 @@ def set_order_ref(db: DbSession, *, user_id: UUID, device_id: str, order_ref: st
     )
     if device is None:
         return None
+    # A soft-dissociated device is still taggable on purpose: a re-synced device must not flip to 404.
     if device.order_ref == order_ref:
         return device
     previous = device.order_ref
