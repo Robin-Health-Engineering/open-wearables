@@ -30,7 +30,6 @@ from sqlalchemy.orm import Session
 
 from app.models.withings_device import WithingsDevice
 from app.services.providers.withings.sdk_devices import (
-    hash_for,
     list_devices,
     mark_dissociated,
     record_installed_device,
@@ -424,7 +423,6 @@ class TestHashDeviceId:
         user_id = _member(db)
         [device] = _sync(db, user_id, _entry(hash_deviceid="hash-1"))
         assert device.hash_device_id == "hash-1"
-        assert hash_for(db, user_connection_id=device.user_connection_id, device_id="device-1") == "hash-1"
 
     def test_a_later_entry_without_hash_keeps_the_stored_one(self, db: Session) -> None:
         # "A write never erases what it cannot replace" (module docstring).
@@ -432,8 +430,3 @@ class TestHashDeviceId:
         _sync(db, user_id, _entry(hash_deviceid="hash-1"))
         [device] = _sync(db, user_id, _entry())
         assert device.hash_device_id == "hash-1"
-
-    def test_hash_for_unknown_device_is_none(self, db: Session) -> None:
-        user_id = _member(db)
-        [device] = _sync(db, user_id, _entry())
-        assert hash_for(db, user_connection_id=device.user_connection_id, device_id="nope") is None

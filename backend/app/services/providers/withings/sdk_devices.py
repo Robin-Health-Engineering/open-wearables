@@ -169,15 +169,6 @@ def _upsert(
     return device
 
 
-def hash_for(db: DbSession, *, user_connection_id: UUID, device_id: str) -> str | None:
-    """The stored hash_deviceid for one device on one account, or None if unknown."""
-    return (
-        db.query(WithingsDevice.hash_device_id)
-        .filter(WithingsDevice.user_connection_id == user_connection_id, WithingsDevice.device_id == device_id)
-        .scalar()
-    )
-
-
 def record_installed_device(
     db: DbSession,
     *,
