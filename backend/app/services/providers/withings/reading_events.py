@@ -25,11 +25,12 @@ from celery import current_app as celery_app
 
 from app.config import settings
 from app.database import DbSession
+from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings.measure_groups import ParsedGroup
-from app.services.providers.withings.sdk_devices import hash_for, sync_devices_from_withings
+from app.services.providers.withings.sdk_devices import sync_devices_from_withings
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
@@ -49,7 +50,7 @@ def _iso_utc(value: datetime) -> str:
 
 
 def build_payload(
-    *, external_user_id: str, withings_user_id: str, group: ParsedGroup, hash_deviceid: str | None = None
+    *, external_user_id: str, withings_user_id: str | None, group: ParsedGroup, hash_deviceid: str | None = None
 ) -> dict[str, Any]:
     return {
         "event": EVENT_NAME,
@@ -72,6 +73,40 @@ def _eligible(group: ParsedGroup, cutoff: datetime) -> bool:
     )
 
 
+def _devices(db: DbSession, user_connection_id: UUID, device_ids: set[str]) -> dict[str, tuple[str | None, bool]]:
+    """device_id -> (stored hash, whether Getdevice has ever listed it). Absent = no row yet."""
+    rows = db.query(WithingsDevice.device_id, WithingsDevice.hash_device_id, WithingsDevice.last_getdevice_at).filter(
+        WithingsDevice.user_connection_id == user_connection_id, WithingsDevice.device_id.in_(device_ids)
+    )
+    return {device_id: (hash_device_id, listed_at is not None) for device_id, hash_device_id, listed_at in rows}
+
+
+def _needs_refresh(devices: dict[str, tuple[str | None, bool]], device_ids: set[str]) -> bool:
+    """A device with no row, or a row Getdevice has never listed, and no hash.
+
+    A device Getdevice HAS listed without a hash simply does not report one: asking again on
+    every reading would cost a Getdevice call per weigh-in and change nothing.
+    """
+    for device_id in device_ids:
+        hash_device_id, listed = devices.get(device_id, (None, False))
+        if hash_device_id is None and not listed:
+            return True
+    return False
+
+
+def _rollback(db: DbSession, user_connection_id: UUID) -> None:
+    """Leave the caller's session usable; a failing rollback must not escape either."""
+    try:
+        db.rollback()
+    except Exception as rollback_error:
+        log_and_capture_error(
+            rollback_error,
+            logger,
+            "Withings reading event rollback failed",
+            extra={"provider": "withings", "user_connection_id": str(user_connection_id)},
+        )
+
+
 def _refresh_hashes(db: DbSession, *, user_id: UUID, user_connection_id: UUID, oauth: BaseOAuthTemplate) -> None:
     """One Getdevice sweep of this connection, so a first reading can carry its hash_deviceid.
 
@@ -81,7 +116,7 @@ def _refresh_hashes(db: DbSession, *, user_id: UUID, user_connection_id: UUID, o
     try:
         sync_devices_from_withings(db, user_id=user_id, oauth=oauth, connection_id=user_connection_id)
     except Exception as e:
-        db.rollback()
+        _rollback(db, user_connection_id)
         log_and_capture_error(
             e,
             logger,
@@ -122,23 +157,32 @@ def enqueue_new_reading_events(
             return 0
         # Read everything off the ORM objects now: a failed refresh rolls the session back.
         external_user_id = account.external_id
-        withings_user_id = str(connection.provider_user_id)
+        # JSON null rather than the string "None" when Withings never reported a userid.
+        withings_user_id = str(connection.provider_user_id) if connection.provider_user_id is not None else None
         user_id = connection.user_id
+        device_ids = {g.device_id for g in eligible if g.device_id is not None}
 
-        def _hashes() -> dict[str, str | None]:
-            return {
-                device_id: hash_for(db, user_connection_id=user_connection_id, device_id=device_id)
-                for device_id in {g.device_id for g in eligible if g.device_id is not None}
-            }
-
-        hashes = _hashes()
-        if oauth is not None and any(h is None for h in hashes.values()):
+        devices = _devices(db, user_connection_id, device_ids)
+        if oauth is not None and _needs_refresh(devices, device_ids):
             # The first reading from a device can beat the Getdevice sweep that stores its hash.
             _refresh_hashes(db, user_id=user_id, user_connection_id=user_connection_id, oauth=oauth)
-            hashes = _hashes()
+            devices = _devices(db, user_connection_id, device_ids)
+        hashes = {device_id: devices.get(device_id, (None, False))[0] for device_id in device_ids}
+    except Exception as e:
+        _rollback(db, user_connection_id)
+        log_and_capture_error(
+            e,
+            logger,
+            "Withings reading event enqueue failed",
+            extra={"provider": "withings", "user_connection_id": str(user_connection_id)},
+        )
+        return 0
 
-        sent = 0
-        for group in eligible:
+    sent = 0
+    for group in eligible:
+        # Per group: the groups are already committed as seen, so one failed enqueue must not
+        # drop the rest of the batch with it.
+        try:
             payload = build_payload(
                 external_user_id=external_user_id,
                 withings_user_id=withings_user_id,
@@ -147,22 +191,22 @@ def enqueue_new_reading_events(
             )
             celery_app.send_task(DELIVER_TASK, args=[payload], queue="default")
             sent += 1
-        log_structured(
-            logger,
-            "info",
-            "Withings reading events enqueued",
-            provider="withings",
-            action="reading_event_enqueued",
-            user_connection_id=str(user_connection_id),
-            count=sent,
-            without_hash=sum(1 for h in hashes.values() if h is None),
-        )
-        return sent
-    except Exception as e:
-        log_and_capture_error(
-            e,
-            logger,
-            "Withings reading event enqueue failed",
-            extra={"provider": "withings", "user_connection_id": str(user_connection_id)},
-        )
-        return 0
+        except Exception as e:
+            log_and_capture_error(
+                e,
+                logger,
+                "Withings reading event enqueue failed",
+                extra={"provider": "withings", "user_connection_id": str(user_connection_id), "grpid": group.grpid},
+            )
+    log_structured(
+        logger,
+        "info",
+        "Withings reading events enqueued",
+        provider="withings",
+        action="reading_event_enqueued",
+        user_connection_id=str(user_connection_id),
+        count=sent,
+        failed=len(eligible) - sent,
+        without_hash=sum(1 for h in hashes.values() if h is None),
+    )
+    return sent

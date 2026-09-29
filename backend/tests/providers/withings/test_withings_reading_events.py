@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -61,7 +62,12 @@ def _external_id(db: Session, connection_id: UUID) -> str:
 
 
 def _add_device(
-    db: Session, connection_id: UUID, device_id: str = "dev-1", hash_device_id: str | None = "hash-1"
+    db: Session,
+    connection_id: UUID,
+    device_id: str = "dev-1",
+    hash_device_id: str | None = "hash-1",
+    *,
+    listed: bool = False,
 ) -> None:
     db.add(
         WithingsDevice(
@@ -69,6 +75,7 @@ def _add_device(
             user_connection_id=connection_id,
             device_id=device_id,
             hash_device_id=hash_device_id,
+            last_getdevice_at=_NOW if listed else None,
             updated_at=_NOW,
         )
     )
@@ -249,3 +256,65 @@ def test_enqueue_error_is_swallowed(
         n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert n == 0
     capture.assert_called_once()
+
+
+def test_one_failed_enqueue_does_not_drop_the_rest_of_the_batch(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    with (
+        patch(_SEND, side_effect=[None, ConnectionError("redis blip"), None]) as send,
+        patch(f"{_MODULE}.log_and_capture_error") as capture,
+    ):
+        n = reading_events.enqueue_new_reading_events(
+            db, user_connection_id=connection.id, groups=[_group("1"), _group("2"), _group("3")], now=_NOW
+        )
+    assert n == 2
+    assert [p["grpid"] for p in _sent(send)] == ["1", "2", "3"]
+    capture.assert_called_once()
+    assert capture.call_args.kwargs["extra"]["grpid"] == "2"
+
+
+def test_a_failed_setup_query_leaves_the_session_usable(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+
+    def _broken_query(db: Session, *_: Any) -> None:
+        db.execute(text("SELECT * FROM no_such_table"))  # aborts the transaction, as a real DB error does
+
+    with (
+        patch(_SEND) as send,
+        patch(f"{_MODULE}.UserConnectionRepository.get", side_effect=_broken_query),
+        patch(f"{_MODULE}.log_and_capture_error") as capture,
+    ):
+        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+    assert n == 0
+    send.assert_not_called()
+    capture.assert_called_once()
+    assert db.execute(select(1)).scalar() == 1  # without the rollback: InFailedSqlTransaction
+
+
+def test_a_device_getdevice_listed_without_a_hash_is_not_refreshed(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    _add_device(db, connection.id, hash_device_id=None, listed=True)  # Getdevice saw it, no hash reported
+    with patch(_SEND) as send, patch(_SYNC) as sync:
+        n = reading_events.enqueue_new_reading_events(
+            db, user_connection_id=connection.id, groups=[_group()], now=_NOW, oauth=MagicMock()
+        )
+    assert n == 1
+    sync.assert_not_called()
+    assert send.call_args.kwargs["args"][0]["hash_deviceid"] is None
+
+
+def test_a_missing_withings_userid_is_sent_as_null(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    _, connection = make_provisioned_connection()
+    connection.provider_user_id = None
+    db.flush()
+    with patch(_SEND) as send:
+        reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+    assert send.call_args.kwargs["args"][0]["withings_user_id"] is None
