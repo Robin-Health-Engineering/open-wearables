@@ -1,16 +1,24 @@
 """The Robin reading event: who gets one and what it says (delivery is Task 8's)."""
 
+import hashlib
+import hmac
+import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from celery.exceptions import MaxRetriesExceededError
 from pydantic import SecretStr
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.integrations.celery.core import create_celery
+from app.integrations.celery.tasks.withings_reading_event_task import deliver_withings_reading_event
 from app.models import UserConnection
 from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
@@ -318,3 +326,176 @@ def test_a_missing_withings_userid_is_sent_as_null(
     with patch(_SEND) as send:
         reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert send.call_args.kwargs["args"][0]["withings_user_id"] is None
+
+
+_POST = f"{_MODULE}.httpx.post"
+_TASK_MODULE = "app.integrations.celery.tasks.withings_reading_event_task"
+
+
+def test_sign_is_hmac_sha256_over_timestamp_dot_body() -> None:
+    body = b'{"a":1}'
+    expected = hmac.new(b"s3cret", b"1790668800." + body, hashlib.sha256).hexdigest()
+    assert reading_events.sign("s3cret", 1790668800, body) == f"t=1790668800,v1={expected}"
+
+
+def test_sign_matches_robins_verifier_formula() -> None:
+    """Robin verifies lowercase-hex HMAC-SHA256(secret, "<t>.<raw body>"); pin it independently."""
+    secret, t, body = "whsec_test", 1790668800, b'{"event":"withings.reading.created","grpid":"9"}'
+    message = str(t).encode() + b"." + body
+    robin_expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    header = reading_events.sign(secret, t, body)
+    assert header == f"t={t},v1={robin_expected}"
+    assert robin_expected == robin_expected.lower()
+    assert len(robin_expected) == 64
+    # a different body or timestamp must not verify
+    assert reading_events.sign(secret, t + 1, body) != header
+    assert reading_events.sign(secret, t, body + b" ") != header
+
+
+def test_post_event_sends_the_signed_raw_body(enabled: None) -> None:
+    payload = reading_events.build_payload(external_user_id="cp", withings_user_id="1", group=_group())
+    with patch(_POST, return_value=httpx.Response(200)) as post:
+        assert reading_events.post_event(payload, now=1790668800) == "delivered"
+    sent_body = post.call_args.kwargs["content"]
+    assert json.loads(sent_body) == payload
+    headers = post.call_args.kwargs["headers"]
+    assert headers["Content-Type"] == "application/json"
+    assert headers["X-Robin-Signature"] == reading_events.sign("s3cret", 1790668800, sent_body)
+    assert post.call_args.args[0] == "https://robin.example/reading-event"
+    assert post.call_args.kwargs["timeout"] == 10.0
+    assert post.call_args.kwargs.get("follow_redirects", False) is False
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        (200, "delivered"),
+        (202, "delivered"),
+        (204, "delivered"),
+        (301, "rejected"),
+        (302, "rejected"),
+        (307, "rejected"),
+        (400, "rejected"),
+        (401, "rejected"),
+        (404, "rejected"),
+        (429, "rejected"),
+        (500, "retry"),
+        (502, "retry"),
+        (503, "retry"),
+    ],
+)
+def test_post_event_classifies_status(enabled: None, status: int, outcome: str) -> None:
+    with patch(_POST, return_value=httpx.Response(status)):
+        assert reading_events.post_event({"grpid": "1"}) == outcome
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectTimeout("slow"), httpx.ReadTimeout("slow"), httpx.ConnectError("down")])
+def test_post_event_retries_on_network_error(enabled: None, error: Exception) -> None:
+    with patch(_POST, side_effect=error):
+        assert reading_events.post_event({"grpid": "1"}) == "retry"
+
+
+def test_post_event_disabled_without_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "robin_reading_event_url", None)
+    monkeypatch.setattr(settings, "robin_reading_event_secret", SecretStr("s3cret"))
+    with patch(_POST) as post, patch(f"{_MODULE}.log_structured") as log:
+        assert reading_events.post_event({"grpid": "1"}) == "disabled"
+    post.assert_not_called()
+    assert "disabled" in log.call_args.args[2]
+
+
+def test_post_event_disabled_without_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "robin_reading_event_url", "https://robin.example/reading-event")
+    monkeypatch.setattr(settings, "robin_reading_event_secret", None)
+    with patch(_POST) as post:
+        assert reading_events.post_event({"grpid": "1"}) == "disabled"
+    post.assert_not_called()
+
+
+def test_a_rejection_is_captured_and_leaks_nothing(enabled: None, caplog: pytest.LogCaptureFixture) -> None:
+    payload = {"grpid": "77", "external_user_id": "member-secret-id"}
+    with (
+        caplog.at_level(logging.DEBUG),
+        patch(f"{_MODULE}.log_and_capture_error") as capture,
+        patch(_POST, return_value=httpx.Response(401)),
+    ):
+        assert reading_events.post_event(payload, now=1790668800) == "rejected"
+    capture.assert_called_once()
+    rendered = caplog.text + repr(capture.call_args)
+    assert "member-secret-id" not in rendered
+    assert "s3cret" not in rendered
+    assert "v1=" not in rendered
+
+
+def test_network_error_log_leaks_nothing(enabled: None, caplog: pytest.LogCaptureFixture) -> None:
+    payload = {"grpid": "77", "external_user_id": "member-secret-id"}
+    with caplog.at_level(logging.DEBUG), patch(_POST, side_effect=httpx.ConnectError("down")):
+        assert reading_events.post_event(payload) == "retry"
+    assert "member-secret-id" not in caplog.text
+    assert "s3cret" not in caplog.text
+
+
+def test_task_is_registered_under_the_enqueued_name() -> None:
+    assert deliver_withings_reading_event.name == reading_events.DELIVER_TASK
+    assert reading_events.DELIVER_TASK in create_celery().tasks
+
+
+def test_task_retry_budget_is_three_attempts_total() -> None:
+    assert deliver_withings_reading_event.max_retries == 2
+
+
+@pytest.mark.parametrize(("retries", "countdown"), [(0, 10), (1, 20)])
+def test_task_backs_off_exponentially_on_every_retry(retries: int, countdown: int) -> None:
+    deliver_withings_reading_event.push_request(retries=retries)
+    try:
+        with (
+            patch(f"{_TASK_MODULE}.post_event", return_value="retry"),
+            patch.object(deliver_withings_reading_event, "retry", side_effect=RuntimeError("retrying")) as retry,
+            pytest.raises(RuntimeError, match="retrying"),
+        ):
+            deliver_withings_reading_event.run({"grpid": "1"})
+    finally:
+        deliver_withings_reading_event.pop_request()
+    assert retry.call_args.kwargs["countdown"] == countdown
+
+
+def test_task_gives_up_after_the_third_attempt() -> None:
+    deliver_withings_reading_event.push_request(retries=2)
+    try:
+        with (
+            patch(f"{_TASK_MODULE}.post_event", return_value="retry") as post_event,
+            patch(f"{_TASK_MODULE}.log_and_capture_error") as capture,
+            pytest.raises(MaxRetriesExceededError),
+        ):
+            deliver_withings_reading_event.run({"grpid": "1", "external_user_id": "member-secret-id"})
+    finally:
+        deliver_withings_reading_event.pop_request()
+    post_event.assert_called_once()
+    capture.assert_called_once()
+    assert "member-secret-id" not in repr(capture.call_args)
+
+
+def test_three_attempts_in_total_against_a_down_robin(enabled: None) -> None:
+    """Drive the real task through attempts 0..2 against a 503 Robin: exactly 3 POSTs, then it fails."""
+    with patch(_POST, return_value=httpx.Response(503)) as post, patch(f"{_TASK_MODULE}.log_and_capture_error"):
+        for attempt in range(3):
+            deliver_withings_reading_event.push_request(retries=attempt)
+            try:
+                with (
+                    patch.object(deliver_withings_reading_event, "retry", side_effect=RuntimeError("again")),
+                    pytest.raises(RuntimeError if attempt < 2 else MaxRetriesExceededError),
+                ):
+                    deliver_withings_reading_event.run({"grpid": "1"})
+            finally:
+                deliver_withings_reading_event.pop_request()
+    assert post.call_count == 3
+
+
+@pytest.mark.parametrize("outcome", ["delivered", "rejected", "disabled"])
+def test_task_does_not_retry_terminal_outcomes(outcome: str) -> None:
+    with (
+        patch(f"{_TASK_MODULE}.post_event", return_value=outcome),
+        patch.object(deliver_withings_reading_event, "retry") as retry,
+    ):
+        assert deliver_withings_reading_event.run({"grpid": "1"}) == {"outcome": outcome}
+    retry.assert_not_called()

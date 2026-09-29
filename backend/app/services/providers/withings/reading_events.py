@@ -12,15 +12,20 @@ Sent only for groups that are
 * carrying at least one C2 metric (a blood-pressure-only group has nothing to announce);
 * RECENT (``robin_reading_event_max_age_hours``), because backfills re-read history.
 
-This module stops at the enqueue. Signing and the POST are the Celery task's (``DELIVER_TASK``),
-enqueued by name so there is no import dependency on it.
+Enqueue is by name (``DELIVER_TASK``), so there is no import dependency on the Celery task; the
+task calls ``post_event`` here, which signs and POSTs.
 """
 
+import hashlib
+import hmac
+import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
+import httpx
 from celery import current_app as celery_app
 
 from app.config import settings
@@ -39,6 +44,10 @@ logger = logging.getLogger(__name__)
 EVENT_NAME = "withings.reading.created"
 DELIVER_TASK = "app.integrations.celery.tasks.withings_reading_event_task.deliver_withings_reading_event"
 _MANUAL_ATTRIBS = frozenset({2, 4})
+
+DeliveryOutcome = Literal["delivered", "rejected", "retry", "disabled"]
+# Bounded so a hung Robin cannot pin a worker; stays under Robin's handler budget.
+_TIMEOUT_SECONDS = 10.0
 
 
 def is_enabled() -> bool:
@@ -210,3 +219,77 @@ def enqueue_new_reading_events(
         without_hash=sum(1 for h in hashes.values() if h is None),
     )
     return sent
+
+
+def sign(secret: str, timestamp: int, body: bytes) -> str:
+    """``X-Robin-Signature`` value: ``t=<ts>,v1=<lowercase hex HMAC-SHA256(secret, "<ts>.<body>")>``."""
+    digest = hmac.new(secret.encode("utf-8"), f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+    return f"t={timestamp},v1={digest}"
+
+
+def post_event(payload: dict[str, Any], *, now: int | None = None) -> DeliveryOutcome:
+    """POST one event. The timestamp is minted per ATTEMPT so a retry stays inside Robin's window.
+
+    Retry only on network errors and 5xx. Robin answers 2xx for every well-formed signed event,
+    including ones it drops, so a 3xx/4xx means OUR request is wrong (bad secret, clock skew, wrong
+    URL) and retrying cannot fix it. Never logs the secret, the signature or the external_user_id.
+    """
+    url = settings.robin_reading_event_url
+    secret = settings.robin_reading_event_secret
+    grpid = payload.get("grpid")
+    if not url or secret is None:
+        log_structured(
+            logger,
+            "info",
+            "Robin reading event delivery disabled: url or secret unset",
+            provider="withings",
+            action="reading_event_disabled",
+            grpid=grpid,
+        )
+        return "disabled"
+    # Serialise once and send exactly these bytes: the signature covers the raw body.
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    timestamp = now if now is not None else int(time.time())
+    try:
+        response = httpx.post(
+            url,
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Robin-Signature": sign(secret.get_secret_value(), timestamp, body),
+            },
+            timeout=_TIMEOUT_SECONDS,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as e:
+        log_structured(
+            logger,
+            "warning",
+            "Robin reading event delivery failed",
+            provider="withings",
+            action="reading_event_network_error",
+            grpid=grpid,
+            error=type(e).__name__,
+        )
+        return "retry"
+    status = response.status_code
+    if status >= 500:
+        log_structured(
+            logger,
+            "warning",
+            "Robin reading event delivery got a server error",
+            provider="withings",
+            action="reading_event_server_error",
+            grpid=grpid,
+            status=status,
+        )
+        return "retry"
+    if status >= 300:
+        log_and_capture_error(
+            RuntimeError(f"Robin rejected a reading event with HTTP {status}"),
+            logger,
+            "Robin rejected a reading event",
+            extra={"provider": "withings", "action": "reading_event_rejected", "grpid": grpid, "status": status},
+        )
+        return "rejected"
+    return "delivered"
