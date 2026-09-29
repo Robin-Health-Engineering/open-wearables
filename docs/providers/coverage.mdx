@@ -189,8 +189,10 @@ This guide gives an overview of data type support across the integrated wearable
 | `garmin_body_battery` | percent | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `garmin_fitness_age` | years | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `garmin_stress_level` | score | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `withings_basal_metabolic_rate` | kcal | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `withings_metabolic_age` | years | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `withings_pulse_wave_velocity` | m_per_s | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `withings_visceral_fat` | score | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 
 ### Other
 
@@ -446,7 +448,7 @@ Key differences and limitations to be aware of when working with each provider:
   - Notify-only webhooks: Withings sends a lightweight push notification per user; Open Wearables fetches the actual data via REST API on receipt
   - Webhook subscriptions are **per-user**: the shared registration task fans out reconciliation of the current live-sync mode to each connected user
   - Notification callbacks use Withings' recommended `?token=<random-secret>` validation; configure `WITHINGS_WEBHOOK_TOKEN` before enabling webhook live sync
-  - Body measures from `getmeas`: weight, height, lean body mass, body fat %, body fat mass, blood pressure (systolic/diastolic), heart rate, body temperature, skin temperature, oxygen saturation, skeletal muscle mass, bone mass, body water mass, blood glucose, VO2 max, and vascular age mapped to `cardiovascular_age`; plus the provider-specific `withings_pulse_wave_velocity` and `withings_metabolic_age` series
+  - Body measures from `getmeas`: weight, height, lean body mass, body fat %, body fat mass, blood pressure (systolic/diastolic), heart rate, body temperature, skin temperature, oxygen saturation, skeletal muscle mass, bone mass, body water mass, blood glucose, VO2 max, and vascular age mapped to `cardiovascular_age`; plus visceral fat index and basal metabolic rate; plus the provider-specific `withings_pulse_wave_velocity`, `withings_metabolic_age`, `withings_visceral_fat` and `withings_basal_metabolic_rate` series
   - Deferred `getmeas` types are listed with their reason in the `DEFERRED_MEASURE_TYPES` map in `withings/coverage.py` — generic temperature type 12 needs device-aware environmental-versus-body classification; extracellular/intracellular water compartments (kg, not the core mL intake series), AFib classifications (not burden), segmental composition, ECG intervals, nerve health scores, nerve/skin conductance, visceral fat, and BMR (a rate, not basal energy expenditure) all need explicit core-model agreement before ingestion
   - Daily activity from `getactivity`: steps, distance, and active calories are stored as provider-native daily totals; the passive component of total calories is derived as `totalcalories - calories` and stored as the daily `basal_energy` total, avoiding active-energy double counting
   - Sleep from `getsummary`: full stage breakdown (deep, light, REM, awake) and sleep efficiency; sleep records are merged when sessions are within the configured gap window

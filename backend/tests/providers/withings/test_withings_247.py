@@ -57,6 +57,7 @@ def test_normalize_measures_keeps_mapped_and_drops_deferred_official_types() -> 
                 {"value": 1, "type": 130, "unit": 0},  # AFib classification
                 {"value": 12, "type": 196, "unit": 0},  # Nerve Response Score
                 {"value": 1800, "type": 226, "unit": 0},  # BMR rate
+                {"value": 8, "type": 170, "unit": 0},  # visceral fat index
                 {"value": 40, "type": 227, "unit": 0},  # metabolic age
                 {"value": 7500, "type": 1, "unit": -2},  # weight 75.00 kg → kept
             ],
@@ -69,7 +70,35 @@ def test_normalize_measures_keeps_mapped_and_drops_deferred_official_types() -> 
         SeriesType.withings_pulse_wave_velocity,
         SeriesType.body_water_mass,
         SeriesType.withings_metabolic_age,
+        SeriesType.withings_basal_metabolic_rate,
+        SeriesType.withings_visceral_fat,
     }
+
+
+def test_normalize_measures_keeps_visceral_fat_and_bmr_values() -> None:
+    groups = [
+        {
+            "date": 1728000000,
+            "measures": [
+                {"value": 8, "type": 170, "unit": 0},  # visceral fat index 8
+                {"value": 1620, "type": 226, "unit": 0},  # BMR 1620 kcal/day
+            ],
+        }
+    ]
+    by_type = {s.series_type: s for s in _make_data_247().normalize_measures(groups, uuid4())}
+    assert by_type[SeriesType.withings_visceral_fat].value == Decimal("8")
+    assert by_type[SeriesType.withings_basal_metabolic_rate].value == Decimal("1620")
+
+
+@patch("app.services.providers.withings.data_247.timeseries_service")
+@patch("app.services.providers.withings.data_247.paginate")
+def test_getmeas_requests_visceral_fat_and_bmr(mock_paginate: MagicMock, mock_ts: MagicMock) -> None:
+    d = _make_data_247()
+    mock_paginate.return_value = PaginatedResult(rows=[], envelope={})
+    with patch.object(d.connection_repo, "get_active_connection", return_value=MagicMock(id=uuid4())):
+        d.save_measures(MagicMock(), uuid4(), datetime.now(timezone.utc), datetime.now(timezone.utc))
+    requested = {int(c) for c in mock_paginate.call_args.kwargs["params"]["meastypes"].split(",")}
+    assert {170, 226} <= requested
 
 
 def test_normalize_measures_converts_height_metres_to_cm() -> None:

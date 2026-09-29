@@ -1,4 +1,5 @@
-from app.schemas.enums import SeriesType
+from app.schemas.enums import SeriesType, get_series_type_id, get_series_type_unit
+from app.schemas.enums.aggregation_method import AggregationMethod, get_aggregation_method
 from app.schemas.enums.series_types import SERIES_TYPE_CATEGORY_BY_ENUM
 from app.services.providers.withings.coverage import DEFERRED_MEASURE_TYPES, MEASURE_TYPE_MAP, TIMESERIES
 
@@ -23,6 +24,8 @@ def test_getmeas_mapping_is_limited_to_core_semantic_matches() -> None:
         119: SeriesType.blood_glucose,
         123: SeriesType.vo2_max,
         155: SeriesType.cardiovascular_age,
+        170: SeriesType.withings_visceral_fat,
+        226: SeriesType.withings_basal_metabolic_rate,
         227: SeriesType.withings_metabolic_age,
     }
     assert expected == MEASURE_TYPE_MAP
@@ -30,7 +33,9 @@ def test_getmeas_mapping_is_limited_to_core_semantic_matches() -> None:
 
 def test_deferred_getmeas_types_are_recorded_and_never_mapped() -> None:
     assert DEFERRED_MEASURE_TYPES.keys().isdisjoint(MEASURE_TYPE_MAP)
-    assert {12, 130, 140, 158, 159, 167, 196, 226}.issubset(DEFERRED_MEASURE_TYPES)
+    assert {12, 130, 140, 158, 159, 167, 196}.issubset(DEFERRED_MEASURE_TYPES)
+    assert 170 not in DEFERRED_MEASURE_TYPES
+    assert 226 not in DEFERRED_MEASURE_TYPES
     assert "environmental temperature" in DEFERRED_MEASURE_TYPES[12]
     assert "device-aware mapping" in DEFERRED_MEASURE_TYPES[12]
     assert "left-foot Nerve Health Score" in DEFERRED_MEASURE_TYPES[158]
@@ -49,3 +54,14 @@ def test_withings_series_use_their_canonical_categories() -> None:
     assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.bone_mass] == "Body Composition"
     assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.withings_pulse_wave_velocity] == "Provider-Specific"
     assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.withings_metabolic_age] == "Provider-Specific"
+    assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.withings_visceral_fat] == "Provider-Specific"
+    assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.withings_basal_metabolic_rate] == "Provider-Specific"
+
+
+def test_visceral_fat_and_bmr_are_withings_block_series() -> None:
+    assert get_series_type_id(SeriesType.withings_visceral_fat) == 242
+    assert get_series_type_id(SeriesType.withings_basal_metabolic_rate) == 243
+    assert get_series_type_unit(SeriesType.withings_visceral_fat) == "score"
+    assert get_series_type_unit(SeriesType.withings_basal_metabolic_rate) == "kcal"
+    assert get_aggregation_method(SeriesType.withings_visceral_fat) == AggregationMethod.AVG
+    assert get_aggregation_method(SeriesType.withings_basal_metabolic_rate) == AggregationMethod.AVG

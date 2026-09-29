@@ -24,6 +24,10 @@ MEASURE_TYPE_MAP: dict[int, SeriesType] = {
     119: SeriesType.blood_glucose,
     123: SeriesType.vo2_max,
     155: SeriesType.cardiovascular_age,
+    170: SeriesType.withings_visceral_fat,
+    # BMR is a RATE (kcal/day), not basal energy expended over a window, so it does not map to
+    # SeriesType.basal_energy; it gets a provider-specific series, like metabolic age.
+    226: SeriesType.withings_basal_metabolic_rate,
     227: SeriesType.withings_metabolic_age,
 }
 
@@ -48,12 +52,10 @@ DEFERRED_MEASURE_TYPES: dict[int, str] = {
     ),
     168: "extracellular water (kg); not the core mL intake series",
     169: "intracellular water (kg); not the core mL intake series",
-    170: "visceral fat; no core series type",
     173: "segmental fat-free mass; no core series type",
     174: "segmental fat mass; no core series type",
     175: "segmental muscle mass; no core series type",
     196: "Nerve Response Score; no core series type",
-    226: "BMR rate, not basal energy expenditure",
     229: "electrochemical skin conductance; no core series type",
 }
 

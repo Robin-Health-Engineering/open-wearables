@@ -110,6 +110,8 @@ AGGREGATION_METHOD_BY_TYPE: dict[SeriesType, AggregationMethod] = {
     # ── Withings-specific ──
     SeriesType.withings_pulse_wave_velocity: AggregationMethod.AVG,
     SeriesType.withings_metabolic_age: AggregationMethod.AVG,
+    SeriesType.withings_visceral_fat: AggregationMethod.AVG,
+    SeriesType.withings_basal_metabolic_rate: AggregationMethod.AVG,
     # ── Other ──
     SeriesType.electrodermal_activity: AggregationMethod.AVG,
     SeriesType.push_count: AggregationMethod.SUM,
