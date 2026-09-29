@@ -1,6 +1,6 @@
 from app.schemas.enums import SeriesType, get_series_type_id, get_series_type_unit
 from app.schemas.enums.aggregation_method import AggregationMethod, get_aggregation_method
-from app.schemas.enums.series_types import SERIES_TYPE_CATEGORY_BY_ENUM
+from app.schemas.enums.series_types import SERIES_TYPE_CATEGORY_BY_ENUM, SERIES_TYPE_DEFINITIONS
 from app.services.providers.withings.coverage import DEFERRED_MEASURE_TYPES, MEASURE_TYPE_MAP, TIMESERIES
 
 
@@ -58,10 +58,21 @@ def test_withings_series_use_their_canonical_categories() -> None:
     assert SERIES_TYPE_CATEGORY_BY_ENUM[SeriesType.withings_basal_metabolic_rate] == "Provider-Specific"
 
 
-def test_visceral_fat_and_bmr_are_withings_block_series() -> None:
-    assert get_series_type_id(SeriesType.withings_visceral_fat) == 242
-    assert get_series_type_id(SeriesType.withings_basal_metabolic_rate) == 243
+def test_visceral_fat_and_bmr_live_in_the_robin_fork_id_range() -> None:
+    # Not 242/243: upstream owns the Withings block (240-259), and the seed upserts by id, so an
+    # upstream series landing on the same id would silently relabel our stored rows.
+    assert get_series_type_id(SeriesType.withings_visceral_fat) == 900
+    assert get_series_type_id(SeriesType.withings_basal_metabolic_rate) == 901
     assert get_series_type_unit(SeriesType.withings_visceral_fat) == "score"
     assert get_series_type_unit(SeriesType.withings_basal_metabolic_rate) == "kcal"
     assert get_aggregation_method(SeriesType.withings_visceral_fat) == AggregationMethod.AVG
     assert get_aggregation_method(SeriesType.withings_basal_metabolic_rate) == AggregationMethod.AVG
+
+
+def test_the_robin_fork_id_range_holds_only_fork_series() -> None:
+    # Fails loudly if an upstream merge ever puts one of its series in the fork's range.
+    in_range = {type_id: enum for type_id, enum, _ in SERIES_TYPE_DEFINITIONS if 900 <= type_id < 1000}
+    assert in_range == {
+        900: SeriesType.withings_visceral_fat,
+        901: SeriesType.withings_basal_metabolic_rate,
+    }

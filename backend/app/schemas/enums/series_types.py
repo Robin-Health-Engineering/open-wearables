@@ -162,8 +162,6 @@ class SeriesType(str, Enum):
     # =========================================================================
     withings_pulse_wave_velocity = "withings_pulse_wave_velocity"
     withings_metabolic_age = "withings_metabolic_age"
-    withings_visceral_fat = "withings_visceral_fat"  # unitless visceral fat index (meastype 170)
-    withings_basal_metabolic_rate = "withings_basal_metabolic_rate"  # kcal/day (meastype 226)
 
     # =========================================================================
     # OTHER (IDs 500-)
@@ -177,6 +175,12 @@ class SeriesType(str, Enum):
     number_of_alcoholic_beverages = "number_of_alcoholic_beverages"
     nike_fuel = "nike_fuel"
     hydration = "hydration"
+
+    # =========================================================================
+    # ROBIN FORK (IDs 900-999): series this fork adds, outside every upstream block
+    # =========================================================================
+    withings_visceral_fat = "withings_visceral_fat"  # unitless visceral fat index (meastype 170)
+    withings_basal_metabolic_rate = "withings_basal_metabolic_rate"  # kcal/day (meastype 226)
 
 
 # =============================================================================
@@ -314,8 +318,6 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     # -------------------------------------------------------------------------
     (240, SeriesType.withings_pulse_wave_velocity, "m_per_s"),
     (241, SeriesType.withings_metabolic_age, "years"),
-    (242, SeriesType.withings_visceral_fat, "score"),
-    (243, SeriesType.withings_basal_metabolic_rate, "kcal"),
     # -------------------------------------------------------------------------
     # OTHER (IDs 500-)
     # -------------------------------------------------------------------------
@@ -327,6 +329,14 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (505, SeriesType.number_of_alcoholic_beverages, "count"),
     (506, SeriesType.nike_fuel, "count"),
     (507, SeriesType.hydration, "mL"),
+    # -------------------------------------------------------------------------
+    # ROBIN FORK (IDs 900-999)
+    # -------------------------------------------------------------------------
+    # Upstream (the-momentum/open-wearables) owns every block above and keeps adding to them;
+    # scripts/init/seed_series_types.py upserts by id, so a fork series inside an upstream block
+    # would be silently relabelled the day upstream used that id. Fork series go here instead.
+    (900, SeriesType.withings_visceral_fat, "score"),
+    (901, SeriesType.withings_basal_metabolic_rate, "kcal"),
 ]
 
 
@@ -383,6 +393,7 @@ _CATEGORY_RANGES: list[tuple[range, str]] = [
     (range(200, 220), "Environmental"),
     (range(220, 260), "Provider-Specific"),  # 220-239 Garmin, 240-259 Withings
     (range(500, 600), "Other"),
+    (range(900, 1000), "Provider-Specific"),  # Robin fork series (see SERIES_TYPE_DEFINITIONS)
 ]
 
 SERIES_TYPE_CATEGORY_BY_ENUM: dict[SeriesType, str] = {}
