@@ -115,6 +115,7 @@ def _upsert(
     device_type: str | None = None,
     battery: str | None = None,
     last_session_at: datetime | None = None,
+    hash_device_id: str | None = None,
 ) -> WithingsDevice:
     """Create or update one device row, without ever losing what an earlier write stored.
 
@@ -148,6 +149,8 @@ def _upsert(
         device.battery = battery
     if last_session_at is not None:
         device.last_session_at = last_session_at
+    if hash_device_id:
+        device.hash_device_id = hash_device_id
 
     # Stamped for a Getdevice write and ONLY a Getdevice write — it records that Withings' own
     # list has seen this device, which is what makes the dissociation sweep safe. A device
@@ -164,6 +167,15 @@ def _upsert(
         db.add(device)
     db.flush()
     return device
+
+
+def hash_for(db: DbSession, *, user_connection_id: UUID, device_id: str) -> str | None:
+    """The stored hash_deviceid for one device on one account, or None if unknown."""
+    return (
+        db.query(WithingsDevice.hash_device_id)
+        .filter(WithingsDevice.user_connection_id == user_connection_id, WithingsDevice.device_id == device_id)
+        .scalar()
+    )
 
 
 def record_installed_device(
@@ -276,6 +288,7 @@ def _sync_one(
                 device_type=entry.type,
                 battery=entry.battery,
                 last_session_at=_from_unix(entry.last_session_date),
+                hash_device_id=entry.hash_deviceid,
             )
         )
 

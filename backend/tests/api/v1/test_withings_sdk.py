@@ -1067,3 +1067,40 @@ class TestOrderRefRoute:
 
         assert self._put(client, user, {"order_ref": "REF-1"}, api_key_header).status_code == 404
         assert db.query(WithingsDevice).filter_by(device_id="dev-1").one().order_ref is None
+
+
+class TestDeviceHashDeviceIdInResponse:
+    def _get(self, client: TestClient, user: User, headers: dict[str, str]) -> Any:
+        return client.get("/api/v1/providers/withings/sdk/devices", params={"user_id": str(user.id)}, headers=headers)
+
+    def test_list_carries_hash_deviceid(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, connection = make_provisioned_connection()
+        db.add(
+            WithingsDevice(
+                id=uuid4(),
+                user_connection_id=connection.id,
+                device_id="dev-1",
+                hash_device_id="hash-1",
+                updated_at=connection.updated_at,
+            )
+        )
+        db.commit()
+        r = self._get(client, user, api_key_header)
+        assert r.status_code == 200
+        assert r.json()[0]["hash_deviceid"] == "hash-1"
+
+    def test_absent_hash_is_a_present_null(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, connection = make_provisioned_connection()
+        db.add(
+            WithingsDevice(
+                id=uuid4(), user_connection_id=connection.id, device_id="dev-1", updated_at=connection.updated_at
+            )
+        )
+        db.commit()
+        body = self._get(client, user, api_key_header).json()[0]
+        assert "hash_deviceid" in body
+        assert body["hash_deviceid"] is None

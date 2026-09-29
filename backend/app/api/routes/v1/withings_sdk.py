@@ -847,6 +847,7 @@ class SdkDeviceResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     device_id: str
+    hash_deviceid: str | None
     model_id: int | None
     model: str | None
     device_type: str | None
@@ -858,6 +859,7 @@ class SdkDeviceResponse(BaseModel):
     def of(cls, device: WithingsDevice) -> "SdkDeviceResponse":
         return cls(
             device_id=device.device_id,
+            hash_deviceid=device.hash_device_id,
             model_id=device.model_id,
             model=device.model,
             device_type=device.device_type,

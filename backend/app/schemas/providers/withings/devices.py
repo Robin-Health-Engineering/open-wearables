@@ -18,6 +18,12 @@ class WithingsDeviceEntry(BaseModel):
 
     deviceid: str
 
+    # Withings' hashed device id. It is the ONE key that appears both here and on the dropshipment
+    # order detail (orderv2-getdetail products[].devices[].hash_deviceid), which is what lets
+    # robin-backend tie a device on the account to the order it shipped on. Optional: not every
+    # device or scope reports it.
+    hash_deviceid: str | None = None
+
     # Withings' numeric model. Their responses have carried both spellings across API
     # versions, so accept either rather than silently parse it as absent — a null model_id
     # means the setup WebView cannot be opened straight onto the right device.
