@@ -224,17 +224,31 @@ class WithingsWebhookHandler(BaseWebhookHandler):
                 components: dict[str, WriteCounts]
                 if domain == "measures":
                     # appli 1/2/4/58 all fetch via getmeas (requested meastypes in coverage.py).
-                    components = {"measures": WriteCounts.coerce(self.data_247.save_measures(db, user_id, start, end))}
+                    # Name the connection: without it the saver falls back to the member's
+                    # PRIMARY account and a notification for the provisioned one reads the wrong
+                    # account's token.
+                    components = {
+                        "measures": WriteCounts.coerce(
+                            self.data_247.save_measures(db, user_id, start, end, connection_id=connection.id)
+                        )
+                    }
                 elif domain == "sleep":
-                    components = {"sleep": WriteCounts.coerce(self.data_247.save_sleep(db, user_id, start, end))}
+                    components = {
+                        "sleep": WriteCounts.coerce(
+                            self.data_247.save_sleep(db, user_id, start, end, connection_id=connection.id)
+                        )
+                    }
                 elif domain == "activity_workouts":
                     # appli 16 covers both daily activity and workouts.
                     components = {
-                        "activity": WriteCounts.coerce(self.data_247.save_activity(db, user_id, start, end)),
+                        "activity": WriteCounts.coerce(
+                            self.data_247.save_activity(db, user_id, start, end, connection_id=connection.id)
+                        ),
                         "workouts": WriteCounts.coerce(
                             self.workouts.load_data(
                                 db,
                                 user_id,
+                                connection_id=connection.id,
                                 start_date=start.isoformat(),
                                 end_date=end.isoformat(),
                             )
