@@ -338,6 +338,13 @@ def test_sign_is_hmac_sha256_over_timestamp_dot_body() -> None:
     assert reading_events.sign("s3cret", 1790668800, body) == f"t=1790668800,v1={expected}"
 
 
+def test_sign_shared_vector_pinned_with_robin_backend() -> None:
+    """Fixed vector, hard-coded and shared verbatim with the robin-backend verifier test."""
+    body = b'{"event":"withings.reading.created","grpid":"1"}'
+    digest = "55c83d9f97fc00aa57844f068dfeeb4c00a3a96184db9c93570974bf2a41a877"
+    assert reading_events.sign("test-secret", 1790668800, body) == f"t=1790668800,v1={digest}"
+
+
 def test_sign_matches_robins_verifier_formula() -> None:
     """Robin verifies lowercase-hex HMAC-SHA256(secret, "<t>.<raw body>"); pin it independently."""
     secret, t, body = "whsec_test", 1790668800, b'{"event":"withings.reading.created","grpid":"9"}'
@@ -362,7 +369,7 @@ def test_post_event_sends_the_signed_raw_body(enabled: None) -> None:
     assert headers["Content-Type"] == "application/json"
     assert headers["X-Robin-Signature"] == reading_events.sign("s3cret", 1790668800, sent_body)
     assert post.call_args.args[0] == "https://robin.example/reading-event"
-    assert post.call_args.kwargs["timeout"] == 10.0
+    assert post.call_args.kwargs["timeout"] == 28.0
     assert post.call_args.kwargs.get("follow_redirects", False) is False
 
 

@@ -46,8 +46,8 @@ DELIVER_TASK = "app.integrations.celery.tasks.withings_reading_event_task.delive
 _MANUAL_ATTRIBS = frozenset({2, 4})
 
 DeliveryOutcome = Literal["delivered", "rejected", "retry", "disabled"]
-# Bounded so a hung Robin cannot pin a worker; stays under Robin's handler budget.
-_TIMEOUT_SECONDS = 10.0
+# Bounded so a hung Robin cannot pin a worker. Robin's API Gateway limit is 29 s (its Lambda 25 s), so 28 s.
+_TIMEOUT_SECONDS = 28.0
 
 
 def is_enabled() -> bool:
