@@ -385,7 +385,7 @@ def test_post_event_sends_the_signed_raw_body(enabled: None) -> None:
         (400, "rejected"),
         (401, "rejected"),
         (404, "rejected"),
-        (429, "rejected"),
+        (429, "retry"),
         (500, "retry"),
         (502, "retry"),
         (503, "retry"),

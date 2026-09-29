@@ -251,3 +251,20 @@ def test_reading_of_another_member_is_none(
     _reading(db, alice, alice_conn, "a1", _T0, weight=70)
     assert get_reading(db, user_id=bob.id, grpid="a1") is None
     assert get_reading(db, user_id=alice.id, grpid="a1") is not None
+
+
+def test_another_members_sample_with_the_same_grpid_and_time_is_not_a_metric(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """The sample join is scoped to the requesting member's data source, not only by grpid and time."""
+    alice, alice_conn = make_provisioned_connection()
+    bob, _ = make_provisioned_connection()
+    _reading(db, alice, alice_conn, "1", _T0, weight=70)
+    definition = db.get(SeriesTypeDefinition, get_series_type_id(SeriesType.heart_rate))
+    DataPointSeriesFactory(
+        data_source=_source(bob), series_type=definition, value=Decimal("99"), recorded_at=_T0, external_id="1"
+    )
+    db.flush()
+    reading = get_reading(db, user_id=alice.id, grpid="1")
+    assert reading is not None
+    assert reading.metrics == {"weight": 70.0}

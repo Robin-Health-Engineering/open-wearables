@@ -253,9 +253,10 @@ def sign(secret: str, timestamp: int, body: bytes) -> str:
 def post_event(payload: dict[str, Any], *, now: int | None = None) -> DeliveryOutcome:
     """POST one event. The timestamp is minted per ATTEMPT so a retry stays inside Robin's window.
 
-    Retry only on network errors and 5xx. Robin answers 2xx for every well-formed signed event,
-    including ones it drops, so a 3xx/4xx means OUR request is wrong (bad secret, clock skew, wrong
-    URL) and retrying cannot fix it. Never logs the secret, the signature or the external_user_id.
+    Retry on network errors, 5xx and 429 (API Gateway throttling is transient, and the request is
+    fine). Robin answers 2xx for every well-formed signed event, including ones it drops, so any
+    other 3xx/4xx means OUR request is wrong (bad secret, clock skew, wrong URL) and retrying cannot
+    fix it. Never logs the secret, the signature or the external_user_id.
     """
     grpid = payload.get("grpid")
     endpoint = _endpoint()
@@ -296,11 +297,11 @@ def post_event(payload: dict[str, Any], *, now: int | None = None) -> DeliveryOu
         )
         return "retry"
     status = response.status_code
-    if status >= 500:
+    if status >= 500 or status == 429:
         log_structured(
             logger,
             "warning",
-            "Robin reading event delivery got a server error",
+            "Robin reading event delivery got a server error or throttling",
             provider="withings",
             action="reading_event_server_error",
             grpid=grpid,
