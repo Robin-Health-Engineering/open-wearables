@@ -209,12 +209,13 @@ class Withings247Data(Base247DataTemplate):
         counts = timeseries_service.bulk_create_samples(db, samples)
         new_groups: list[ParsedGroup] = []
         if user_connection_id is not None:
+            parsed = [g for g in (parsed_group_of(x) for x in groups) if g is not None]
             # Same transaction as the samples: a group is "recorded" only if its samples are.
             new_groups = record_new_groups(
                 db,
                 user_id=user_id,
                 user_connection_id=user_connection_id,
-                groups=[g for g in (parsed_group_of(x) for x in groups) if g is not None],
+                groups=parsed,
             )
         db.commit()
         if new_groups and user_connection_id is not None:

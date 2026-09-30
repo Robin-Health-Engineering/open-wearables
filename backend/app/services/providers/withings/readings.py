@@ -134,6 +134,8 @@ def list_device_readings(
 ) -> ReadingPage:
     """One device's readings on the member's provisioned connections, newest first.
 
+    ``device_id`` matches a group's own ``deviceid`` or its ``hash_deviceid``.
+
     ``limit`` is clamped to 1..100. Raises ``InvalidReadingCursor`` for a cursor this function did
     not issue for this ``user_id`` and ``device_id``.
     """
@@ -144,7 +146,10 @@ def list_device_readings(
     limit = max(1, min(limit, _MAX_LIMIT))
     query = db.query(WithingsMeasureGroupRecord).filter(
         WithingsMeasureGroupRecord.user_connection_id.in_(connection_ids),
-        WithingsMeasureGroupRecord.device_id == device_id,
+        # Either id names the device: the device hub asks by withings_device.device_id, which for
+        # the cellular Body Pro 2 is the hash, while that scale's groups carry an unrelated integer
+        # deviceid beside it.
+        or_(WithingsMeasureGroupRecord.device_id == device_id, WithingsMeasureGroupRecord.hash_device_id == device_id),
     )
     if position is not None:
         at, grpid = position
