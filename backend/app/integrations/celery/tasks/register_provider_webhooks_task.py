@@ -3,7 +3,7 @@
 Dispatched when a provider's live_sync_mode is switched in settings. Runs
 asynchronously so the settings API response is not blocked. Providers with
 per-user subscriptions fan out from their own ``register_subscriptions`` into
-``sync_provider_user_subscription``, one task per active connection.
+``sync_provider_user_subscription``, one task per subscription-owning connection.
 """
 
 import asyncio
@@ -104,15 +104,23 @@ def register_provider_webhooks(self: Task, provider: str, callback_url: str) -> 
     max_retries=3,
     default_retry_delay=60,
 )
-def sync_provider_user_subscription(self: Task, provider: str, user_id: str) -> dict:
-    """Reconcile one user's subscriptions with the provider's current live-sync mode."""
+def sync_provider_user_subscription(self: Task, provider: str, user_id: str, connection_id: str | None = None) -> dict:
+    """Reconcile one user's subscriptions with the provider's current live-sync mode.
+
+    ``connection_id`` narrows it to one of the user's connections. Without it — including every
+    message queued before the argument existed — all of the user's connections are reconciled.
+    Results from every connection are aggregated, so a deferral or error on any one of them
+    retries the task.
+    """
     strategy = ProviderFactory().get_provider(provider)
     service = strategy.webhook_service
     if service is None:
         raise NotImplementedError(f"Provider '{provider}' does not manage per-user webhook subscriptions")
 
     with SessionLocal() as db:
-        results = service.reconcile_user_subscriptions(db, UUID(user_id))
+        results = service.reconcile_user_subscriptions(
+            db, UUID(user_id), connection_id=UUID(connection_id) if connection_id else None
+        )
 
     # Honour the wait the provider asked for, jittered: a fan-out rejected as a burst
     # would otherwise retry as the same burst.
@@ -125,6 +133,7 @@ def sync_provider_user_subscription(self: Task, provider: str, user_id: str) -> 
             "Provider user subscription reconciliation deferred",
             provider=provider,
             user_id=user_id,
+            connection_id=connection_id,
             retry_after=wait,
             attempt=self.request.retries,
         )
@@ -141,6 +150,7 @@ def sync_provider_user_subscription(self: Task, provider: str, user_id: str) -> 
             "Provider user subscription reconciliation had failures",
             provider=provider,
             user_id=user_id,
+            connection_id=connection_id,
             failed_items=failed,
             attempt=self.request.retries,
             max_retries=self.max_retries,
@@ -156,6 +166,7 @@ def sync_provider_user_subscription(self: Task, provider: str, user_id: str) -> 
         "Provider user subscriptions reconciled",
         provider=provider,
         user_id=user_id,
+        connection_id=connection_id,
         results=results,
     )
-    return {"provider": provider, "user_id": user_id, "results": results}
+    return {"provider": provider, "user_id": user_id, "connection_id": connection_id, "results": results}

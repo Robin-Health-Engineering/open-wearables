@@ -62,12 +62,57 @@ def test_user_reconciliation_delegates_to_the_providers_webhook_service() -> Non
         session_local.return_value.__exit__ = MagicMock(return_value=False)
         result = sync_provider_user_subscription.apply(args=["withings", str(user_id)]).get()
 
-    service.reconcile_user_subscriptions.assert_called_once_with(db, user_id)
+    # Legacy [provider, user_id] messages — already queued before connection_id existed — mean
+    # "every connection of this member".
+    service.reconcile_user_subscriptions.assert_called_once_with(db, user_id, connection_id=None)
     assert result == {
         "provider": "withings",
         "user_id": str(user_id),
+        "connection_id": None,
         "results": [{"appli": 1, "status": "subscribed"}],
     }
+
+
+def test_user_reconciliation_can_target_one_connection() -> None:
+    user_id, connection_id = uuid4(), uuid4()
+    service = MagicMock()
+    service.reconcile_user_subscriptions.return_value = [
+        {"appli": 1, "status": "subscribed", "connection_id": str(connection_id)}
+    ]
+    strategy = MagicMock(webhook_service=service)
+    db = MagicMock()
+
+    with patch(_FACTORY) as factory, patch(_SESSION) as session_local:
+        factory.return_value.get_provider.return_value = strategy
+        session_local.return_value.__enter__ = MagicMock(return_value=db)
+        session_local.return_value.__exit__ = MagicMock(return_value=False)
+        result = sync_provider_user_subscription.apply(args=["withings", str(user_id), str(connection_id)]).get()
+
+    service.reconcile_user_subscriptions.assert_called_once_with(db, user_id, connection_id=connection_id)
+    assert result["connection_id"] == str(connection_id)
+
+
+def test_user_reconciliation_retries_when_only_one_connection_was_deferred() -> None:
+    """One account's backpressure must not be masked by another account's success."""
+    service = MagicMock()
+    service.reconcile_user_subscriptions.return_value = [
+        {"appli": 1, "status": "subscribed", "connection_id": "personal"},
+        {"status": "deferred", "reason": "rate_limited", "retry_after": 30, "connection_id": "provisioned"},
+    ]
+    strategy = MagicMock(webhook_service=service)
+
+    with (
+        patch(_FACTORY) as factory,
+        patch(_SESSION) as session_local,
+        patch.object(sync_provider_user_subscription, "retry", side_effect=Exception("retry-called")) as retry,
+    ):
+        factory.return_value.get_provider.return_value = strategy
+        session_local.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        session_local.return_value.__exit__ = MagicMock(return_value=False)
+        with pytest.raises(Exception, match="retry-called"):
+            sync_provider_user_subscription.apply(args=["withings", str(uuid4())]).get()
+
+    assert retry.call_args.kwargs["countdown"] >= 30
 
 
 def test_user_reconciliation_retries_deferred_work_on_the_providers_own_schedule() -> None:

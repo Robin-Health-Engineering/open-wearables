@@ -1,6 +1,24 @@
 """Model the Withings payload fields required by ingestion."""
 
-from pydantic import BaseModel, Field
+from typing import Annotated, Any
+
+from pydantic import BaseModel, BeforeValidator, Field
+
+
+def _id_as_str(value: Any) -> Any:
+    """Withings ids arrive as a JSON string or a JSON number; store them as strings.
+
+    The cellular Body Pro 2 sends a measure group's ``deviceid`` as an integer, and a strict
+    ``str`` rejected every group from it. ``bool`` is left alone so validation still refuses it:
+    it is an ``int`` subclass, and ``"True"`` would invent a device id.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return value
+
+
+# An opaque Withings identifier: string or integer on the wire, always a string here.
+WithingsId = Annotated[str | None, BeforeValidator(_id_as_str)]
 
 
 class WithingsMeasure(BaseModel):
@@ -23,7 +41,11 @@ class WithingsMeasureGroup(BaseModel):
     # attrib 0/8 = device-captured & unambiguous, 2/4 = manual entry (see spec table).
     attrib: int | None = None
     category: int | None = None
-    deviceid: str | None = None
+    # NOT the Getdevice deviceid for every device: the cellular Body Pro 2 sends an integer here
+    # that Getdevice never lists. ``hash_deviceid`` is what joins the group to its device row
+    # (Getdevice's deviceid/hash_deviceid) and to the order that shipped it.
+    deviceid: WithingsId = None
+    hash_deviceid: str | None = None
     model: str | None = None
 
 
@@ -35,7 +57,7 @@ class WithingsActivity(BaseModel):
     timezone: str | None = None
     # deviceid identifies the capturing device but may be absent on valid rows;
     # the echo filter is brand == 18, not deviceid absence.
-    deviceid: str | None = None
+    deviceid: WithingsId = None
     # Origin signals: brand 1 = Withings, 18 = external/echo (e.g. Health Connect).
     # is_tracker = captured by Withings hardware.
     brand: int | None = None
@@ -101,5 +123,5 @@ class WithingsWorkout(BaseModel):
     date: str | None = None
     timezone: str | None = None
     # Workouts retain rows without deviceid and do not apply the activity echo filter.
-    deviceid: str | None = None
+    deviceid: WithingsId = None
     data: WithingsWorkoutData = Field(default_factory=WithingsWorkoutData)

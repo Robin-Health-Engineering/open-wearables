@@ -167,7 +167,8 @@ def oauth_callback(
             )
 
     # User-scoped webhook subscriptions exist only after OAuth has persisted
-    # the connection and its bearer token.
+    # the connection and its bearer token. No connection id is passed: the task then
+    # reconciles every active connection of the user, which includes the one just authorized.
     try:
         if (
             strategy.capabilities.webhook_subscription_per_user

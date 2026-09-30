@@ -42,6 +42,9 @@ class ParsedGroup:
     # C2 keys present in this group, in measure order, deduplicated. Empty when the group only
     # holds measures outside C2 (e.g. blood pressure): still recorded, but there is nothing to emit.
     metric_keys: tuple[str, ...]
+    # The group's own ``hash_deviceid``. For some devices (the cellular Body Pro 2) ``device_id`` is
+    # an id Getdevice never lists and only this hash joins the group to its withings_device row.
+    hash_device_id: str | None = None
 
     @property
     def has_c2_metrics(self) -> bool:
@@ -66,6 +69,7 @@ def parsed_group_of(group: WithingsMeasureGroup) -> ParsedGroup | None:
         attrib=group.attrib,
         measured_at=datetime.fromtimestamp(group.date, tz=timezone.utc),
         metric_keys=keys,
+        hash_device_id=group.hash_deviceid or None,
     )
 
 
@@ -92,6 +96,7 @@ def record_new_groups(
                     "user_connection_id": user_connection_id,
                     "grpid": g.grpid,
                     "device_id": g.device_id,
+                    "hash_device_id": g.hash_device_id,
                     "model": g.model,
                     "attrib": g.attrib,
                     "measured_at": g.measured_at,

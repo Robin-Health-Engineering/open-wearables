@@ -28,9 +28,12 @@ Reference: https://developer.withings.com/api-reference/#tag/devices
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID, uuid4
+
+from sqlalchemy import or_
 
 from app.database import DbSession
 from app.models.user_connection import UserConnection
@@ -41,6 +44,7 @@ from app.schemas.providers.withings.devices import WithingsDeviceEntry, Withings
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL, withings_request
 from app.services.providers.withings.connections import active_withings_connections, device_connections
+from app.services.providers.withings.measure_groups import ParsedGroup
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -206,6 +210,44 @@ def record_installed_device(
         device_id=device_id,
     )
     return device
+
+
+def backfill_models_from_groups(db: DbSession, *, connection_id: UUID, groups: Iterable[ParsedGroup]) -> int:
+    """Name a device Getdevice left unnamed, from the model its measure groups carry.
+
+    Getdevice lists the cellular Body Pro 2 with ``"model": null`` (only ``model_id``), yet every
+    measure group from it says ``"model": "Body Pro 2"``. The group is matched to its device row by
+    its ``hash_deviceid`` (against ``hash_device_id`` or ``device_id``, on the SAME connection),
+    never by its ``deviceid``, which for that scale is an id Getdevice does not list.
+
+    Fills only a NULL or empty model: a name Getdevice supplied is never overwritten, and
+    ``_upsert`` in turn never erases this one when a later Getdevice reports null. Does not commit;
+    the caller commits alongside the samples. Returns the number of rows named.
+    """
+    models: dict[str, str] = {}
+    for group in groups:
+        if group.hash_device_id and group.model:
+            models.setdefault(group.hash_device_id, group.model)
+    if not models:
+        return 0
+    rows = (
+        db.query(WithingsDevice)
+        .filter(
+            WithingsDevice.user_connection_id == connection_id,
+            or_(WithingsDevice.model.is_(None), WithingsDevice.model == ""),
+            or_(WithingsDevice.hash_device_id.in_(models), WithingsDevice.device_id.in_(models)),
+        )
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    for device in rows:
+        model = models.get(device.hash_device_id or "") or models.get(device.device_id)
+        if model:
+            device.model = model
+            device.updated_at = now
+    if rows:
+        db.flush()
+    return len(rows)
 
 
 def sync_devices_from_withings(

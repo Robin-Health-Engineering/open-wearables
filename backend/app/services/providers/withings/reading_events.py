@@ -167,8 +167,9 @@ def enqueue_new_reading_events(
 ) -> int:
     """Enqueue one delivery per eligible group. Never raises: the samples are already committed.
 
-    ``oauth`` enables the Getdevice refresh for a device whose hash is not stored yet, run at most
-    once per call. Without it the hash is whatever is stored, possibly null.
+    The event's ``hash_deviceid`` is the group's own when it carries one, else the stored device
+    row's. ``oauth`` enables the Getdevice refresh for a hashless group whose device has no stored
+    hash yet, run at most once per call. Without it the hash is whatever is stored, possibly null.
     """
     if not groups or not is_enabled():
         return 0
@@ -192,14 +193,20 @@ def enqueue_new_reading_events(
         # JSON null rather than the string "None" when Withings never reported a userid.
         withings_user_id = str(connection.provider_user_id) if connection.provider_user_id is not None else None
         user_id = connection.user_id
-        device_ids = {g.device_id for g in eligible if g.device_id is not None}
+        # A group carrying its own hash_deviceid needs no lookup: its deviceid may not even be one
+        # Getdevice lists (the cellular Body Pro 2 sends an integer there), so the hash is the only
+        # reliable join. Only hashless groups fall back to the stored device row.
+        device_ids = {g.device_id for g in eligible if g.device_id is not None and not g.hash_device_id}
 
-        devices = _devices(db, user_connection_id, device_ids)
-        if oauth is not None and _needs_refresh(devices, device_ids):
-            # The first reading from a device can beat the Getdevice sweep that stores its hash.
-            _refresh_hashes(db, user_id=user_id, user_connection_id=user_connection_id, oauth=oauth)
+        stored: dict[str, str | None] = {}
+        if device_ids:
             devices = _devices(db, user_connection_id, device_ids)
-        hashes = {device_id: devices.get(device_id, (None, False))[0] for device_id in device_ids}
+            if oauth is not None and _needs_refresh(devices, device_ids):
+                # The first reading from a device can beat the Getdevice sweep that stores its hash.
+                _refresh_hashes(db, user_id=user_id, user_connection_id=user_connection_id, oauth=oauth)
+                devices = _devices(db, user_connection_id, device_ids)
+            stored = {device_id: devices.get(device_id, (None, False))[0] for device_id in device_ids}
+        hashes = [group.hash_device_id or stored.get(group.device_id or "") for group in eligible]
     except Exception as e:
         _rollback(db, user_connection_id)
         log_and_capture_error(
@@ -211,7 +218,7 @@ def enqueue_new_reading_events(
         return 0
 
     sent = 0
-    for group in eligible:
+    for group, hash_deviceid in zip(eligible, hashes, strict=True):
         # Per group: the groups are already committed as seen, so one failed enqueue must not
         # drop the rest of the batch with it.
         try:
@@ -219,7 +226,7 @@ def enqueue_new_reading_events(
                 external_user_id=external_user_id,
                 withings_user_id=withings_user_id,
                 group=group,
-                hash_deviceid=hashes.get(group.device_id or ""),
+                hash_deviceid=hash_deviceid,
             )
             celery_app.send_task(DELIVER_TASK, args=[payload], queue="default")
             sent += 1
@@ -239,7 +246,7 @@ def enqueue_new_reading_events(
         user_connection_id=str(user_connection_id),
         count=sent,
         failed=len(eligible) - sent,
-        without_hash=sum(1 for h in hashes.values() if h is None),
+        without_hash=sum(1 for h in hashes if h is None),
     )
     return sent
 

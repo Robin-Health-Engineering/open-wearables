@@ -16,8 +16,10 @@ class WithingsMeasureGroupRecord(BaseDbModel):
     ``data_source.device_model`` would open a second data source, so every re-read of an old window
     would insert duplicates. This table carries the group-level facts instead:
 
-    * **which device**: ``device_id`` is Withings' opaque ``deviceid``, the same value
-      ``withings_device.device_id`` holds;
+    * **which device**: ``device_id`` is the group's own opaque ``deviceid``. For most devices that
+      is the value ``withings_device.device_id`` holds, but not for all: the cellular Body Pro 2
+      sends an integer Getdevice never lists. ``hash_device_id`` is the group's ``hash_deviceid``,
+      which does match ``withings_device.device_id``/``hash_device_id`` (and Robin's order);
     * **which account**: ``user_connection_id``. A member can hold two Withings connections, and
       only readings on the one WE provisioned belong to the device we sold them;
     * **whether it is new**: the unique ``(user_connection_id, grpid)`` makes the insert idempotent,
@@ -42,6 +44,8 @@ class WithingsMeasureGroupRecord(BaseDbModel):
     )
     grpid: Mapped[str_32]
     device_id: Mapped[str_64 | None] = mapped_column(nullable=True)
+    # Null for groups recorded before the column existed and for groups that carry no hash.
+    hash_device_id: Mapped[str_64 | None] = mapped_column(nullable=True)
     model: Mapped[str_64 | None] = mapped_column(nullable=True)
     # Withings' capture attribution: 0/8 device-captured, 2/4 manual entry.
     attrib: Mapped[int | None] = mapped_column(nullable=True)
