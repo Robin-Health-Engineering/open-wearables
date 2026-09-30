@@ -523,3 +523,30 @@ def test_process_payload_ignores_profile_change_update() -> None:
     assert result["status"] == "ignored"
     assert result["reason"] == "profile_change"
     h.connection_repo.disconnect.assert_not_called()
+
+
+def test_process_payload_fetches_with_the_notified_connection() -> None:
+    h = _handler()
+    connection = MagicMock(user_id=uuid4(), id=uuid4())
+    h.connection_repo.get_all_by_provider_user_id.return_value = [connection]
+    h.data_247.save_measures.return_value = 1
+
+    h.process_payload(MagicMock(), _burst("1", uuid4().hex), "trace-conn")
+
+    assert h.data_247.save_measures.call_args.kwargs["connection_id"] == connection.id
+
+
+def test_process_payload_syncs_sleep_and_activity_with_the_notified_connection() -> None:
+    h = _handler()
+    connection = MagicMock(user_id=uuid4(), id=uuid4())
+    h.connection_repo.get_all_by_provider_user_id.return_value = [connection]
+    h.data_247.save_sleep.return_value = 0
+    h.data_247.save_activity.return_value = 0
+    h.workouts.load_data.return_value = 0
+
+    h.process_payload(MagicMock(), _burst("44", uuid4().hex), "trace-sleep")
+    h.process_payload(MagicMock(), _burst("16", uuid4().hex), "trace-act")
+
+    assert h.data_247.save_sleep.call_args.kwargs["connection_id"] == connection.id
+    assert h.data_247.save_activity.call_args.kwargs["connection_id"] == connection.id
+    assert h.workouts.load_data.call_args.kwargs["connection_id"] == connection.id

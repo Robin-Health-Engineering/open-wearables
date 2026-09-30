@@ -10,6 +10,7 @@ from app.schemas.providers.withings import (
     WithingsSleepSummary,
     WithingsWorkout,
 )
+from app.schemas.providers.withings.devices import WithingsDeviceEntry
 
 
 def test_notification_parses_form_fields() -> None:
@@ -134,3 +135,8 @@ def test_resolve_window_garbage_date_returns_none() -> None:
 def test_resolve_window_stringified_out_of_range_epoch_returns_none() -> None:
     n = WithingsNotification(userid="1", appli=16, date=str(10**20))
     assert n.resolve_window() is None
+
+
+def test_getdevice_entry_parses_optional_hash_deviceid() -> None:
+    assert WithingsDeviceEntry.model_validate({"deviceid": "d", "hash_deviceid": "h"}).hash_deviceid == "h"
+    assert WithingsDeviceEntry.model_validate({"deviceid": "d"}).hash_deviceid is None

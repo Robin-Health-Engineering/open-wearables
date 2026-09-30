@@ -20,12 +20,13 @@ narrowed, it should be narrowed on purpose and not by someone reading a docstrin
 claimed it was.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from logging import getLogger
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_serializer
 
 from app.config import settings
 from app.database import DbSession
@@ -41,11 +42,18 @@ from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.withings.dropshipment import WithingsDropshipmentError
 from app.services.providers.withings.order_detail import WithingsOrderDetailError, get_order_detail
+from app.services.providers.withings.readings import (
+    InvalidReadingCursor,
+    Reading,
+    get_reading,
+    list_device_readings,
+)
 from app.services.providers.withings.sdk_devices import (
     WithingsDeviceError,
     list_devices,
     mark_dissociated,
     record_installed_device,
+    set_order_ref,
     sync_devices_from_withings,
 )
 from app.services.providers.withings.sdk_provisioning import (
@@ -839,6 +847,7 @@ class SdkDeviceResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     device_id: str
+    hash_deviceid: str | None
     model_id: int | None
     model: str | None
     device_type: str | None
@@ -850,6 +859,7 @@ class SdkDeviceResponse(BaseModel):
     def of(cls, device: WithingsDevice) -> "SdkDeviceResponse":
         return cls(
             device_id=device.device_id,
+            hash_deviceid=device.hash_device_id,
             model_id=device.model_id,
             model=device.model,
             device_type=device.device_type,
@@ -992,3 +1002,122 @@ def dissociate_withings_device(
     except WithingsDeviceError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     return SdkDeviceResponse.of(device) if device else None
+
+
+class SdkDeviceOrderRefRequest(BaseModel):
+    order_ref: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
+        Field(description="robin-backend orderRef this device shipped on"),
+    ]
+
+
+@router.put(
+    "/withings/sdk/devices/{device_id}/order-ref",
+    summary="Record which order shipped a device",
+    tags=["External: Providers"],
+)
+def set_withings_device_order_ref(
+    device_id: str,
+    user_id: UUID,
+    payload: SdkDeviceOrderRefRequest,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> SdkDeviceResponse:
+    """Idempotent. 404 unless the device is on one of this member's Withings accounts.
+
+    A different ``order_ref`` than the one held overwrites it: Robin is the authority on orders.
+    """
+    device = set_order_ref(db, user_id=user_id, device_id=device_id, order_ref=payload.order_ref)
+    if device is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such device for this member")
+    return SdkDeviceResponse.of(device)
+
+
+def _utc_z(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class DeviceReadingItem(BaseModel):
+    """One reading (Withings measurement group) from the device we sold the member.
+
+    ``metrics`` uses the Robin metric keys (weight, fat_ratio, ...). A key the reading does not
+    carry is ABSENT, never null; the app shows only what is there.
+    """
+
+    grpid: str
+    measured_at: datetime
+    device_id: str | None
+    metrics: dict[str, float]
+
+    @field_serializer("measured_at")
+    def _serialize_measured_at(self, value: datetime) -> str:
+        return _utc_z(value)
+
+    @classmethod
+    def of(cls, reading: Reading) -> "DeviceReadingItem":
+        return cls(
+            grpid=reading.grpid, measured_at=reading.measured_at, device_id=reading.device_id, metrics=reading.metrics
+        )
+
+
+class DeviceReadingsResponse(BaseModel):
+    items: list[DeviceReadingItem]
+    next_cursor: str | None
+
+
+class DeviceReadingResponse(DeviceReadingItem):
+    is_first: bool
+
+    @classmethod
+    def of(cls, reading: Reading) -> "DeviceReadingResponse":
+        return cls(
+            grpid=reading.grpid,
+            measured_at=reading.measured_at,
+            device_id=reading.device_id,
+            metrics=reading.metrics,
+            is_first=bool(reading.is_first),
+        )
+
+
+@router.get(
+    "/withings/sdk/devices/{device_id}/readings",
+    summary="List readings from a member's purchased Withings device",
+    tags=["External: Providers"],
+)
+def list_withings_device_readings(
+    device_id: str,
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: str | None = None,
+) -> DeviceReadingsResponse:
+    """Newest first, one item per measurement group, only from accounts we provisioned.
+
+    An unknown device or a member with no provisioned account is an empty list, not a 404: the
+    device hub renders the empty state either way.
+    """
+    try:
+        page = list_device_readings(db, user_id=user_id, device_id=device_id, limit=limit, cursor=cursor)
+    except InvalidReadingCursor as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    return DeviceReadingsResponse(items=[DeviceReadingItem.of(r) for r in page.items], next_cursor=page.next_cursor)
+
+
+@router.get(
+    "/withings/sdk/readings/{grpid}",
+    summary="Get one reading from a member's purchased Withings device",
+    tags=["External: Providers"],
+)
+def get_withings_device_reading(
+    grpid: str,
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> DeviceReadingResponse:
+    """404 unless the group is on one of THIS member's provisioned connections."""
+    reading = get_reading(db, user_id=user_id, grpid=grpid)
+    if reading is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such reading for this member")
+    return DeviceReadingResponse.of(reading)

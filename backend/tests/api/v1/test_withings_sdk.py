@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.user import User
+from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
 from app.schemas.providers.withings.order_detail import OrderDetail
@@ -954,3 +955,152 @@ class TestCellularOrderDetailRoute:
         # An operator condition, not a bad request — the same answer the two provisioning routes
         # give. Deliberately without the `withings_configured` fixture.
         assert client.get(self._URL, headers=api_key_header).status_code == 503
+
+
+_ORDER_REF_URL = "/api/v1/providers/withings/sdk/devices/{device_id}/order-ref"
+
+
+class TestOrderRefRoute:
+    def _device(self, db: Session, make_provisioned_connection: Any) -> tuple[User, WithingsDevice]:
+        user, connection = make_provisioned_connection()
+        device = WithingsDevice(
+            id=uuid4(), user_connection_id=connection.id, device_id="dev-1", updated_at=connection.updated_at
+        )
+        db.add(device)
+        db.commit()
+        return user, device
+
+    def _put(self, client: TestClient, user: User, body: dict, headers: dict[str, str] | None = None) -> Any:
+        return client.put(
+            _ORDER_REF_URL.format(device_id="dev-1"),
+            params={"user_id": str(user.id)},
+            json=body,
+            headers=headers or {},
+        )
+
+    def test_sets_the_ref(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        r = self._put(client, user, {"order_ref": "REF-1"}, api_key_header)
+        assert r.status_code == 200
+        assert r.json()["device_id"] == "dev-1"
+        assert db.query(WithingsDevice).filter_by(device_id="dev-1").one().order_ref == "REF-1"
+
+    def test_repeat_is_200_and_unchanged(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        bodies = [self._put(client, user, {"order_ref": "REF-1"}, api_key_header) for _ in range(2)]
+        assert [b.status_code for b in bodies] == [200, 200]
+        assert bodies[0].json() == bodies[1].json()
+
+    def test_a_different_ref_overwrites(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        self._put(client, user, {"order_ref": "REF-1"}, api_key_header)
+        r = self._put(client, user, {"order_ref": "REF-2"}, api_key_header)
+        assert r.status_code == 200
+        assert db.query(WithingsDevice).filter_by(device_id="dev-1").one().order_ref == "REF-2"
+
+    def test_404_for_a_device_not_on_this_user(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        self._device(db, make_provisioned_connection)
+        stranger, _ = make_provisioned_connection()
+        assert self._put(client, stranger, {"order_ref": "REF-1"}, api_key_header).status_code == 404
+
+    def test_404_for_a_member_with_no_withings_connection(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        self._device(db, make_provisioned_connection)
+        assert self._put(client, UserFactory(), {"order_ref": "REF-1"}, api_key_header).status_code == 404
+
+    @pytest.mark.parametrize("bad", ["", "x" * 65])
+    def test_400_on_a_bad_ref(
+        self,
+        client: TestClient,
+        db: Session,
+        api_key_header: dict[str, str],
+        make_provisioned_connection: Any,
+        bad: str,
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        assert self._put(client, user, {"order_ref": bad}, api_key_header).status_code == 400  # app maps 422 to 400
+
+    def test_requires_authentication(self, client: TestClient, db: Session, make_provisioned_connection: Any) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        assert self._put(client, user, {"order_ref": "REF-1"}).status_code == 401
+
+    def test_a_padded_ref_is_stored_stripped_and_a_clean_resend_is_a_noop(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        assert self._put(client, user, {"order_ref": " REF-1 "}, api_key_header).status_code == 200
+        stamp = db.query(WithingsDevice).filter_by(device_id="dev-1").one().updated_at
+
+        assert self._put(client, user, {"order_ref": "REF-1"}, api_key_header).status_code == 200
+
+        db.expire_all()
+        device = db.query(WithingsDevice).filter_by(device_id="dev-1").one()
+        assert device.order_ref == "REF-1"
+        assert device.updated_at == stamp
+
+    def test_400_on_a_whitespace_only_ref(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, _ = self._device(db, make_provisioned_connection)
+        assert self._put(client, user, {"order_ref": "   "}, api_key_header).status_code == 400
+
+    def test_404_and_no_write_for_a_device_on_a_self_linked_account(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str]
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="withings", provider_user_id="own")
+        db.add(
+            WithingsDevice(
+                id=uuid4(), user_connection_id=connection.id, device_id="dev-1", updated_at=connection.updated_at
+            )
+        )
+        db.commit()
+
+        assert self._put(client, user, {"order_ref": "REF-1"}, api_key_header).status_code == 404
+        assert db.query(WithingsDevice).filter_by(device_id="dev-1").one().order_ref is None
+
+
+class TestDeviceHashDeviceIdInResponse:
+    def _get(self, client: TestClient, user: User, headers: dict[str, str]) -> Any:
+        return client.get("/api/v1/providers/withings/sdk/devices", params={"user_id": str(user.id)}, headers=headers)
+
+    def test_list_carries_hash_deviceid(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, connection = make_provisioned_connection()
+        db.add(
+            WithingsDevice(
+                id=uuid4(),
+                user_connection_id=connection.id,
+                device_id="dev-1",
+                hash_device_id="hash-1",
+                updated_at=connection.updated_at,
+            )
+        )
+        db.commit()
+        r = self._get(client, user, api_key_header)
+        assert r.status_code == 200
+        assert r.json()[0]["hash_deviceid"] == "hash-1"
+
+    def test_absent_hash_is_a_present_null(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], make_provisioned_connection: Any
+    ) -> None:
+        user, connection = make_provisioned_connection()
+        db.add(
+            WithingsDevice(
+                id=uuid4(), user_connection_id=connection.id, device_id="dev-1", updated_at=connection.updated_at
+            )
+        )
+        db.commit()
+        body = self._get(client, user, api_key_header).json()[0]
+        assert "hash_deviceid" in body
+        assert body["hash_deviceid"] is None

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models import ApiKey, Developer, User
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
+from tests.providers.withings.conftest import make_provisioned_connection  # noqa: F401  (shared fixture, ruling O10)
 from tests.utils import api_key_headers, developer_auth_headers
 
 

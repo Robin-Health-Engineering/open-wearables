@@ -48,6 +48,11 @@ class WithingsDevice(BaseDbModel):
     # Withings' ``deviceid``. Theirs, not ours, and opaque — do not parse it.
     device_id: Mapped[str_64]
 
+    # Withings' ``hash_deviceid`` from Getdevice: the join to the order that shipped this device
+    # (robin-backend matches it against the order detail's hash_deviceid). Nullable: devices the
+    # member owned before us, and scopes that do not report it.
+    hash_device_id: Mapped[str_64 | None] = mapped_column(nullable=True)
+
     # Withings' numeric model (6 = Body+, 45 = BPM Connect, …) and its display name. The
     # numeric one is what the setup WebView takes as ``device_model``; the name is only for
     # showing a member which of their devices this is.

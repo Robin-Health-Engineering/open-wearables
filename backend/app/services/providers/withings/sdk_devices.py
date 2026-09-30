@@ -40,7 +40,7 @@ from app.schemas.enums import ProviderName
 from app.schemas.providers.withings.devices import WithingsDeviceEntry, WithingsGetdeviceBody
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import WITHINGS_API_BASE_URL, withings_request
-from app.services.providers.withings.connections import active_withings_connections
+from app.services.providers.withings.connections import active_withings_connections, device_connections
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,7 @@ def _upsert(
     device_type: str | None = None,
     battery: str | None = None,
     last_session_at: datetime | None = None,
+    hash_device_id: str | None = None,
 ) -> WithingsDevice:
     """Create or update one device row, without ever losing what an earlier write stored.
 
@@ -148,6 +149,8 @@ def _upsert(
         device.battery = battery
     if last_session_at is not None:
         device.last_session_at = last_session_at
+    if hash_device_id:
+        device.hash_device_id = hash_device_id
 
     # Stamped for a Getdevice write and ONLY a Getdevice write — it records that Withings' own
     # list has seen this device, which is what makes the dissociation sweep safe. A device
@@ -276,6 +279,7 @@ def _sync_one(
                 device_type=entry.type,
                 battery=entry.battery,
                 last_session_at=_from_unix(entry.last_session_date),
+                hash_device_id=entry.hash_deviceid,
             )
         )
 
@@ -316,6 +320,50 @@ def _sync_one(
         without_battery=sum(1 for d in devices if not d.battery),
     )
     return devices
+
+
+def set_order_ref(db: DbSession, *, user_id: UUID, device_id: str, order_ref: str) -> WithingsDevice | None:
+    """Record which robin-backend order shipped this device. Idempotent; None if not the member's.
+
+    Across the member's SDK-provisioned accounts only, the ones WE created to ship a device. The
+    member's own self-linked account is excluded: hardware on it is not something we shipped, so
+    Robin's order link must never be stamped there. The caller names a DEVICE, and which
+    provisioned account it hangs off is our bookkeeping.
+
+    Robin re-issues this on every match, so a repeat must cost a read and nothing more. A
+    DIFFERENT value overwrites: Robin is authoritative for orders, and a replacement order
+    legitimately re-links the same account's new device.
+    """
+    connection_ids = [c.id for c in device_connections(db, user_id)]
+    if not connection_ids:
+        return None
+    device = (
+        db.query(WithingsDevice)
+        .filter(WithingsDevice.user_connection_id.in_(connection_ids), WithingsDevice.device_id == device_id)
+        .first()
+    )
+    if device is None:
+        return None
+    # A soft-dissociated device is still taggable on purpose: a re-synced device must not flip to 404.
+    if device.order_ref == order_ref:
+        return device
+    previous = device.order_ref
+    device.order_ref = order_ref
+    device.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    if previous is not None:
+        log_structured(
+            logger,
+            "info",
+            "Withings device order_ref replaced",
+            provider=ProviderName.WITHINGS.value,
+            action="order_ref_replaced",
+            user_id=str(user_id),
+            device_id=device_id,
+            previous=previous,
+            current=order_ref,
+        )
+    return device
 
 
 def mark_dissociated(db: DbSession, *, user_id: UUID, device_id: str) -> WithingsDevice | None:

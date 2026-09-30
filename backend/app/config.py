@@ -229,6 +229,18 @@ class Settings(BaseSettings):
     # (Divergence from upstream, which omits it deliberately - keep it on any rebase.)
     withings_default_scope: str = "user.info,user.metrics,user.activity,user.sleepevents"
 
+    # ROBIN READING EVENT (Withings, provisioned accounts only)
+    # Where to POST ``withings.reading.created`` when a measurement group first arrives on an
+    # account WE provisioned. Unset = feature off: nothing is sent. Staging and prod opt in
+    # separately by setting it.
+    robin_reading_event_url: str | None = None
+    # HMAC-SHA256 key for X-Robin-Signature. Both this and the URL must be set to send.
+    robin_reading_event_secret: SecretStr | None = None
+    # Groups measured longer ago than this never emit. A first sync, a reconnect or a recover
+    # backfill re-reads weeks of history and every group in it is "new" to withings_measure_group;
+    # without this guard the member would receive a push per historic weigh-in.
+    robin_reading_event_max_age_hours: int = Field(24, ge=1)
+
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None
     email_from_address: str | None = None
