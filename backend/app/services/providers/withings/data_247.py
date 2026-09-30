@@ -37,6 +37,7 @@ from app.services.providers.withings.coverage import ACTIVITY_FIELD_MAP, MEASURE
 from app.services.providers.withings.data_requests import ACTIVITY, MEASURES, SLEEP_SUMMARY
 from app.services.providers.withings.measure_groups import ParsedGroup, parsed_group_of, record_new_groups
 from app.services.providers.withings.reading_events import enqueue_new_reading_events
+from app.services.providers.withings.sdk_devices import backfill_models_from_groups
 from app.services.providers.withings.timezone import local_day_start, zone_offset_at
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
@@ -217,6 +218,8 @@ class Withings247Data(Base247DataTemplate):
                 user_connection_id=user_connection_id,
                 groups=parsed,
             )
+            # Same transaction too: Getdevice names some devices null, their groups do not.
+            backfill_models_from_groups(db, connection_id=user_connection_id, groups=parsed)
         db.commit()
         if new_groups and user_connection_id is not None:
             # After commit: Robin reads the reading back as soon as it gets the event. Never raises.

@@ -29,6 +29,7 @@ from app.services.providers.withings._client import PaginatedResult
 from app.services.providers.withings.data_247 import Withings247Data
 from app.services.providers.withings.measure_groups import ParsedGroup, parsed_group_of
 from app.services.providers.withings.readings import get_reading, list_device_readings
+from app.services.providers.withings.sdk_devices import sync_devices_from_withings
 from tests.providers.withings.conftest import ProvisionedConnectionMaker
 
 _HASH = "41a451ad428083cbf215257be7decbc02a3169c5"
@@ -36,6 +37,7 @@ _INT_DEVICEID = 15542329
 _SEND = "app.services.providers.withings.reading_events.celery_app.send_task"
 _SYNC = "app.services.providers.withings.reading_events.sync_devices_from_withings"
 _PAGINATE = "app.services.providers.withings.data_247.paginate"
+_GETDEVICE = "app.services.providers.withings.sdk_devices.withings_request"
 
 
 def _body_pro_2_group(*, date: int = 1790754643, grpid: int = 8530283247, **overrides: Any) -> dict[str, Any]:
@@ -287,3 +289,57 @@ def test_readings_are_listed_under_the_getdevice_id_and_the_groups_own_id(
     reading = get_reading(db, user_id=user.id, grpid="8530283247")
     assert reading is not None
     assert reading.is_first is True
+
+
+# --------------------------------------------------------------------------- device model backfill
+
+
+def _device(db: Session, connection_id: UUID) -> WithingsDevice:
+    return db.query(WithingsDevice).filter_by(user_connection_id=connection_id).one()
+
+
+def test_the_groups_model_fills_a_device_getdevice_left_without_one(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id, model=None)
+    _save(db, user.id, connection, [_body_pro_2_group(date=_recent())])
+    assert _device(db, connection.id).model == "Body Pro 2"
+
+
+def test_an_empty_model_is_filled_too(db: Session, make_provisioned_connection: ProvisionedConnectionMaker) -> None:
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id, model="")
+    _save(db, user.id, connection, [_body_pro_2_group(date=_recent())])
+    assert _device(db, connection.id).model == "Body Pro 2"
+
+
+def test_a_model_getdevice_supplied_is_never_overwritten(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id, model="Body Pro 2 (Getdevice)")
+    _save(db, user.id, connection, [_body_pro_2_group(date=_recent())])
+    assert _device(db, connection.id).model == "Body Pro 2 (Getdevice)"
+
+
+def test_the_backfill_stays_on_the_groups_own_connection(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _, other = make_provisioned_connection(user)
+    _getdevice_row(db, other.id, model=None)  # same hash, different account
+    _save(db, user.id, connection, [_body_pro_2_group(date=_recent())])
+    assert _device(db, other.id).model is None
+
+
+def test_a_later_getdevice_reporting_null_model_keeps_the_backfilled_one(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id, model=None)
+    _save(db, user.id, connection, [_body_pro_2_group(date=_recent())])
+    entry = {"deviceid": _HASH, "hash_deviceid": _HASH, "model_id": 17, "model": None, "type": "Scale"}
+    with patch(_GETDEVICE, return_value={"devices": [entry]}):
+        sync_devices_from_withings(db, user_id=user.id, oauth=MagicMock(), connection_id=connection.id)
+    assert _device(db, connection.id).model == "Body Pro 2"
