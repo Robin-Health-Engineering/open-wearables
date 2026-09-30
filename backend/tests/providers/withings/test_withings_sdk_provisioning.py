@@ -327,8 +327,23 @@ class TestSubscriptionScheduling:
         celery.send_task.assert_called_once()
         name, kwargs = celery.send_task.call_args[0][0], celery.send_task.call_args[1]
         assert name == SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
-        assert kwargs["args"] == ["withings", str(user.id)]
+        (connection,) = device_connections(db, user.id)
+        assert kwargs["args"] == ["withings", str(user.id), str(connection.id)]
         assert kwargs["queue"] == "webhook_sync"
+
+    def test_it_targets_the_provisioned_connection_not_the_members_own(self, db: Session) -> None:
+        # The staging bug: a member with their own, older Withings account resolves to THAT one as
+        # primary, so a user-only task reconciled the personal account and the scale we shipped
+        # was never subscribed. The task has to be told which connection was just provisioned.
+        user = UserFactory()
+        personal = UserConnectionFactory(user=user, provider="withings", provider_user_id="withings-personal")
+
+        with patch("app.services.providers.withings.sdk_provisioning.celery_app") as celery:
+            _provision(db, user.id, withings_userid="withings-ours")
+
+        (provisioned,) = device_connections(db, user.id)
+        assert provisioned.id != personal.id
+        assert celery.send_task.call_args[1]["args"] == ["withings", str(user.id), str(provisioned.id)]
 
     def test_a_repeat_order_schedules_it_too(self, db: Session) -> None:
         # Reuse is the path most likely to skip this, and the one where skipping is least

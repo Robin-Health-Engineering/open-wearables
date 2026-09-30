@@ -98,13 +98,18 @@ def _upsert_sdk_account(db: DbSession, *, connection_id: UUID, external_id: str,
     return account
 
 
-def _schedule_subscription_sync(user_id: UUID) -> None:
-    """Ask the webhook worker to reconcile this member's Withings subscriptions.
+def _schedule_subscription_sync(user_id: UUID, connection_id: UUID) -> None:
+    """Ask the webhook worker to reconcile the Withings subscriptions of the connection just provisioned.
+
+    **It names the connection.** A task carrying only the user id reconciles the member's PRIMARY
+    connection — their own, older account when they have one — so the device account we had just
+    provisioned was never subscribed (staging, 2026-09-30: personal account 7 subscriptions,
+    provisioned account 0).
 
     **The gap this closes.** ``WithingsNotifyService`` has been complete since the Notify work
     landed, but nothing on the PROVISIONING path enqueued it. The two existing enqueue sites are
-    the OAuth callback (``oauth.py:178``) and the ``register_subscriptions`` fan-out
-    (``notify_service.py:82``) — and a provisioned account never goes through OAuth, while the
+    the OAuth callback (``oauth.py:178``) and the ``register_subscriptions`` fan-out — and a
+    provisioned account never goes through OAuth, while the
     fan-out is **not periodic**: it has no ``beat_schedule`` entry, and runs only when an operator
     hits the admin route or changes the live-sync mode. So a member shipped a cellular device had
     a connection, live tokens and no Notify subscription: their scale would upload to Withings and
@@ -124,7 +129,7 @@ def _schedule_subscription_sync(user_id: UUID) -> None:
     try:
         celery_app.send_task(
             SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
-            args=[ProviderName.WITHINGS.value, str(user_id)],
+            args=[ProviderName.WITHINGS.value, str(user_id), str(connection_id)],
             queue="webhook_sync",
         )
     except Exception as e:
@@ -135,6 +140,7 @@ def _schedule_subscription_sync(user_id: UUID) -> None:
             provider=ProviderName.WITHINGS.value,
             task="provision_subscription_sync",
             user_id=str(user_id),
+            connection_id=str(connection_id),
             error=str(e),
         )
 
@@ -303,7 +309,7 @@ def _store_provisioned_account(
             connected_at=connection.created_at.isoformat(),
         )
 
-    _schedule_subscription_sync(user_id)
+    _schedule_subscription_sync(user_id, connection.id)
 
     return account
 

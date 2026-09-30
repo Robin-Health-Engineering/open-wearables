@@ -7,6 +7,8 @@ registering anything itself.
 """
 
 import logging
+from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -15,6 +17,7 @@ from pydantic import ValidationError
 
 from app.database import DbSession, SessionLocal
 from app.integrations.celery.task_names import SYNC_PROVIDER_USER_SUBSCRIPTION_TASK
+from app.models import UserConnection
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import LiveSyncMode
@@ -38,6 +41,30 @@ from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
+
+
+def _link_order(connection: UserConnection) -> tuple[datetime, str]:
+    return (connection.created_at, str(connection.id))
+
+
+def _owner_key(connection: UserConnection) -> tuple[str, str]:
+    """The Withings account a connection's subscriptions live on; its own id when none is known."""
+    if connection.provider_user_id is not None:
+        return ("provider_user_id", connection.provider_user_id)
+    return ("connection_id", str(connection.id))
+
+
+def _subscription_owners(connections: Iterable[UserConnection]) -> dict[tuple[str, str], UserConnection]:
+    """The connection that owns each Withings account's subscriptions.
+
+    The oldest active link owns them, matching inbound webhook attribution. A revoked grant
+    yields ownership on the next reconciliation. Shared by the fan-out and per-user reconcile so
+    both agree on who manages an account.
+    """
+    owners: dict[tuple[str, str], UserConnection] = {}
+    for connection in sorted(connections, key=_link_order):
+        owners.setdefault(_owner_key(connection), connection)
+    return owners
 
 
 class WithingsNotifyService(BaseWebhookService):
@@ -64,34 +91,27 @@ class WithingsNotifyService(BaseWebhookService):
         with SessionLocal() as db:
             connections = self.connection_repo.get_all_active_by_provider(db, "withings")
 
-        # The oldest active link owns each provider account's subscriptions, matching
-        # inbound webhook attribution. A revoked grant yields ownership on the next fan-out.
-        subscription_owners: dict[tuple[str, str], str] = {}
-        for connection in sorted(connections, key=lambda item: (item.created_at, str(item.id))):
-            owner_key = (
-                ("provider_user_id", connection.provider_user_id)
-                if connection.provider_user_id is not None
-                else ("connection_id", str(connection.id))
-            )
-            subscription_owners.setdefault(owner_key, str(connection.user_id))
-
+        # One task per owned ACCOUNT, naming the connection that owns it. A task carrying only the
+        # user id is resolved to the member's primary connection, so a member holding a personal
+        # and a provisioned account would have had only the personal one reconciled.
         results: list[dict[str, Any]] = []
-        for user_id in subscription_owners.values():
+        for owner in _subscription_owners(connections).values():
+            user_id, connection_id = str(owner.user_id), str(owner.id)
             try:
                 celery_app.send_task(
                     SYNC_PROVIDER_USER_SUBSCRIPTION_TASK,
-                    args=["withings", user_id],
+                    args=["withings", user_id, connection_id],
                     queue="webhook_sync",
                 )
-                results.append({"status": "dispatched", "user_id": user_id})
+                results.append({"status": "dispatched", "user_id": user_id, "connection_id": connection_id})
             except Exception as e:
                 log_and_capture_error(
                     e,
                     logger,
                     "Withings subscription fan-out failed to dispatch",
-                    extra={"provider": "withings", "user_id": user_id},
+                    extra={"provider": "withings", "user_id": user_id, "connection_id": connection_id},
                 )
-                results.append({"status": "error", "user_id": user_id, "error": str(e)})
+                results.append({"status": "error", "user_id": user_id, "connection_id": connection_id, "error": str(e)})
 
         log_structured(
             logger,
@@ -103,12 +123,71 @@ class WithingsNotifyService(BaseWebhookService):
         )
         return results
 
-    def reconcile_user_subscriptions(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
-        """Reconcile one user against the currently configured live-sync mode."""
+    def reconcile_user_subscriptions(
+        self, db: DbSession, user_id: UUID, connection_id: UUID | None = None
+    ) -> list[dict[str, Any]]:
+        """Reconcile a member's Withings accounts against the currently configured live-sync mode.
+
+        EVERY active Withings connection of the member, or only ``connection_id`` when given. A
+        member can hold several accounts — their own, plus one per cellular device we provisioned —
+        and each carries its own subscription set, so reconciling "the user" means reconciling each
+        of them as that connection. Without the loop, ``sync_user`` resolves the member's primary
+        (oldest) connection only, and the provisioned device was never subscribed.
+
+        A connection whose account is owned by an older link on another profile is skipped: that
+        profile reconciles the account's subscriptions, and two reconcilers would fight over them.
+        Each result entry carries the ``connection_id`` it came from.
+        """
         mode = self.provider_settings_repo.get_live_sync_mode(db, "withings") or self._default_live_sync_mode
         if mode is None:
             return [{"status": "skipped", "reason": "no_live_sync_mode"}]
-        return self.sync_user(db, user_id, mode)
+
+        connections = sorted(
+            (
+                connection
+                for connection in self.connection_repo.get_all_active_by_user(db, user_id)
+                if connection.provider == "withings"
+            ),
+            key=_link_order,
+        )
+        if connection_id is not None:
+            connections = [connection for connection in connections if connection.id == connection_id]
+            if not connections:
+                return [{"status": "skipped", "reason": "connection_not_active", "connection_id": str(connection_id)}]
+        if not connections:
+            return [{"status": "skipped", "reason": "no_active_connection"}]
+
+        results: list[dict[str, Any]] = []
+        for connection in connections:
+            if not self._owns_subscriptions(db, connection):
+                log_structured(
+                    logger,
+                    "info",
+                    "Withings notify sync skipped: account owned by an older link on another profile",
+                    provider="withings",
+                    action="notify_sync_not_owner",
+                    user_id=str(user_id),
+                    connection_id=str(connection.id),
+                )
+                results.append(
+                    {
+                        "status": "skipped",
+                        "reason": "provider_account_owned_by_another_user",
+                        "connection_id": str(connection.id),
+                    }
+                )
+                continue
+            for result in self.sync_user(db, user_id, mode, connection_id=connection.id):
+                results.append({**result, "connection_id": str(connection.id)})
+        return results
+
+    def _owns_subscriptions(self, db: DbSession, connection: UserConnection) -> bool:
+        """Whether this connection's profile owns its account's subscriptions (see ``_subscription_owners``)."""
+        if connection.provider_user_id is None:
+            return True
+        linked = self.connection_repo.get_all_by_provider_user_id(db, "withings", connection.provider_user_id)
+        owner = _subscription_owners([*linked, connection]).get(_owner_key(connection))
+        return owner is None or owner.user_id == connection.user_id
 
     def remove_user(self, db: DbSession, user_id: UUID, *, connection_id: UUID | None = None) -> list[dict[str, Any]]:
         """Revoke a user's subscriptions on disconnect, data purge or account deletion.
