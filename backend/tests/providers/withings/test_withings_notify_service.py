@@ -650,3 +650,22 @@ def test_reconcile_keeps_a_deferral_from_one_account_alongside_the_others(
         {"status": "deferred", "reason": "rate_limited", "retry_after": 12, "connection_id": str(provisioned.id)}
     ]
     assert {r["status"] for r in results if r["connection_id"] == str(personal.id)} == {"subscribed"}
+
+
+@patch("app.services.providers.withings.notify_service.withings_callback_url", return_value=_OUR_CALLBACK)
+@patch("app.services.providers.withings.notify_service.withings_request")
+def test_reconcile_a_connection_with_no_known_account_is_its_own_owner(
+    mock_req: MagicMock,
+    mock_url: MagicMock,
+    db: Session,
+) -> None:
+    """No provider_user_id means no account to share: the connection owns its own subscriptions."""
+    user = UserFactory()
+    orphan = UserConnectionFactory(user=user, provider="withings", provider_user_id=None)
+    withings = _RecordingWithings()
+    mock_req.side_effect = withings
+
+    results = _db_service().reconcile_user_subscriptions(db, user.id)
+
+    assert withings.connections_for("list") == [orphan.id]
+    assert {r["status"] for r in results} == {"subscribed"}
