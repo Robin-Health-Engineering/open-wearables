@@ -262,8 +262,8 @@ def list_device_readings(
 
     ``limit`` is clamped to 1..100 and counts sessions, not groups.
     Discarded sessions are skipped (and are not counted by ``limit``); pending ones carry their held values.
-    Raises ``InvalidReadingCursor``
-    for a cursor this function did not issue for this ``user_id`` and ``device_id``.
+    Raises ``InvalidReadingCursor`` for a cursor this function did not issue for this ``user_id`` and
+    ``device_id``.
     """
     position = _decode_cursor(user_id, device_id, cursor) if cursor is not None else None
     connection_ids = _provisioned_ids(db, user_id)

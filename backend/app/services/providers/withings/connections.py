@@ -88,7 +88,7 @@ def device_connections(db: DbSession, user_id: UUID) -> list[UserConnection]:
 def is_device_connection(db: DbSession, connection_id: UUID) -> bool:
     """Whether this connection is one we provisioned, rather than the member's own.
 
-    Answers for a connection in any state, unlike the two helpers above — a disconnect resolves
+    Answers for a connection in any state, unlike the active-only helpers above — a disconnect resolves
     the connection first and asks this second, by which point it may already be revoked.
     """
     return bool(_provisioned_connection_ids(db, [connection_id]))
