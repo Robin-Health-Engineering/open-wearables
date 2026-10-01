@@ -32,7 +32,7 @@ from app.config import settings
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, WithingsMeasureGroupRecord
 from app.schemas.enums import ProviderName, get_series_type_id
-from app.services.providers.withings.connections import device_connections
+from app.services.providers.withings.connections import all_device_connection_ids, device_connections
 from app.services.providers.withings.data_247 import raw_group_samples
 from app.services.providers.withings.measure_groups import (
     C2_KEYS,
@@ -227,15 +227,18 @@ def _session_groups(
 
 
 def find_session(
-    db: DbSession, *, user_id: UUID, grpid: str, lock: bool = False
+    db: DbSession, *, user_id: UUID, grpid: str, lock: bool = False, any_state: bool = False
 ) -> list[WithingsMeasureGroupRecord] | None:
     """Every group of the session ``grpid`` belongs to, discarded ones included.
 
     Returns None unless the group is on one of this member's provisioned connections. Any grpid of
     the session names it. ``lock`` takes a row lock on the session's groups (``SELECT … FOR UPDATE``)
     so a confirm and a discard of one weigh-in, or a retried call, run one after the other.
+
+    Only active provisioned connections count, unless ``any_state``: then a revoked or inactive one
+    does too, so a repeated discard still finds the tombstone of a disconnected account.
     """
-    connection_ids = _provisioned_ids(db, user_id)
+    connection_ids = all_device_connection_ids(db, user_id) if any_state else _provisioned_ids(db, user_id)
     if not connection_ids:
         return None
     group = WithingsMeasureGroupRecord
