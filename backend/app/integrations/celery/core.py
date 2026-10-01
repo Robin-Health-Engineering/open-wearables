@@ -157,6 +157,12 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        "retire-stale-pending-withings-readings": {
+            "task": "app.integrations.celery.tasks.withings_pending_task.retire_stale_pending_readings",
+            "schedule": crontab(hour=3, minute=30),  # Daily at 03:30 UTC, after the archival run
+            "args": (),
+            "kwargs": {},
+        },
         "fill-missing-sleep-scores": {
             "task": "app.integrations.celery.tasks.fill_missing_sleep_scores_task.fill_missing_sleep_scores",
             "schedule": float(settings.sleep_score_interval_seconds),

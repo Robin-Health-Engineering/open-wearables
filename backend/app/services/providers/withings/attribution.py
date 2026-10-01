@@ -18,11 +18,11 @@ rows, and are idempotent. Neither sends an event: the member is already in the a
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, delete, select
+from sqlalchemy import CursorResult, delete, null, select, update
 
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, WithingsMeasureGroupRecord
@@ -158,3 +158,42 @@ def discard_reading(db: DbSession, *, user_id: UUID, grpid: str) -> DiscardResul
         measured_at=reading.measured_at,
         was=was,
     )
+
+
+RETIRE_STALE_PENDING_TASK = "app.integrations.celery.tasks.withings_pending_task.retire_stale_pending_readings"
+# Spec 2026-10-01 D4: a weigh-in nobody answered within a week is dropped, never registered.
+PENDING_MAX_AGE = timedelta(days=7)
+
+
+def retire_stale_pending(db: DbSession, *, now: datetime | None = None) -> int:
+    """Retire every pending group measured more than 7 days ago; returns how many. Commits. Idempotent.
+
+    "Deleted" in the spec's sense: the held values (``raw``) are erased and the weigh-in is never
+    registered. The row stays as a ``discarded`` tombstone, because a re-read of the window (a
+    reconnect backfill reads 30 days) would otherwise record the group again as new and pending,
+    and the member would see a weigh-in they never answered come back. A session's groups share
+    ``measured_at``, so a whole weigh-in is retired at once.
+    """
+    cutoff = (now or datetime.now(timezone.utc)) - PENDING_MAX_AGE
+    record = WithingsMeasureGroupRecord
+    result = cast(
+        CursorResult[tuple[()]],
+        db.execute(
+            update(record)
+            .where(record.status == PENDING, record.measured_at < cutoff)
+            .values(status=DISCARDED, raw=null())
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    db.commit()
+    retired = result.rowcount
+    log_structured(
+        logger,
+        "info",
+        "Withings stale pending readings retired",
+        provider="withings",
+        action="pending_readings_retired",
+        count=retired,
+        cutoff=cutoff.isoformat(),
+    )
+    return retired
