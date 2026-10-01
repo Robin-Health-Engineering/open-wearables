@@ -347,10 +347,10 @@ def test_on_a_key_in_two_groups_the_representative_wins() -> None:
     """Storage keeps one sample per (source, type, time), so samples cannot collide; the rule is pinned anyway."""
     t = _T0
     records = [
-        WithingsMeasureGroupRecord(grpid="8530283246", device_id=_DEVICE, hash_device_id=_HASH, measured_at=t),
+        WithingsMeasureGroupRecord(grpid="8530283250", device_id=_DEVICE, hash_device_id=_HASH, measured_at=t),
         WithingsMeasureGroupRecord(grpid="8530283247", device_id=_DEVICE, hash_device_id=_HASH, measured_at=t),
     ]
-    metrics = {"8530283246": {"heart_rate": 64.0}, "8530283247": {"weight": 72.4, "heart_rate": 70.0}}
+    metrics = {"8530283250": {"heart_rate": 64.0}, "8530283247": {"weight": 72.4, "heart_rate": 70.0}}
     reading = merge_session(records, metrics)
     assert reading.grpid == "8530283247"
     assert reading.metrics == {"weight": 72.4, "heart_rate": 70.0}
