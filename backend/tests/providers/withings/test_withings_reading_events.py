@@ -686,6 +686,29 @@ def test_an_earlier_sibling_with_nothing_to_announce_does_not_silence_the_weigh_
     assert _sent(send)[0]["grpid"] == "8530283247"
 
 
+def test_a_blood_pressure_only_sibling_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    bp_only = _group("8530283240", device_id="15542329", hash_device_id=_HASH, metric_keys=())
+    _record(db, connection, bp_only, (SeriesType.blood_pressure_systolic, SeriesType.blood_pressure_diastolic))
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[_body()], now=_NOW)
+    assert n == 1
+    assert _sent(send)[0]["grpid"] == "8530283247"
+
+
+def test_a_sibling_on_the_same_members_other_connection_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    _, historic = make_provisioned_connection(user=db.get(User, connection.user_id))
+    _record(db, historic, _pulse(), (SeriesType.heart_rate,))
+    with patch(_SEND):
+        n = announce(db, user_connection_id=connection.id, groups=[_body()], now=_NOW)
+    assert n == 1
+
+
 def test_an_earlier_group_of_another_device_or_time_does_not_silence_the_weigh_in(
     db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
 ) -> None:
