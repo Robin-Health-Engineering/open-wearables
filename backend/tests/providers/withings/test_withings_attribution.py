@@ -183,6 +183,21 @@ def test_discard_of_a_registered_weigh_in_deletes_only_its_samples(
     assert [r.grpid for r in list_device_readings(db, user_id=user.id, device_id=HASH).items] == ["8530358979"]
 
 
+def test_discard_keeps_a_colliding_grpid_of_the_members_other_connection_at_another_time(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _, other = make_provisioned_connection(user)  # same member: both accounts write to the one Withings source
+    first, second = recent(), recent() + 60
+    save(db, user.id, connection.id, [body_group(first, attrib=0)])
+    save(db, user.id, other.id, [body_group(second, attrib=0)])  # the same grpid, another session
+
+    discard_reading(db, user_id=user.id, grpid=_BODY)
+
+    assert samples_at(db, user.id, first) == []
+    assert len(samples_at(db, user.id, second)) == 4
+
+
 def test_discard_is_idempotent(db: Session, make_provisioned_connection: ProvisionedConnectionMaker) -> None:
     user, _, _ = _ambiguous_weigh_in(db, make_provisioned_connection)
     first = discard_reading(db, user_id=user.id, grpid=_BODY)

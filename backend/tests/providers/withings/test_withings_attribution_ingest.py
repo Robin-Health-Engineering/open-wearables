@@ -97,6 +97,21 @@ def test_a_late_pulse_group_joins_the_pending_weigh_in(
     assert late.raw == pulse_group(at, attrib=0)
 
 
+def test_a_late_ambiguous_group_of_a_registered_weigh_in_is_registered_and_written(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    at = recent()
+    save(db, user.id, connection.id, [body_group(at, attrib=0)])
+    counts = save(db, user.id, connection.id, [body_group(at, attrib=0), pulse_group(at)])
+    assert {grpid: r.status for grpid, r in records(db, connection.id).items()} == {
+        str(BODY_GRPID): "registered",
+        str(PULSE_GRPID): "registered",
+    }
+    assert counts.inserted == 1  # the pulse sample
+    assert len(samples_at(db, user.id, at)) == 5  # four of the body group, one of the late pulse group
+
+
 def test_a_reread_of_a_discarded_weigh_in_writes_no_samples(
     db: Session, make_provisioned_connection: ProvisionedConnectionMaker
 ) -> None:

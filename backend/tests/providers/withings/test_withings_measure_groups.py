@@ -277,6 +277,15 @@ def test_a_late_sibling_inherits_its_sessions_status(db: Session) -> None:
     assert _stored(db, connection)["902"] == ("discarded", None)
 
 
+def test_a_late_sibling_of_a_registered_session_is_registered(db: Session) -> None:
+    connection = UserConnectionFactory(user=UserFactory(), provider="withings")
+    _record(db, connection, [_held("900", attrib=0)], hold_ambiguous=True)
+    # An ambiguous late group of an already registered weigh-in is not held: it inherits "registered".
+    (late,) = _record(db, connection, [_held("901")], raw_by_grpid=_raws("901"), hold_ambiguous=True)
+    assert late.status == "registered"
+    assert _stored(db, connection) == {"900": ("registered", None), "901": ("registered", None)}
+
+
 def test_a_pending_group_without_its_raw_is_refused(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
     with pytest.raises(ValueError, match="raw"):
