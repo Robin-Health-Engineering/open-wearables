@@ -1,5 +1,6 @@
 """The Robin reading event: who gets one and what it says (delivery is Task 8's)."""
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -111,6 +112,7 @@ def test_build_payload_matches_the_contract() -> None:
         "grpid": "77",
         "measured_at": "2026-09-29T07:55:00Z",
         "types": ["weight", "fat_ratio"],
+        "pending": False,
     }
 
 
@@ -589,6 +591,7 @@ def _record(db: Session, connection: UserConnection, group: ParsedGroup, series:
             model=group.model,
             attrib=group.attrib,
             measured_at=group.measured_at,
+            status=group.status,
         )
     )
     source = db.query(DataSource).filter(DataSource.user_id == connection.user_id).one_or_none()
@@ -703,3 +706,57 @@ def test_an_earlier_group_of_another_device_or_time_does_not_silence_the_weigh_i
     with patch(_SEND):
         n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_pulse()], now=_NOW)
     assert n == 1
+
+
+# --- pending (spec 2026-10-01 D1, contract A3) ----------------------------------------------------
+
+
+def test_a_pending_weigh_in_is_announced_once_with_pending_true(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    groups = [dataclasses.replace(_body(), status="pending"), dataclasses.replace(_pulse(), status="pending")]
+    with patch(_SEND) as send:
+        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=groups, now=_NOW)
+    assert n == 1
+    (payload,) = _sent(send)
+    assert payload["pending"] is True
+    assert payload["grpid"] == "8530283247"
+    assert payload["types"] == [*_BODY_KEYS, "heart_rate"]
+
+
+def test_a_registered_weigh_in_is_announced_with_pending_false(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    with patch(_SEND) as send:
+        reading_events.enqueue_new_reading_events(
+            db, user_connection_id=connection.id, groups=[_body(), _pulse()], now=_NOW
+        )
+    assert [p["pending"] for p in _sent(send)] == [False]
+
+
+def test_a_discarded_group_is_never_announced(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """A late sibling of a weigh-in the member already discarded is recorded as a tombstone, silently."""
+    connection = _provisioned(db, make_provisioned_connection)
+    groups = [dataclasses.replace(_pulse(), status="discarded")]
+    with patch(_SEND) as send:
+        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=groups, now=_NOW)
+    assert n == 0
+    send.assert_not_called()
+
+
+def test_a_late_sibling_of_a_pending_session_is_not_announced_again(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """A pending sibling has no samples, so it is its status that says the weigh-in was announced."""
+    connection = _provisioned(db, make_provisioned_connection)
+    _record(db, connection, dataclasses.replace(_body(), status="pending"))
+    pulse = dataclasses.replace(_pulse(), status="pending")
+    _record(db, connection, pulse)  # this batch's own row, as record_new_groups leaves it
+    with patch(_SEND) as send:
+        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
+    assert n == 0
+    send.assert_not_called()

@@ -8,8 +8,10 @@ Sent only for groups that are
 * NEW, i.e. just inserted into withings_measure_group (``record_new_groups``);
 * on a connection WE provisioned (a ``withings_sdk_account`` row), because a member's own
   Withings account is not the device we sold them;
-* device-captured (a ``deviceid``, attrib not 2/4 = manual entry; see ``_eligible`` for why
-  every other attrib, the ambiguous 1 included, is accepted);
+* device-captured (a ``deviceid``, attrib not 2/4 = manual entry). An ambiguous ``attrib 1``
+  weigh-in on a provisioned account is recorded ``pending`` (spec 2026-10-01 D1) and IS announced,
+  with ``pending: true``, so Robin asks the member "È tua questa pesata?"; a ``discarded`` group
+  (the late sibling of a weigh-in the member already rejected) never is;
 * carrying at least one C2 metric (a blood-pressure-only group has nothing to announce);
 * RECENT (``robin_reading_event_max_age_hours``), because backfills re-read history;
 * ONE PER SESSION (``measure_groups.session_device``): a cellular Body Pro 2 weigh-in arrives as
@@ -51,6 +53,9 @@ from app.schemas.enums import ProviderName, get_series_type_id
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings.measure_groups import (
     C2_KEYS,
+    DISCARDED,
+    PENDING,
+    REGISTERED,
     WEIGHT_KEY,
     ParsedGroup,
     representative_grpid,
@@ -106,21 +111,24 @@ def build_payload(
         "grpid": group.grpid,
         "measured_at": _iso_utc(group.measured_at),
         "types": list(group.metric_keys),
+        # Contract A3: true iff the session is held pending (attrib 1, awaiting the member's answer).
+        "pending": group.status == PENDING,
     }
 
 
 def _eligible(group: ParsedGroup, cutoff: datetime) -> bool:
-    """Only manual entries (attrib 2 and 4) are refused; every other device attrib is accepted.
+    """Device-captured, not discarded, with something to announce, and recent.
 
-    That includes attrib 1, "device measure, ambiguous user": Withings could not tell which user
-    of the device stepped on it. A household sharing one cellular scale can therefore get another
-    person's weigh-in pushed to the member. Accepted for now, knowingly: dropping 1 would also
-    drop the member's own readings whenever the scale is unsure of the user. The push itself
-    carries ids and metric names only, never values.
+    Manual entries (attrib 2 and 4) are refused. Ambiguous ones (attrib 1) are accepted: on an
+    account we provisioned they arrive ``pending`` and the event says so, so the member is asked
+    rather than handed another person's weigh-in; on the member's own account they are registered
+    as before, but that account never emits. A discarded group is the late sibling of a weigh-in
+    the member already rejected: nothing to say.
     """
     return (
         group.device_id is not None
         and group.attrib not in _MANUAL_ATTRIBS
+        and group.status != DISCARDED
         and group.has_c2_metrics
         and group.measured_at >= cutoff
     )
@@ -155,9 +163,23 @@ def _announced_earlier(
     Announceable as ``_eligible`` sees it from what is stored: a device-captured group with at
     least one C2 sample. Recency needs no check, the sibling has the session's own time. A sibling
     that only held, say, blood pressure was never announced, so it does not silence this one.
+
+    A pending or discarded sibling has no samples by design, so its status stands in for them: the
+    weigh-in was announced (pending) or already answered (discarded). Known edge, accepted: a
+    pending sibling that held only non-C2 measures silences this one too.
     """
     device = session_device(session.hash_device_id, session.device_id)
     group = WithingsMeasureGroupRecord
+    same_session = (
+        group.user_connection_id == user_connection_id,
+        group.measured_at == session.measured_at,
+        session_device_column() == device,
+        group.grpid.not_in(batch_grpids),
+        or_(group.attrib.is_(None), group.attrib.not_in(_MANUAL_ATTRIBS)),
+    )
+    held = db.query(group.id).filter(*same_session, group.status != REGISTERED).first()
+    if held is not None:
+        return True
     row = (
         db.query(group.id)
         .join(DataSource, and_(DataSource.user_id == user_id, DataSource.provider == ProviderName.WITHINGS))
@@ -170,13 +192,7 @@ def _announced_earlier(
                 DataPointSeries.series_type_definition_id.in_(_C2_TYPE_IDS),
             ),
         )
-        .filter(
-            group.user_connection_id == user_connection_id,
-            group.measured_at == session.measured_at,
-            session_device_column() == device,
-            group.grpid.not_in(batch_grpids),
-            or_(group.attrib.is_(None), group.attrib.not_in(_MANUAL_ATTRIBS)),
-        )
+        .filter(*same_session)
         .first()
     )
     return row is not None

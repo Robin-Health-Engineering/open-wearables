@@ -195,10 +195,12 @@ def test_save_measures_ingests_body_pro_2_groups_and_emits_with_the_groups_hash(
         "grpid",
         "measured_at",
         "types",
+        "pending",
     }
     assert payload["device_id"] == "15542329"
     assert payload["hash_deviceid"] == _HASH
     assert payload["grpid"] == "8530283247"
+    assert payload["pending"] is False
 
 
 # --------------------------------------------------------------------------- reading events
