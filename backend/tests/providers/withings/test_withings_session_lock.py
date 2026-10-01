@@ -1,9 +1,10 @@
-"""Exactly one reading event per weigh-in, across CONCURRENT ingests (review 4152718174 on PR #20).
+"""One reading-event decision per weigh-in, across CONCURRENT ingests (review 4152718174 on PR #20).
 
 A cellular Body Pro 2 weigh-in arrives as two groups. When two ingests each insert one of them,
 both used to commit before either checked for an earlier sibling, and each took the other's group
 for the one that had announced the weigh-in: no push at all. The ingest now takes a session lock
-before recording, decides under it, and only enqueues after its commit.
+before recording, decides under it, and only enqueues after its commit. These tests pin exactly one
+decision and one send in the no-failure path; they say nothing about delivery when a step fails.
 
 These tests need COMMITTED rows seen from two real connections, so they cannot use the per-test
 rollback ``db`` fixture: ``committed_member`` creates its own member on the test database and

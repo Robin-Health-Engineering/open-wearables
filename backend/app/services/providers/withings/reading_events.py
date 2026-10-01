@@ -24,15 +24,21 @@ Sent only for groups that are
   readings API still shows the whole weigh-in under either grpid, so the push opens the right
   reading; only its ``types`` and grpid differ from the usual.
 
-EXACTLY ONE event per session that has an announceable group, across ingests too: ingest takes
-the session's lock (``measure_groups.lock_sessions``) before it records the groups and holds it
-through this module's DECISION (``decide_reading_events``), which runs before its commit. A later
-ingest of the same weigh-in (the pulse group Withings exposed a moment after the body group) waits
-on that lock, then sees the earlier ingest's committed groups, and announces nothing if one of
-them was announceable: that ingest announced the session. A pending session's one event carries
-``pending: true``; a late sibling of a pending or discarded session announces nothing (R10). The
-SEND (``send_reading_events``) runs after the commit. Both steps are best effort and never fail
-the ingest: a failed decision or enqueue is captured, and no later ingest retries it.
+EXACTLY ONE DECISION per session that has an announceable group, across ingests too; AT MOST ONE
+DELIVERY. Ingest takes the session's lock (``measure_groups.lock_sessions``) before it records the
+groups and holds it through this module's DECISION (``decide_reading_events``), which runs before
+its commit. A later ingest of the same weigh-in (the pulse group Withings exposed a moment after
+the body group) waits on that lock, then sees the earlier ingest's committed groups, and decides
+nothing if one of them was announceable: that ingest DECIDED to announce the session. A pending
+session's one event carries ``pending: true``; a late sibling of a pending or discarded session
+announces nothing (R10). The SEND (``send_reading_events``) runs after the commit. Both steps are
+best effort and never fail the ingest, and the groups are committed between them.
+
+What a failure costs: if the decision or the enqueue fails, the session gets no push. The reading
+stays visible in the readings API; nothing retries (no later ingest, no recovery job), because the
+committed groups make every later ingest treat the session as already decided. The failure goes
+to Sentry (``log_and_capture_error``, in both the decision and the enqueue). Nothing is stored
+that tells "announced" from "announceable".
 
 Enqueue is by name (``DELIVER_TASK``), so there is no import dependency on the Celery task; the
 task calls ``post_event`` here, which signs and POSTs.
@@ -168,11 +174,12 @@ def _sessions(groups: list[ParsedGroup]) -> list[ParsedGroup]:
 def _announced_earlier(
     db: DbSession, *, user_id: UUID, user_connection_id: UUID, session: ParsedGroup, batch_grpids: set[str]
 ) -> bool:
-    """Whether an EARLIER ingest recorded a sibling of this session that was announceable, and so announced it.
+    """Whether an EARLIER ingest recorded a sibling of this session that was announceable, and so decided it.
 
-    "And so announced it" holds because the caller holds the session lock: every earlier ingest of
+    "And so decided it" holds because the caller holds the session lock: every earlier ingest of
     this session decided under the same lock and committed before this one could record, so the
-    first ingest that recorded an announceable group found none earlier and announced the session.
+    first ingest that recorded an announceable group found none earlier and decided to announce the
+    session. That is a decision, not a delivery: it does not say the event was sent.
     Without the lock two ingests could each see the other's group here and neither send.
 
     Announceable as ``_eligible`` sees it from what is stored: a device-captured group (a
@@ -291,8 +298,9 @@ def decide_reading_events(
     until this one commits. ``groups`` is exactly what this ingest inserted, so a sibling recorded
     under any other grpid came from an earlier ingest.
 
-    Database reads only: no HTTP, no commit. Never raises: a failure is captured and rolled back to
-    a savepoint, so the ingest's groups and samples still commit, and nothing is announced.
+    Database reads only: no HTTP, no commit. Never raises: a failure is captured (Sentry) and rolled
+    back to a savepoint, so the ingest's groups and samples still commit, nothing is announced, and
+    nothing retries it (see the module doc).
     """
     if not groups or not is_enabled():
         return None
@@ -362,6 +370,9 @@ def _event_hashes(db: DbSession, plan: ReadingEventPlan, oauth: BaseOAuthTemplat
 
 def send_reading_events(db: DbSession, plan: ReadingEventPlan | None, *, oauth: BaseOAuthTemplate | None = None) -> int:
     """Enqueue one delivery per decided session; returns how many. After the ingest's commit. Never raises.
+
+    At most one delivery per session: a failed enqueue is captured (Sentry) and not retried, so
+    that session gets no push (see the module doc).
 
     After the commit because Robin reads the reading back as soon as it gets the event, and because
     the Getdevice refresh (``oauth``) is an HTTP call that must not run under the session locks.
