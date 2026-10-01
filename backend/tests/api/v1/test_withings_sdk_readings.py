@@ -54,7 +54,15 @@ def test_list_route_shape(
 
     assert r.status_code == 200
     assert r.json() == {
-        "items": [{"grpid": "55", "measured_at": "2026-09-01T07:00:00Z", "device_id": "dev-1", "metrics": {}}],
+        "items": [
+            {
+                "grpid": "55",
+                "measured_at": "2026-09-01T07:00:00Z",
+                "device_id": "dev-1",
+                "metrics": {},
+                "status": "registered",
+            }
+        ],
         "next_cursor": None,
     }
 
@@ -128,6 +136,7 @@ def test_single_route_shape(
         "grpid": "55",
         "measured_at": "2026-09-01T07:00:00Z",
         "device_id": "dev-1",
+        "status": "registered",
         "is_first": True,
         "metrics": {},
     }

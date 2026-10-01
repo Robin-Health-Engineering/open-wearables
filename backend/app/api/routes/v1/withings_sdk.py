@@ -22,7 +22,7 @@ claimed it was.
 
 from datetime import datetime, timezone
 from logging import getLogger
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -41,6 +41,7 @@ from app.services.api_key_service import ApiKeyDep
 from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.measure_groups import ReadingStatus
 from app.services.providers.withings.order_detail import WithingsOrderDetailError, get_order_detail
 from app.services.providers.withings.readings import (
     InvalidReadingCursor,
@@ -1038,17 +1039,29 @@ def _utc_z(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+VisibleStatus = Literal["registered", "pending"]
+
+
+def _visible(value: ReadingStatus) -> VisibleStatus:
+    """A served reading is registered or pending (contract A1); the readings service never returns a discarded one."""
+    if value == "discarded":
+        raise ValueError("a discarded reading is never served")
+    return value
+
+
 class DeviceReadingItem(BaseModel):
     """One reading (Withings measurement group) from the device we sold the member.
 
     ``metrics`` uses the Robin metric keys (weight, fat_ratio, ...). A key the reading does not
-    carry is ABSENT, never null; the app shows only what is there.
+    carry is ABSENT, never null; the app shows only what is there. ``status`` is ``pending`` for a weigh-in
+    the scale could not attribute; its metrics are the held values the member is asked to confirm.
     """
 
     grpid: str
     measured_at: datetime
     device_id: str | None
     metrics: dict[str, float]
+    status: VisibleStatus
 
     @field_serializer("measured_at")
     def _serialize_measured_at(self, value: datetime) -> str:
@@ -1057,7 +1070,11 @@ class DeviceReadingItem(BaseModel):
     @classmethod
     def of(cls, reading: Reading) -> "DeviceReadingItem":
         return cls(
-            grpid=reading.grpid, measured_at=reading.measured_at, device_id=reading.device_id, metrics=reading.metrics
+            grpid=reading.grpid,
+            measured_at=reading.measured_at,
+            device_id=reading.device_id,
+            metrics=reading.metrics,
+            status=_visible(reading.status),
         )
 
 
@@ -1076,6 +1093,7 @@ class DeviceReadingResponse(DeviceReadingItem):
             measured_at=reading.measured_at,
             device_id=reading.device_id,
             metrics=reading.metrics,
+            status=_visible(reading.status),
             is_first=bool(reading.is_first),
         )
 
