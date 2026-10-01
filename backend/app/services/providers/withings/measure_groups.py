@@ -3,9 +3,11 @@
 See ``WithingsMeasureGroupRecord`` for why these live beside the samples rather than on them.
 """
 
-from collections.abc import Iterable
+import dataclasses
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import ColumnElement, func
@@ -102,6 +104,9 @@ class ParsedGroup:
     # The group's own ``hash_deviceid``. For some devices (the cellular Body Pro 2) ``device_id`` is
     # an id Getdevice never lists and only this hash joins the group to its withings_device row.
     hash_device_id: str | None = None
+    # The session's status as ``record_new_groups`` decided it. Groups built anywhere else (tests,
+    # ``parsed_group_of``) are registered until recorded.
+    status: ReadingStatus = REGISTERED
 
     @property
     def has_c2_metrics(self) -> bool:
@@ -130,19 +135,75 @@ def parsed_group_of(group: WithingsMeasureGroup) -> ParsedGroup | None:
     )
 
 
+def _stored_session_statuses(
+    db: DbSession, *, user_connection_id: UUID, groups: list[ParsedGroup]
+) -> dict[tuple[str, datetime], ReadingStatus]:
+    """The status of every stored session these groups could join, by ``(session device, measured_at)``.
+
+    Only sessions that name a device: a group with neither a hash nor a deviceid has no siblings
+    (``readings._session_groups``), so it never inherits anything.
+    """
+    times = {g.measured_at for g in groups if session_device(g.hash_device_id, g.device_id) is not None}
+    if not times:
+        return {}
+    record = WithingsMeasureGroupRecord
+    rows = db.query(record.hash_device_id, record.device_id, record.measured_at, record.status).filter(
+        record.user_connection_id == user_connection_id, record.measured_at.in_(times)
+    )
+    statuses: dict[tuple[str, datetime], list[str]] = {}
+    for hash_device_id, device_id, measured_at, status in rows:
+        device = session_device(hash_device_id, device_id)
+        if device is not None:
+            statuses.setdefault((device, measured_at), []).append(status)
+    return {key: session_status(values) for key, values in statuses.items()}
+
+
 def record_new_groups(
-    db: DbSession, *, user_id: UUID, user_connection_id: UUID, groups: list[ParsedGroup]
+    db: DbSession,
+    *,
+    user_id: UUID,
+    user_connection_id: UUID,
+    groups: list[ParsedGroup],
+    raw_by_grpid: Mapping[str, dict[str, Any]] | None = None,
+    hold_ambiguous: bool = False,
 ) -> list[ParsedGroup]:
-    """Insert the groups not yet recorded for this connection and return exactly those.
+    """Insert the groups not yet recorded for this connection and return exactly those, with their status.
 
     Idempotent on ``(user_connection_id, grpid)``: a re-read window, a redelivered notification
     or a sibling appli notification for the same weigh-in returns nothing the second time. Groups
     without C2 metrics are recorded too (callers skip them via ``has_c2_metrics``). Does not
     commit; the caller commits alongside the samples.
+
+    The status is decided per SESSION (spec 2026-10-01 D9), so a weigh-in's groups share it:
+
+    * a session already stored (a sibling recorded by an earlier ingest) passes its status on: a
+      pulse group arriving after its pending or discarded weigh-in joins it instead of registering
+      on its own;
+    * otherwise, with ``hold_ambiguous`` (the caller's "this is an account we provisioned"), a
+      session holding an ``attrib 1`` group is ``pending``, and each of its groups keeps its
+      payload from ``raw_by_grpid``, which must then hold it (``ValueError`` otherwise: a pending
+      group without its payload could never be confirmed);
+    * otherwise ``registered``.
     """
     if not groups:
         return []
     by_grpid = {g.grpid: g for g in groups}
+    stored = _stored_session_statuses(db, user_connection_id=user_connection_id, groups=list(by_grpid.values()))
+    batch: dict[tuple[str | None, datetime], list[ParsedGroup]] = {}
+    for g in by_grpid.values():
+        batch.setdefault((session_device(g.hash_device_id, g.device_id), g.measured_at), []).append(g)
+    status_by_grpid: dict[str, ReadingStatus] = {}
+    for (device, measured_at), members in batch.items():
+        status = stored.get((device, measured_at)) if device is not None else None
+        if status is None:
+            ambiguous = hold_ambiguous and any(m.attrib == AMBIGUOUS_ATTRIB for m in members)
+            status = PENDING if ambiguous else REGISTERED
+        for member in members:
+            status_by_grpid[member.grpid] = status
+    raws = raw_by_grpid or {}
+    unheld = sorted(grpid for grpid, status in status_by_grpid.items() if status == PENDING and grpid not in raws)
+    if unheld:
+        raise ValueError(f"pending groups need their raw payload: {unheld}")
     stmt = (
         insert(WithingsMeasureGroupRecord)
         .values(
@@ -157,6 +218,8 @@ def record_new_groups(
                     "model": g.model,
                     "attrib": g.attrib,
                     "measured_at": g.measured_at,
+                    "status": status_by_grpid[g.grpid],
+                    "raw": raws[g.grpid] if status_by_grpid[g.grpid] == PENDING else None,
                 }
                 for g in by_grpid.values()
             ]
@@ -165,4 +228,21 @@ def record_new_groups(
         .returning(WithingsMeasureGroupRecord.grpid)
     )
     inserted = {row[0] for row in db.execute(stmt)}
-    return [g for g in by_grpid.values() if g.grpid in inserted]
+    return [dataclasses.replace(g, status=status_by_grpid[g.grpid]) for g in by_grpid.values() if g.grpid in inserted]
+
+
+def withheld_grpids(db: DbSession, *, user_connection_id: UUID, grpids: Iterable[str]) -> set[str]:
+    """Which of these grpids belong to a pending or discarded session: their samples must not be written.
+
+    Asked on every ingest, after ``record_new_groups``, for the new groups AND every re-read of an
+    old one, so a discarded reading's samples never come back on the next sync of its window, and a
+    pending one's are only ever written by confirm.
+    """
+    wanted = set(grpids)
+    if not wanted:
+        return set()
+    record = WithingsMeasureGroupRecord
+    rows = db.query(record.grpid).filter(
+        record.user_connection_id == user_connection_id, record.grpid.in_(wanted), record.status != REGISTERED
+    )
+    return {row[0] for row in rows}
