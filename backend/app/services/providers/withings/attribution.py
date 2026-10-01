@@ -12,8 +12,12 @@ samples. The member answers in the app ("È tua questa pesata?"), or removes a r
   deletes its samples. The rows stay as tombstones: ``save_measures`` writes no samples for a
   discarded session, so no re-read of the window brings the reading back.
 
-Both act on the whole session (``readings.find_session``: any sibling grpid names it), lock its
-rows, and are idempotent. Neither sends an event: the member is already in the app.
+Both act on the whole session (``readings.find_session``: any sibling grpid names it) and are
+idempotent. Neither sends an event: the member is already in the app. Both, and the 7-day
+retirement, first take the session's lock (``measure_groups.lock_sessions``), the one an ingest
+holds from recording a weigh-in's groups to its commit: a late sibling being ingested cannot
+interleave with the member's answer (a discard could otherwise see the session without that
+sibling, or the ingest write samples for a session discarded under it).
 """
 
 import logging
@@ -34,6 +38,10 @@ from app.services.providers.withings.measure_groups import (
     REGISTERED,
     ReadingStatus,
     grpid_order,
+    lock_sessions,
+    session_device,
+    session_device_column,
+    session_lock_key,
     session_status,
 )
 from app.services.providers.withings.readings import Reading, find_session, get_reading, merge_session, session_metrics
@@ -41,6 +49,34 @@ from app.services.timeseries_service import timeseries_service
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
+
+
+def _lock_key(record: WithingsMeasureGroupRecord) -> str:
+    return session_lock_key(
+        record.user_connection_id,
+        grpid=record.grpid,
+        hash_device_id=record.hash_device_id,
+        device_id=record.device_id,
+        measured_at=record.measured_at,
+    )
+
+
+def _locked_session(
+    db: DbSession, *, user_id: UUID, grpid: str, any_state: bool = False
+) -> list[WithingsMeasureGroupRecord] | None:
+    """The session ``grpid`` names, read again under its session lock and with its rows locked.
+
+    Found once to learn its key, then re-read once the lock is held: an ingest that held it may
+    have added a sibling meanwhile.
+    """
+    found = find_session(db, user_id=user_id, grpid=grpid, any_state=any_state)
+    if found is None:
+        return None
+    lock_sessions(db, [_lock_key(found[0])])
+    session = find_session(db, user_id=user_id, grpid=grpid, lock=True, any_state=any_state)
+    if session is None:
+        db.rollback()  # releases the lock
+    return session
 
 
 @dataclass(frozen=True)
@@ -59,11 +95,11 @@ def confirm_reading(db: DbSession, *, user_id: UUID, grpid: str) -> Reading | No
     None when no group of it is on this member's provisioned accounts, or it was discarded or
     retired. An already registered reading is returned unchanged (idempotent).
     """
-    session = find_session(db, user_id=user_id, grpid=grpid, lock=True)
+    session = _locked_session(db, user_id=user_id, grpid=grpid)
     if session is None:
         return None
     if session_status(r.status for r in session) == DISCARDED:
-        db.rollback()  # releases the row lock this call took
+        db.rollback()  # releases the locks this call took
         return None
     held = [r for r in session if r.status == PENDING]
     if held:
@@ -126,7 +162,7 @@ def discard_reading(db: DbSession, *, user_id: UUID, grpid: str) -> DiscardResul
     member's provisioned accounts.
     """
     # Any connection state: a repeat discard of a disconnected account's tombstone still answers (A2b.1).
-    session = find_session(db, user_id=user_id, grpid=grpid, lock=True, any_state=True)
+    session = _locked_session(db, user_id=user_id, grpid=grpid, any_state=True)
     if session is None:
         return None
     was = session_status(r.status for r in session)
@@ -171,22 +207,46 @@ def retire_stale_pending(db: DbSession, *, now: datetime | None = None) -> int:
     "Deleted" in the spec's sense: the held values (``raw``) are erased and the weigh-in is never
     registered. The row stays as a ``discarded`` tombstone, because a re-read of the window (a
     reconnect backfill reads 30 days) would otherwise record the group again as new and pending,
-    and the member would see a weigh-in they never answered come back. A session's groups share
-    ``measured_at``, so a whole weigh-in is retired at once.
+    and the member would see a weigh-in they never answered come back.
+
+    One session per transaction, under its session lock, and the whole session at once (its groups
+    share ``measured_at``): a late sibling an ingest is recording right now is either committed
+    before the retirement takes the lock, and retired with its session, or waits and then joins
+    the session as a tombstone (R5). A session that turns stale while this runs waits for tomorrow.
     """
     cutoff = (now or datetime.now(timezone.utc)) - PENDING_MAX_AGE
     record = WithingsMeasureGroupRecord
-    result = cast(
-        CursorResult[tuple[()]],
-        db.execute(
-            update(record)
-            .where(record.status == PENDING, record.measured_at < cutoff)
-            .values(status=DISCARDED, raw=null())
-            .execution_options(synchronize_session=False)
-        ),
-    )
-    db.commit()
-    retired = result.rowcount
+    stale = db.execute(
+        select(record.user_connection_id, record.grpid, record.hash_device_id, record.device_id, record.measured_at)
+        .where(record.status == PENDING, record.measured_at < cutoff)
+        .order_by(record.user_connection_id, record.measured_at)
+    ).all()
+    db.commit()  # ends the read's transaction: each session gets its own
+    sessions: dict[str, tuple[UUID, str, str | None, datetime]] = {}
+    for connection_id, grpid, hash_device_id, device_id, measured_at in stale:
+        key = session_lock_key(
+            connection_id, grpid=grpid, hash_device_id=hash_device_id, device_id=device_id, measured_at=measured_at
+        )
+        sessions.setdefault(key, (connection_id, grpid, session_device(hash_device_id, device_id), measured_at))
+    retired = 0
+    for key, (connection_id, grpid, device, measured_at) in sessions.items():
+        lock_sessions(db, [key])
+        same_session = (
+            (record.grpid == grpid)
+            if device is None
+            else (record.measured_at == measured_at) & (session_device_column() == device)
+        )
+        result = cast(
+            CursorResult[tuple[()]],
+            db.execute(
+                update(record)
+                .where(record.user_connection_id == connection_id, same_session, record.status == PENDING)
+                .values(status=DISCARDED, raw=null())
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        db.commit()
+        retired += result.rowcount
     log_structured(
         logger,
         "info",

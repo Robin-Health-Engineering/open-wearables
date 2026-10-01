@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, func
+from sqlalchemy import ColumnElement, func, text
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -56,6 +56,38 @@ def session_device_column() -> ColumnElement[str | None]:
     # No NULLIF for an empty hash: ``parsed_group_of`` already stores it as NULL, and a bound
     # parameter here would make the expression differ between a SELECT and its GROUP BY.
     return func.coalesce(WithingsMeasureGroupRecord.hash_device_id, WithingsMeasureGroupRecord.device_id)
+
+
+def session_lock_key(
+    user_connection_id: UUID,
+    *,
+    grpid: str,
+    hash_device_id: str | None,
+    device_id: str | None,
+    measured_at: datetime,
+) -> str:
+    """The name of a session's lock: its connection, device and ``measured_at``; by grpid when nothing names a device.
+
+    A group with neither a hash nor a deviceid has no siblings (``readings._session_groups``), so it
+    is a session of its own. The prefixes keep a device string from ever spelling a grpid key.
+    """
+    device = session_device(hash_device_id, device_id)
+    if device is None:
+        return f"withings-session|{user_connection_id}|grpid|{grpid}"
+    return f"withings-session|{user_connection_id}|device|{device}|{int(measured_at.timestamp())}"
+
+
+def lock_sessions(db: DbSession, keys: Iterable[str]) -> None:
+    """Take each session's transaction-scoped advisory lock; released by the caller's commit or rollback.
+
+    One lock per session serialises everything that decides about a weigh-in: an ingest recording
+    and announcing its groups (``Withings247Data.save_measures``), and the member's confirm or
+    discard and the 7-day retirement (``attribution``). Taken in sorted order, so two callers that
+    each need several sessions cannot deadlock. A hash collision between two keys only serialises
+    two unrelated sessions, never lets two of one through.
+    """
+    for key in sorted(set(keys)):
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": key})
 
 
 def grpid_order(grpid: str) -> tuple[int, int, str]:
@@ -184,6 +216,10 @@ def record_new_groups(
       payload from ``raw_by_grpid``, which must then hold it (``ValueError`` otherwise: a pending
       group without its payload could never be confirmed);
     * otherwise ``registered``.
+
+    The caller holds the batch's session locks (``lock_sessions``): two ingests that each carry one
+    group of a weigh-in would otherwise both miss the other's uncommitted group here, and split the
+    weigh-in into a pending and a registered half.
     """
     if not groups:
         return []

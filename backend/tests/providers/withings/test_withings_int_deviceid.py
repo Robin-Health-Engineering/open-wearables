@@ -24,13 +24,13 @@ from app.config import settings
 from app.models import DataPointSeries, DataSource, UserConnection, WithingsMeasureGroupRecord
 from app.models.withings_device import WithingsDevice
 from app.schemas.providers.withings import WithingsActivity, WithingsMeasureGroup, WithingsWorkout
-from app.services.providers.withings import reading_events
 from app.services.providers.withings._client import PaginatedResult
 from app.services.providers.withings.data_247 import Withings247Data
 from app.services.providers.withings.measure_groups import ParsedGroup, parsed_group_of
 from app.services.providers.withings.readings import get_reading, list_device_readings
 from app.services.providers.withings.sdk_devices import sync_devices_from_withings
 from tests.providers.withings.conftest import ProvisionedConnectionMaker
+from tests.providers.withings.weigh_ins import announce
 
 _HASH = "41a451ad428083cbf215257be7decbc02a3169c5"
 _INT_DEVICEID = 15542329
@@ -224,9 +224,7 @@ def test_a_group_with_its_own_hash_needs_no_device_row_and_no_refresh(
     _enable_events(monkeypatch)
     _, connection = make_provisioned_connection()  # no withings_device row at all
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        n = reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=[_parsed("1")], oauth=MagicMock()
-        )
+        n = announce(db, user_connection_id=connection.id, groups=[_parsed("1")], oauth=MagicMock())
     assert n == 1
     sync.assert_not_called()
     assert send.call_args.kwargs["args"][0]["hash_deviceid"] == _HASH
@@ -249,9 +247,7 @@ def test_a_group_without_a_hash_still_falls_back_to_the_device_row(
     db.flush()
     groups = [_parsed("1"), _parsed("2", device_id="dev-legacy", hash_device_id=None)]
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=groups, oauth=MagicMock()
-        )
+        announce(db, user_connection_id=connection.id, groups=groups, oauth=MagicMock())
     sync.assert_not_called()  # the only hashless group's device already has a stored hash
     assert [c.kwargs["args"][0]["hash_deviceid"] for c in send.call_args_list] == [_HASH, "hash-legacy"]
 
@@ -263,9 +259,7 @@ def test_only_a_hashless_group_can_trigger_the_getdevice_refresh(
     _, connection = make_provisioned_connection()
     groups = [_parsed("1"), _parsed("2", device_id="dev-unknown", hash_device_id=None)]
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=groups, oauth=MagicMock()
-        )
+        announce(db, user_connection_id=connection.id, groups=groups, oauth=MagicMock())
     sync.assert_called_once()
     assert [c.kwargs["args"][0]["hash_deviceid"] for c in send.call_args_list] == [_HASH, None]
 

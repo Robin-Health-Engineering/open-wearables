@@ -18,8 +18,11 @@ from sqlalchemy.orm import Query, Session
 from app.config import settings
 from app.models import DataPointSeries, DataSource, WithingsMeasureGroupRecord
 from app.repositories.data_point_series_repository import WriteCounts
+from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.withings import reading_events
 from app.services.providers.withings._client import PaginatedResult
 from app.services.providers.withings.data_247 import Withings247Data
+from app.services.providers.withings.measure_groups import ParsedGroup
 
 HASH = "41a451ad428083cbf215257be7decbc02a3169c5"
 BODY_GRPID = 8530283247
@@ -82,6 +85,19 @@ def save(
     now = datetime.now(timezone.utc)
     with patch(_PAGINATE, return_value=PaginatedResult(rows=rows, envelope=envelope or {})):
         return data.save_measures(db, user_id, now - timedelta(days=1), now, connection_id)
+
+
+def announce(
+    db: Session,
+    *,
+    user_connection_id: UUID,
+    groups: list[ParsedGroup],
+    now: datetime | None = None,
+    oauth: BaseOAuthTemplate | None = None,
+) -> int:
+    """The reading-event half of an ingest, as ``save_measures`` runs it: decide, then send (no commit between)."""
+    plan = reading_events.decide_reading_events(db, user_connection_id=user_connection_id, groups=groups, now=now)
+    return reading_events.send_reading_events(db, plan, oauth=oauth)
 
 
 def _member_samples(db: Session, user_id: UUID) -> Query[DataPointSeries]:

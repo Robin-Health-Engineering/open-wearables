@@ -585,12 +585,19 @@ def test_load_and_save_all_reports_each_failure_once(mock_paginate: MagicMock, m
     mock_capture.assert_not_called()
 
 
-@patch("app.services.providers.withings.data_247.enqueue_new_reading_events")
+@patch("app.services.providers.withings.data_247.send_reading_events")
+@patch("app.services.providers.withings.data_247.decide_reading_events")
+@patch("app.services.providers.withings.data_247.lock_sessions")
 @patch("app.services.providers.withings.data_247.record_new_groups")
 @patch("app.services.providers.withings.data_247.timeseries_service")
 @patch("app.services.providers.withings.data_247.paginate")
-def test_save_measures_records_groups_then_emits_after_commit(
-    mock_paginate: MagicMock, mock_ts: MagicMock, mock_record: MagicMock, mock_enqueue: MagicMock
+def test_save_measures_locks_records_and_decides_before_commit_then_sends_after(
+    mock_paginate: MagicMock,
+    mock_ts: MagicMock,
+    mock_record: MagicMock,
+    mock_lock: MagicMock,
+    mock_decide: MagicMock,
+    mock_send: MagicMock,
 ) -> None:
     d = _make_data_247()
     db = MagicMock()
@@ -603,14 +610,18 @@ def test_save_measures_records_groups_then_emits_after_commit(
     )
     mock_ts.bulk_create_samples.return_value = WriteCounts(inserted=1, updated=0)
     order: list[str] = []
+    plan = object()
 
     def _record(db: MagicMock, **kw: Any) -> list[ParsedGroup]:
         order.append("record")
         return kw["groups"]
 
+    locked: list[str] = []
+    mock_lock.side_effect = lambda db, keys: order.append("lock") or locked.extend(keys)
     mock_record.side_effect = _record
+    mock_decide.side_effect = lambda *a, **kw: order.append("decide") or plan
     db.commit.side_effect = lambda: order.append("commit")
-    mock_enqueue.side_effect = lambda *a, **kw: order.append("enqueue") or 1
+    mock_send.side_effect = lambda *a, **kw: order.append("send") or 1
 
     d.save_measures(db, uuid4(), datetime.now(timezone.utc), datetime.now(timezone.utc), connection_id)
 
@@ -618,12 +629,15 @@ def test_save_measures_records_groups_then_emits_after_commit(
     assert recorded["user_connection_id"] == connection_id
     assert [g.grpid for g in recorded["groups"]] == ["9"]
     assert recorded["groups"][0].device_id == "dev-1"
-    assert order == ["record", "commit", "enqueue"]
-    assert mock_enqueue.call_args.kwargs["user_connection_id"] == connection_id
-    assert mock_enqueue.call_args.kwargs["oauth"] is d.oauth  # enables the null-hash Getdevice refresh
+    assert order == ["lock", "record", "decide", "commit", "send"]
+    assert len(locked) == 1  # the batch's one session
+    assert mock_decide.call_args.kwargs["user_connection_id"] == connection_id
+    assert [g.grpid for g in mock_decide.call_args.kwargs["groups"]] == ["9"]
+    assert mock_send.call_args.args[1] is plan
+    assert mock_send.call_args.kwargs["oauth"] is d.oauth  # enables the null-hash Getdevice refresh
 
 
-@patch("app.services.providers.withings.data_247.enqueue_new_reading_events")
+@patch("app.services.providers.withings.reading_events.celery_app.send_task")
 @patch("app.services.providers.withings.data_247.record_new_groups", return_value=[])
 @patch("app.services.providers.withings.data_247.timeseries_service")
 @patch("app.services.providers.withings.data_247.paginate")
@@ -640,7 +654,7 @@ def test_save_measures_emits_nothing_when_no_group_is_new(
     mock_enqueue.assert_not_called()
 
 
-@patch("app.services.providers.withings.data_247.enqueue_new_reading_events")
+@patch("app.services.providers.withings.reading_events.celery_app.send_task")
 @patch("app.services.providers.withings.data_247.record_new_groups")
 @patch("app.services.providers.withings.data_247.timeseries_service")
 @patch("app.services.providers.withings.data_247.paginate")

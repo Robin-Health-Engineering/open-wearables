@@ -38,12 +38,17 @@ from app.services.providers.withings.coverage import ACTIVITY_FIELD_MAP, MEASURE
 from app.services.providers.withings.data_requests import ACTIVITY, MEASURES, SLEEP_SUMMARY
 from app.services.providers.withings.measure_groups import (
     AMBIGUOUS_ATTRIB,
-    ParsedGroup,
+    lock_sessions,
     parsed_group_of,
     record_new_groups,
+    session_lock_key,
     withheld_grpids,
 )
-from app.services.providers.withings.reading_events import enqueue_new_reading_events
+from app.services.providers.withings.reading_events import (
+    ReadingEventPlan,
+    decide_reading_events,
+    send_reading_events,
+)
 from app.services.providers.withings.sdk_devices import backfill_models_from_groups
 from app.services.providers.withings.timezone import local_day_start, zone_offset_at
 from app.services.timeseries_service import timeseries_service
@@ -266,11 +271,27 @@ class Withings247Data(Base247DataTemplate):
         if not rows:
             return WriteCounts(0, 0)
         groups = [group for _, group in rows]
-        parsed: list[ParsedGroup] = []
-        new_groups: list[ParsedGroup] = []
         withheld: set[str] = set()
+        plan: ReadingEventPlan | None = None
         if user_connection_id is not None:
             parsed = [g for g in (parsed_group_of(x) for x in groups) if g is not None]
+            # One weigh-in, one decision: from here to the commit this ingest holds the lock of every
+            # session in the batch, so a concurrent ingest of the same weigh-in (or the member's
+            # confirm / discard of it) waits, then sees what this one committed. Re-read sessions are
+            # locked too: their samples are written or withheld by the status read below.
+            lock_sessions(
+                db,
+                (
+                    session_lock_key(
+                        user_connection_id,
+                        grpid=g.grpid,
+                        hash_device_id=g.hash_device_id,
+                        device_id=g.device_id,
+                        measured_at=g.measured_at,
+                    )
+                    for g in parsed
+                ),
+            )
             # Spec 2026-10-01 D1: an ambiguous weigh-in waits for the member's answer, but only on an
             # account WE provisioned (the app asks about the scale we sold). The member's own Withings
             # account registers it as before. Asked only when the batch holds an attrib 1 group.
@@ -292,13 +313,14 @@ class Withings247Data(Base247DataTemplate):
             withheld = withheld_grpids(db, user_connection_id=user_connection_id, grpids=[g.grpid for g in parsed])
             # Same transaction too: Getdevice names some devices null, their groups do not.
             backfill_models_from_groups(db, connection_id=user_connection_id, groups=parsed)
+            # Still under the locks, before the commit: which sessions this ingest announces. Never raises.
+            plan = decide_reading_events(db, user_connection_id=user_connection_id, groups=new_groups)
         written = [g for g in groups if g.grpid is None or str(g.grpid) not in withheld]
         samples = self._normalize_parsed(written, user_id, user_connection_id, default_timezone)
         counts = timeseries_service.bulk_create_samples(db, samples) if samples else WriteCounts(0, 0)
         db.commit()
-        if new_groups and user_connection_id is not None:
-            # After commit: Robin reads the reading back as soon as it gets the event. Never raises.
-            enqueue_new_reading_events(db, user_connection_id=user_connection_id, groups=new_groups, oauth=self.oauth)
+        # After the commit: Robin reads the reading back as soon as it gets the event. Never raises.
+        send_reading_events(db, plan, oauth=self.oauth)
         return counts
 
     # ---------------------- Daily activity (getactivity) ----------------------
