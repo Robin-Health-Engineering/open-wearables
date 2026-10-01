@@ -749,3 +749,18 @@ def test_a_late_sibling_of_a_pending_session_is_not_announced_again(
         n = announce(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
     assert n == 0
     send.assert_not_called()
+
+
+def test_an_earlier_hash_only_sibling_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """A sibling with a hash but no deviceid was never announced (``_eligible`` needs one): it silences nothing."""
+    connection = _provisioned(db, make_provisioned_connection)
+    hash_only = _group("8530283247", device_id=None, hash_device_id=_HASH, metric_keys=_BODY_KEYS)
+    _record(db, connection, hash_only, (SeriesType.weight, SeriesType.body_fat_percentage))
+    pulse = _pulse()
+    _record(db, connection, pulse, (SeriesType.heart_rate,))  # this batch's own row, as record_new_groups leaves it
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
+    assert n == 1
+    assert _sent(send)[0]["grpid"] == "8530283250"

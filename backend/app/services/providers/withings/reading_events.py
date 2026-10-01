@@ -175,9 +175,10 @@ def _announced_earlier(
     first ingest that recorded an announceable group found none earlier and announced the session.
     Without the lock two ingests could each see the other's group here and neither send.
 
-    Announceable as ``_eligible`` sees it from what is stored: a device-captured group with at
-    least one C2 sample. Recency needs no check, the sibling has the session's own time. A sibling
-    that only held, say, blood pressure was never announced, so it does not silence this one.
+    Announceable as ``_eligible`` sees it from what is stored: a device-captured group (a
+    ``deviceid``; a hash alone does not do) with at least one C2 sample. Recency needs no check,
+    the sibling has the session's own time. A sibling that only held, say, blood pressure was
+    never announced, so it does not silence this one.
 
     A pending or discarded sibling has no samples by design, so its status stands in for them: the
     weigh-in was announced (pending) or already answered (discarded). Known edge, accepted: a
@@ -207,7 +208,8 @@ def _announced_earlier(
                 DataPointSeries.series_type_definition_id.in_(_C2_TYPE_IDS),
             ),
         )
-        .filter(*same_session)
+        # Device-captured, as ``_eligible`` requires: a hash-only sibling was never announced.
+        .filter(*same_session, group.device_id.is_not(None))
         .first()
     )
     return row is not None
