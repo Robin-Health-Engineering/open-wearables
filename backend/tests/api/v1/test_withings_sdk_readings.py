@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -14,7 +14,12 @@ _ONE_URL = "/api/v1/providers/withings/sdk/readings/55"
 
 
 def _add_group(
-    db: Session, user: User, connection: UserConnection, grpid: str = "55", device_id: str = "dev-1"
+    db: Session,
+    user: User,
+    connection: UserConnection,
+    grpid: str = "55",
+    device_id: str = "dev-1",
+    at: datetime = _T0,
 ) -> None:
     db.add(
         WithingsMeasureGroupRecord(
@@ -25,7 +30,7 @@ def _add_group(
             device_id=device_id,
             model="Body Pro 2",
             attrib=0,
-            measured_at=_T0,
+            measured_at=at,
         )
     )
     db.commit()
@@ -62,7 +67,7 @@ def test_list_route_pages_with_cursor(
 ) -> None:
     user, connection = make_provisioned_connection()
     _add_group(db, user, connection, grpid="55")
-    _add_group(db, user, connection, grpid="56")
+    _add_group(db, user, connection, grpid="56", at=_T0 + timedelta(minutes=1))
 
     first = client.get(_LIST_URL, params={"user_id": str(user.id), "limit": 1}, headers=api_key_header).json()
     second = client.get(
@@ -72,6 +77,27 @@ def test_list_route_pages_with_cursor(
     assert [i["grpid"] for i in first["items"]] == ["56"]
     assert [i["grpid"] for i in second["items"]] == ["55"]
     assert second["next_cursor"] is None
+
+
+def test_a_weigh_in_in_two_groups_is_one_item_and_either_grpid_opens_it(
+    client: TestClient,
+    db: Session,
+    api_key_header: dict[str, str],
+    make_provisioned_connection: ProvisionedConnectionMaker,
+) -> None:
+    user, connection = make_provisioned_connection()
+    _add_group(db, user, connection, grpid="55")
+    _add_group(db, user, connection, grpid="56")  # same device, same time: the same weigh-in
+    params = {"user_id": str(user.id)}
+
+    listed = client.get(_LIST_URL, params=params, headers=api_key_header).json()
+    by_first = client.get("/api/v1/providers/withings/sdk/readings/55", params=params, headers=api_key_header)
+    by_sibling = client.get("/api/v1/providers/withings/sdk/readings/56", params=params, headers=api_key_header)
+
+    assert [i["grpid"] for i in listed["items"]] == ["55"]
+    assert by_first.status_code == by_sibling.status_code == 200
+    assert by_sibling.json() == by_first.json()
+    assert by_sibling.json()["grpid"] == "55"
 
 
 def test_list_route_for_member_without_provisioned_account_is_empty(

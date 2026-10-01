@@ -11,12 +11,23 @@ Sent only for groups that are
 * device-captured (a ``deviceid``, attrib not 2/4 = manual entry; see ``_eligible`` for why
   every other attrib, the ambiguous 1 included, is accepted);
 * carrying at least one C2 metric (a blood-pressure-only group has nothing to announce);
-* RECENT (``robin_reading_event_max_age_hours``), because backfills re-read history.
+* RECENT (``robin_reading_event_max_age_hours``), because backfills re-read history;
+* ONE PER SESSION (``measure_groups.session_device``): a cellular Body Pro 2 weigh-in arrives as
+  a body-composition group plus a heart-pulse-only group with the same date and device. Only the
+  session's representative (the weight group, else the lowest grpid) is announced, with ``types``
+  the union of the session's C2 keys, and nothing is announced for a session a sibling of which
+  was already recorded by an earlier ingest, since that ingest announced it.
+
+  Known edge: if the pulse group arrives ALONE in an earlier ingest and the weight group in a
+  later one, the pulse group is announced (under its own grpid) and the weight group is not. The
+  readings API still shows the whole weigh-in under either grpid, so the push opens the right
+  reading; only its ``types`` and grpid differ from the usual.
 
 Enqueue is by name (``DELIVER_TASK``), so there is no import dependency on the Celery task; the
 task calls ``post_event`` here, which signs and POSTs.
 """
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -28,14 +39,24 @@ from uuid import UUID
 
 import httpx
 from celery import current_app as celery_app
+from sqlalchemy import and_, or_
 
 from app.config import settings
 from app.database import DbSession
+from app.models import DataPointSeries, DataSource, WithingsMeasureGroupRecord
 from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.repositories.user_connection_repository import UserConnectionRepository
+from app.schemas.enums import ProviderName, get_series_type_id
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
-from app.services.providers.withings.measure_groups import ParsedGroup
+from app.services.providers.withings.measure_groups import (
+    C2_KEYS,
+    WEIGHT_KEY,
+    ParsedGroup,
+    representative_grpid,
+    session_device,
+    session_device_column,
+)
 from app.services.providers.withings.sdk_devices import sync_devices_from_withings
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
@@ -105,6 +126,62 @@ def _eligible(group: ParsedGroup, cutoff: datetime) -> bool:
     )
 
 
+_C2_TYPE_IDS = [get_series_type_id(series) for series in C2_KEYS]
+
+
+def _sessions(groups: list[ParsedGroup]) -> list[ParsedGroup]:
+    """One group per session, in batch order: the representative, carrying the union of the C2 keys."""
+    by_session: dict[tuple[str | None, datetime], list[ParsedGroup]] = {}
+    for group in groups:
+        by_session.setdefault((session_device(group.hash_device_id, group.device_id), group.measured_at), []).append(
+            group
+        )
+    out = []
+    for members in by_session.values():
+        rep_grpid = representative_grpid({g.grpid: WEIGHT_KEY in g.metric_keys for g in members})
+        rep = next(g for g in members if g.grpid == rep_grpid)
+        keys = dict.fromkeys(rep.metric_keys)
+        for group in members:
+            keys.update(dict.fromkeys(group.metric_keys))
+        out.append(dataclasses.replace(rep, metric_keys=tuple(keys)))
+    return out
+
+
+def _announced_earlier(
+    db: DbSession, *, user_id: UUID, user_connection_id: UUID, session: ParsedGroup, batch_grpids: set[str]
+) -> bool:
+    """Whether an EARLIER ingest recorded a sibling of this session that was announceable.
+
+    Announceable as ``_eligible`` sees it from what is stored: a device-captured group with at
+    least one C2 sample. Recency needs no check, the sibling has the session's own time. A sibling
+    that only held, say, blood pressure was never announced, so it does not silence this one.
+    """
+    device = session_device(session.hash_device_id, session.device_id)
+    group = WithingsMeasureGroupRecord
+    row = (
+        db.query(group.id)
+        .join(DataSource, and_(DataSource.user_id == user_id, DataSource.provider == ProviderName.WITHINGS))
+        .join(
+            DataPointSeries,
+            and_(
+                DataPointSeries.data_source_id == DataSource.id,
+                DataPointSeries.external_id == group.grpid,
+                DataPointSeries.recorded_at == group.measured_at,
+                DataPointSeries.series_type_definition_id.in_(_C2_TYPE_IDS),
+            ),
+        )
+        .filter(
+            group.user_connection_id == user_connection_id,
+            group.measured_at == session.measured_at,
+            session_device_column() == device,
+            group.grpid.not_in(batch_grpids),
+            or_(group.attrib.is_(None), group.attrib.not_in(_MANUAL_ATTRIBS)),
+        )
+        .first()
+    )
+    return row is not None
+
+
 def _devices(db: DbSession, user_connection_id: UUID, device_ids: set[str]) -> dict[str, tuple[str | None, bool]]:
     """device_id -> (stored hash, whether Getdevice has ever listed it). Absent = no row yet."""
     rows = db.query(WithingsDevice.device_id, WithingsDevice.hash_device_id, WithingsDevice.last_getdevice_at).filter(
@@ -165,7 +242,10 @@ def enqueue_new_reading_events(
     now: datetime | None = None,
     oauth: BaseOAuthTemplate | None = None,
 ) -> int:
-    """Enqueue one delivery per eligible group. Never raises: the samples are already committed.
+    """Enqueue one delivery per eligible session (see the module doc). Never raises: the samples are already committed.
+
+    ``groups`` is exactly what this ingest inserted (``record_new_groups``): a sibling recorded
+    under any other grpid came from an earlier ingest.
 
     The event's ``hash_deviceid`` is the group's own when it carries one, else the stored device
     row's. ``oauth`` enables the Getdevice refresh for a hashless group whose device has no stored
@@ -185,14 +265,25 @@ def enqueue_new_reading_events(
         if connection is None:
             return 0
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=settings.robin_reading_event_max_age_hours)
-        eligible = [g for g in groups if _eligible(g, cutoff)]
-        if not eligible:
-            return 0
         # Read everything off the ORM objects now: a failed refresh rolls the session back.
         external_user_id = account.external_id
         # JSON null rather than the string "None" when Withings never reported a userid.
         withings_user_id = str(connection.provider_user_id) if connection.provider_user_id is not None else None
         user_id = connection.user_id
+        batch_grpids = {g.grpid for g in groups}
+        eligible = [
+            session
+            for session in _sessions([g for g in groups if _eligible(g, cutoff)])
+            if not _announced_earlier(
+                db,
+                user_id=user_id,
+                user_connection_id=user_connection_id,
+                session=session,
+                batch_grpids=batch_grpids,
+            )
+        ]
+        if not eligible:
+            return 0
         # A group carrying its own hash_deviceid needs no lookup: its deviceid may not even be one
         # Getdevice lists (the cellular Body Pro 2 sends an integer there), so the hash is the only
         # reliable join. Only hashless groups fall back to the stored device row.

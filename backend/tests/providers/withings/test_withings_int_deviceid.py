@@ -291,6 +291,62 @@ def test_readings_are_listed_under_the_getdevice_id_and_the_groups_own_id(
     assert reading.is_first is True
 
 
+# --------------------------------------------------------------------------- one weigh-in, two groups
+# Staging 2026-10-01: each Body Pro 2 weigh-in came back as TWO groups with the same date and
+# device, body composition in 8530283247 and the heart pulse alone in 8530283250 (and again
+# 8530358979 / 8530358986). The member got two pushes and saw two readings.
+
+
+def _pulse_group(*, date: int, grpid: int = 8530283250) -> dict[str, Any]:
+    return _body_pro_2_group(date=date, grpid=grpid, measures=[{"value": 64, "type": 11, "unit": 0}])
+
+
+def test_a_weigh_in_saved_as_two_groups_is_one_event_and_one_reading(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_events(monkeypatch)
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id)
+    first, second = _recent(), _recent() + 60
+    rows = [
+        _body_pro_2_group(date=first),
+        _pulse_group(date=first),
+        _body_pro_2_group(date=second, grpid=8530358979),
+        _pulse_group(date=second, grpid=8530358986),
+    ]
+    with patch(_SEND) as send, patch(_SYNC):
+        _save(db, user.id, connection, rows)
+
+    payloads = [c.kwargs["args"][0] for c in send.call_args_list]
+    assert [p["grpid"] for p in payloads] == ["8530283247", "8530358979"]
+    assert all("heart_rate" in p["types"] and "weight" in p["types"] for p in payloads)
+
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["8530358979", "8530283247"]
+    assert page.items[1].metrics["heart_rate"] == 64.0
+    assert page.items[1].metrics["weight"] == pytest.approx(72.45)
+    by_sibling = get_reading(db, user_id=user.id, grpid="8530283250")
+    assert by_sibling == get_reading(db, user_id=user.id, grpid="8530283247")
+    assert by_sibling is not None
+    assert by_sibling.grpid == "8530283247"
+    assert by_sibling.is_first is True
+
+
+def test_a_pulse_group_arriving_in_a_later_ingest_is_not_pushed_again(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_events(monkeypatch)
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id)
+    measured = _recent()
+    with patch(_SEND) as send, patch(_SYNC):
+        _save(db, user.id, connection, [_body_pro_2_group(date=measured)])
+        _save(db, user.id, connection, [_body_pro_2_group(date=measured), _pulse_group(date=measured)])
+    assert [c.kwargs["args"][0]["grpid"] for c in send.call_args_list] == ["8530283247"]
+    (reading,) = list_device_readings(db, user_id=user.id, device_id=_HASH).items
+    assert reading.metrics["heart_rate"] == 64.0
+
+
 # --------------------------------------------------------------------------- device model backfill
 
 

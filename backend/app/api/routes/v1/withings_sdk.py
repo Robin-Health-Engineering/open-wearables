@@ -1093,7 +1093,7 @@ def list_withings_device_readings(
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     cursor: str | None = None,
 ) -> DeviceReadingsResponse:
-    """Newest first, one item per measurement group, only from accounts we provisioned.
+    """Newest first, one item per weigh-in (its measurement groups merged), only from accounts we provisioned.
 
     An unknown device or a member with no provisioned account is an empty list, not a 404: the
     device hub renders the empty state either way.
@@ -1116,7 +1116,10 @@ def get_withings_device_reading(
     db: DbSession,
     _caller: ApiKeyDep,
 ) -> DeviceReadingResponse:
-    """404 unless the group is on one of THIS member's provisioned connections."""
+    """404 unless the group is on one of THIS member's provisioned connections.
+
+    A sibling group of a weigh-in returns the whole weigh-in, under its representative grpid.
+    """
     reading = get_reading(db, user_id=user_id, grpid=grpid)
     if reading is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such reading for this member")

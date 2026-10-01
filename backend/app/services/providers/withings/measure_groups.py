@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+from sqlalchemy import ColumnElement, func
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -30,6 +31,38 @@ C2_KEYS: dict[SeriesType, str] = {
     SeriesType.withings_visceral_fat: "visceral_fat",
     SeriesType.withings_basal_metabolic_rate: "basal_metabolic_rate",
 }
+
+
+# --- Sessions --------------------------------------------------------------------------------------
+# One weigh-in can arrive as SEVERAL groups: a cellular Body Pro 2 sends the body composition in one
+# grpid and the heart pulse alone in the next, both with the same ``date`` and device. A SESSION is
+# the groups on one connection, from one device, at one ``measured_at``; it is one reading and one
+# event. "One device" compares the hash when the group carries one, else the deviceid, so the
+# integer deviceid the Body Pro 2 shares with nothing Getdevice lists never decides on its own.
+WEIGHT_KEY = C2_KEYS[SeriesType.weight]
+
+
+def session_device(hash_device_id: str | None, device_id: str | None) -> str | None:
+    """The device half of a session key (the connection and ``measured_at`` are the rest)."""
+    return hash_device_id or device_id
+
+
+def session_device_column() -> ColumnElement[str | None]:
+    """``session_device`` in SQL, over ``withings_measure_group``."""
+    # No NULLIF for an empty hash: ``parsed_group_of`` already stores it as NULL, and a bound
+    # parameter here would make the expression differ between a SELECT and its GROUP BY.
+    return func.coalesce(WithingsMeasureGroupRecord.hash_device_id, WithingsMeasureGroupRecord.device_id)
+
+
+def grpid_order(grpid: str) -> tuple[int, int, str]:
+    """Numeric order for Withings' integer grpids ("999" < "9100"); anything else after, as text."""
+    return (0, int(grpid), "") if grpid.isdigit() else (1, 0, grpid)
+
+
+def representative_grpid(grpids_with_weight: dict[str, bool]) -> str:
+    """The grpid that stands for a session: the lowest one holding a weight, else the lowest one."""
+    weighed = [g for g, has_weight in grpids_with_weight.items() if has_weight]
+    return min(weighed or grpids_with_weight, key=grpid_order)
 
 
 @dataclass(frozen=True)

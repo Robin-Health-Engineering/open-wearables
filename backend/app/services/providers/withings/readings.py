@@ -1,4 +1,10 @@
-"""Readings from the device we sold a member: one reading per Withings measurement group.
+"""Readings from the device we sold a member: one reading per weigh-in (session).
+
+A session is the measurement groups on one connection, from one device, at one ``measured_at``
+(``measure_groups.session_device``): a cellular Body Pro 2 weigh-in arrives as a body-composition
+group plus a heart-pulse-only group, and the member made ONE measurement. A reading is named by
+its session's representative grpid (the group holding the weight, else the lowest grpid) and
+carries the union of its groups' metrics.
 
 Only groups on a connection WE provisioned are visible here. A member's own Withings account may
 hold the same kind of device, but it is not the one this feature is about, and its readings stay
@@ -14,19 +20,26 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 
 from app.config import settings
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, WithingsMeasureGroupRecord
 from app.schemas.enums import ProviderName, get_series_type_id
 from app.services.providers.withings.connections import device_connections
-from app.services.providers.withings.measure_groups import C2_KEYS
+from app.services.providers.withings.measure_groups import (
+    C2_KEYS,
+    WEIGHT_KEY,
+    grpid_order,
+    representative_grpid,
+    session_device,
+    session_device_column,
+)
 
 _MAX_LIMIT = 100
 _TYPE_IDS = {get_series_type_id(series): key for series, key in C2_KEYS.items()}
 
-# A cursor is ``<body>.<signature>``: the body is the last item's (measured_at, grpid), the
+# A cursor is ``<body>.<signature>``: the body is the last session's (measured_at, lowest grpid), the
 # signature an HMAC over the body AND the member and device it was issued for. It only ever
 # narrows a query that is already scoped to the requesting member's provisioned connections, so a
 # forged cursor could not reach another member's rows anyway; the signature makes a tampered or
@@ -69,8 +82,8 @@ def _signature(user_id: UUID, device_id: str, body: str) -> str:
     return _b64encode(hmac.new(_CURSOR_KEY, message, hashlib.sha256).digest()[:_SIGNATURE_BYTES])
 
 
-def _encode_cursor(user_id: UUID, device_id: str, record: WithingsMeasureGroupRecord) -> str:
-    body = _b64encode(json.dumps([record.measured_at.isoformat(), record.grpid], separators=(",", ":")).encode())
+def _encode_cursor(user_id: UUID, device_id: str, measured_at: datetime, grpid: str) -> str:
+    body = _b64encode(json.dumps([measured_at.isoformat(), grpid], separators=(",", ":")).encode())
     return f"{body}.{_signature(user_id, device_id, body)}"
 
 
@@ -129,51 +142,102 @@ def _metrics(db: DbSession, user_id: UUID, records: list[WithingsMeasureGroupRec
     return out
 
 
+def merge_session(records: list[WithingsMeasureGroupRecord], metrics: dict[str, dict[str, float]]) -> Reading:
+    """One session's groups as one reading, named by its representative grpid.
+
+    The metrics are the union of the groups'; on a key two groups both hold (storage keeps one
+    sample per series type and time, so in practice none), the representative's value wins.
+    """
+    rep_grpid = representative_grpid({r.grpid: WEIGHT_KEY in metrics.get(r.grpid, {}) for r in records})
+    rep = next(r for r in records if r.grpid == rep_grpid)
+    merged = dict(metrics.get(rep.grpid, {}))
+    for record in sorted(records, key=lambda r: grpid_order(r.grpid)):
+        for key, value in metrics.get(record.grpid, {}).items():
+            merged.setdefault(key, value)
+    return Reading(grpid=rep.grpid, measured_at=rep.measured_at, device_id=rep.device_id, metrics=merged)
+
+
+def _session_groups(db: DbSession, record: WithingsMeasureGroupRecord) -> list[WithingsMeasureGroupRecord]:
+    """``record`` and its siblings: same connection, same device, same ``measured_at``."""
+    device = session_device(record.hash_device_id, record.device_id)
+    if device is None:  # nothing names the device, so nothing can be a sibling
+        return [record]
+    return (
+        db.query(WithingsMeasureGroupRecord)
+        .filter(
+            WithingsMeasureGroupRecord.user_connection_id == record.user_connection_id,
+            WithingsMeasureGroupRecord.measured_at == record.measured_at,
+            session_device_column() == device,
+        )
+        .all()
+    )
+
+
 def list_device_readings(
     db: DbSession, *, user_id: UUID, device_id: str, limit: int = 20, cursor: str | None = None
 ) -> ReadingPage:
-    """One device's readings on the member's provisioned connections, newest first.
+    """One device's readings on the member's provisioned connections, newest first, one per session.
 
     ``device_id`` matches a group's own ``deviceid`` or its ``hash_deviceid``.
 
-    ``limit`` is clamped to 1..100. Raises ``InvalidReadingCursor`` for a cursor this function did
-    not issue for this ``user_id`` and ``device_id``.
+    ``limit`` is clamped to 1..100 and counts sessions, not groups. Raises ``InvalidReadingCursor``
+    for a cursor this function did not issue for this ``user_id`` and ``device_id``.
     """
     position = _decode_cursor(user_id, device_id, cursor) if cursor is not None else None
     connection_ids = _provisioned_ids(db, user_id)
     if not connection_ids:
         return ReadingPage(items=[], next_cursor=None)
     limit = max(1, min(limit, _MAX_LIMIT))
-    query = db.query(WithingsMeasureGroupRecord).filter(
-        WithingsMeasureGroupRecord.user_connection_id.in_(connection_ids),
-        # Either id names the device: the device hub asks by withings_device.device_id, which for
-        # the cellular Body Pro 2 is the hash, while that scale's groups carry an unrelated integer
-        # deviceid beside it.
-        or_(WithingsMeasureGroupRecord.device_id == device_id, WithingsMeasureGroupRecord.hash_device_id == device_id),
+    group = WithingsMeasureGroupRecord
+    device = session_device_column()
+    # The session's lowest grpid (as text) breaks a tie between sessions at the same time.
+    tie = func.min(group.grpid)
+    query = (
+        db.query(group.user_connection_id, device, group.measured_at, tie)
+        .filter(
+            group.user_connection_id.in_(connection_ids),
+            # Either id names the device: the device hub asks by withings_device.device_id, which for
+            # the cellular Body Pro 2 is the hash, while that scale's groups carry an unrelated
+            # integer deviceid beside it.
+            or_(group.device_id == device_id, group.hash_device_id == device_id),
+        )
+        .group_by(group.user_connection_id, device, group.measured_at)
     )
     if position is not None:
         at, grpid = position
-        query = query.filter(
-            or_(
-                WithingsMeasureGroupRecord.measured_at < at,
-                and_(WithingsMeasureGroupRecord.measured_at == at, WithingsMeasureGroupRecord.grpid < grpid),
-            )
-        )
+        query = query.having(or_(group.measured_at < at, and_(group.measured_at == at, tie < grpid)))
+    sessions = query.order_by(group.measured_at.desc(), tie.desc()).limit(limit + 1).all()
+    page, more = sessions[:limit], len(sessions) > limit
+    if not page:
+        return ReadingPage(items=[], next_cursor=None)
+
     records = (
-        query.order_by(WithingsMeasureGroupRecord.measured_at.desc(), WithingsMeasureGroupRecord.grpid.desc())
-        .limit(limit + 1)
+        db.query(group)
+        .filter(
+            group.user_connection_id.in_({s[0] for s in page}),
+            group.measured_at.in_({s[2] for s in page}),
+            device.in_({s[1] for s in page}),
+        )
         .all()
     )
-    page, more = records[:limit], len(records) > limit
-    metrics = _metrics(db, user_id, page)
+    by_session: dict[tuple[UUID, str | None, datetime], list[WithingsMeasureGroupRecord]] = {}
+    for record in records:
+        key = (record.user_connection_id, session_device(record.hash_device_id, record.device_id), record.measured_at)
+        by_session.setdefault(key, []).append(record)
+    metrics = _metrics(db, user_id, records)
+    items = [merge_session(by_session[(conn, dev, at)], metrics) for conn, dev, at, _ in page]
+    last = page[-1]
     return ReadingPage(
-        items=[Reading(r.grpid, r.measured_at, r.device_id, metrics[r.grpid]) for r in page],
-        next_cursor=_encode_cursor(user_id, device_id, page[-1]) if more else None,
+        items=items,
+        next_cursor=_encode_cursor(user_id, device_id, last[2], last[3]) if more else None,
     )
 
 
 def get_reading(db: DbSession, *, user_id: UUID, grpid: str) -> Reading | None:
     """One reading with ``is_first`` set, or None unless the group is on a provisioned connection of this member.
+
+    Any grpid of a session returns that whole session, under its representative grpid: an event
+    or a link naming a sibling group still resolves to the reading the member saw.
 
     ``is_first`` means no older group exists for the same device on the same connection: a
     Withings deviceid is not unique across accounts.
@@ -181,30 +245,33 @@ def get_reading(db: DbSession, *, user_id: UUID, grpid: str) -> Reading | None:
     connection_ids = _provisioned_ids(db, user_id)
     if not connection_ids:
         return None
+    group = WithingsMeasureGroupRecord
     record = (
-        db.query(WithingsMeasureGroupRecord)
-        .filter(
-            WithingsMeasureGroupRecord.user_connection_id.in_(connection_ids),
-            WithingsMeasureGroupRecord.grpid == grpid,
-        )
-        .order_by(WithingsMeasureGroupRecord.measured_at.asc())
+        db.query(group)
+        .filter(group.user_connection_id.in_(connection_ids), group.grpid == grpid)
+        .order_by(group.measured_at.asc())
         .first()
     )
     if record is None:
         return None
+    siblings = _session_groups(db, record)
+    device = session_device(record.hash_device_id, record.device_id)
+    if device is None:
+        same_device = group.device_id.is_(None)
+    else:
+        same_device = session_device_column() == device
+        if record.hash_device_id and record.device_id:
+            # A group recorded before hash_device_id existed has only its deviceid.
+            same_device = or_(same_device, and_(group.hash_device_id.is_(None), group.device_id == record.device_id))
     older = (
-        db.query(WithingsMeasureGroupRecord.id)
+        db.query(group.id)
         .filter(
-            WithingsMeasureGroupRecord.user_connection_id == record.user_connection_id,
-            WithingsMeasureGroupRecord.device_id == record.device_id,
-            WithingsMeasureGroupRecord.measured_at < record.measured_at,
+            group.user_connection_id == record.user_connection_id,
+            same_device,
+            group.measured_at < record.measured_at,
         )
         .first()
     )
-    return Reading(
-        grpid=record.grpid,
-        measured_at=record.measured_at,
-        device_id=record.device_id,
-        metrics=_metrics(db, user_id, [record])[record.grpid],
-        is_first=older is None,
-    )
+    reading = merge_session(siblings, _metrics(db, user_id, siblings))
+    reading.is_first = older is None
+    return reading
