@@ -412,6 +412,10 @@ def test_the_same_weigh_in_on_two_connections_is_not_merged(
     _reading(db, user, historic, "8530283250", _T0, _DEVICE, _HASH)
     page = list_device_readings(db, user_id=user.id, device_id=_HASH)
     assert [r.grpid for r in page.items] == ["8530283250", "8530283247"]
+    detail = get_reading(db, user_id=user.id, grpid="8530283250")
+    assert detail is not None
+    assert detail.grpid == "8530283250"
+    assert detail.metrics == {}
 
 
 def test_limit_and_cursor_count_weigh_ins_not_groups(
