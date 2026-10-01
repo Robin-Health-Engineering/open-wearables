@@ -18,7 +18,7 @@ from app.database import DbSession
 from app.models import EventRecord
 from app.repositories import EventRecordRepository, UserConnectionRepository
 from app.repositories.data_point_series_repository import WriteCounts
-from app.schemas.enums import SeriesType, daily_total_flag
+from app.schemas.enums import ProviderName, SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -33,9 +33,16 @@ from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import paginate, scale_measure
+from app.services.providers.withings.connections import is_device_connection
 from app.services.providers.withings.coverage import ACTIVITY_FIELD_MAP, MEASURE_TYPE_MAP
 from app.services.providers.withings.data_requests import ACTIVITY, MEASURES, SLEEP_SUMMARY
-from app.services.providers.withings.measure_groups import ParsedGroup, parsed_group_of, record_new_groups
+from app.services.providers.withings.measure_groups import (
+    AMBIGUOUS_ATTRIB,
+    ParsedGroup,
+    parsed_group_of,
+    record_new_groups,
+    withheld_grpids,
+)
 from app.services.providers.withings.reading_events import enqueue_new_reading_events
 from app.services.providers.withings.sdk_devices import backfill_models_from_groups
 from app.services.providers.withings.timezone import local_day_start, zone_offset_at
@@ -54,6 +61,79 @@ _REQUESTED_MEASTYPES = ",".join(str(code) for code in MEASURE_TYPE_MAP)
 _MEASURE_UNIT_FACTOR: dict[int, Decimal] = {
     4: Decimal(100),
 }
+
+
+def measure_group_samples(
+    group: WithingsMeasureGroup,
+    *,
+    user_id: UUID,
+    user_connection_id: UUID | None,
+    provider_name: str,
+    default_timezone: str | None = None,
+) -> list[TimeSeriesSampleCreate]:
+    """One group's samples, exactly as ingest writes them.
+
+    The single normalisation of a measure group: ingest calls it for every registered group, and
+    confirming a pending weigh-in calls it on the held payload, so a confirmed reading's samples
+    are the ones ingest would have written (spec 2026-10-01 §4.1).
+    """
+    ts = datetime.fromtimestamp(group.date, tz=timezone.utc)
+    zone_offset = zone_offset_at(
+        group.timezone or default_timezone,
+        ts,
+        logger,
+        action="measure_timezone_invalid",
+        user_id=str(user_id),
+    )
+    external_id = str(group.grpid) if group.grpid is not None else None
+    samples: list[TimeSeriesSampleCreate] = []
+    for measure in group.measures:
+        series_type = MEASURE_TYPE_MAP.get(measure.type)
+        if series_type is None:
+            continue
+        value = scale_measure(measure)
+        factor = _MEASURE_UNIT_FACTOR.get(measure.type)
+        if factor is not None:
+            value = value * factor
+        samples.append(
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                source=provider_name,
+                provider=provider_name,
+                user_connection_id=user_connection_id,
+                external_id=external_id,
+                recorded_at=ts,
+                zone_offset=zone_offset,
+                value=value,
+                series_type=series_type,
+            )
+        )
+    return samples
+
+
+def raw_group(row: dict[str, Any], default_timezone: str | None) -> dict[str, Any]:
+    """A group as received, to hold while it is pending (``withings_measure_group.raw``).
+
+    The response-level timezone is folded in when the group has none of its own, so confirming it
+    later normalises exactly as this ingest would have: getmeas may put the timezone only on the
+    response body.
+    """
+    if row.get("timezone") or not default_timezone:
+        return dict(row)
+    return {**row, "timezone": default_timezone}
+
+
+def raw_group_samples(
+    raw: dict[str, Any], *, user_id: UUID, user_connection_id: UUID | None
+) -> list[TimeSeriesSampleCreate]:
+    """The samples of a held group (``raw_group``'s output), as ingest would have written them."""
+    return measure_group_samples(
+        WithingsMeasureGroup.model_validate(raw),
+        user_id=user_id,
+        user_connection_id=user_connection_id,
+        provider_name=ProviderName.WITHINGS.value,
+    )
 
 
 class WithingsDataSyncError(HTTPException):
@@ -94,12 +174,13 @@ class Withings247Data(Base247DataTemplate):
         connection = self.connection_repo.get_active_connection(db, user_id, self.provider_name)
         return connection.id if connection is not None and isinstance(connection.id, UUID) else None
 
-    def _parse_measure_groups(self, groups: list[dict], user_id: UUID) -> list[WithingsMeasureGroup]:
-        parsed: list[WithingsMeasureGroup] = []
+    def _parse_measure_rows(self, groups: list[dict], user_id: UUID) -> list[tuple[dict, WithingsMeasureGroup]]:
+        """Each valid row beside its parsed group: a pending group is held as it was received."""
+        parsed: list[tuple[dict, WithingsMeasureGroup]] = []
         for group in groups:
             # Tolerate a malformed group without dropping the rest of the batch.
             try:
-                parsed.append(WithingsMeasureGroup.model_validate(group))
+                parsed.append((group, WithingsMeasureGroup.model_validate(group)))
             except ValidationError as e:
                 log_structured(
                     logger,
@@ -111,6 +192,9 @@ class Withings247Data(Base247DataTemplate):
                     error=str(e),
                 )
         return parsed
+
+    def _parse_measure_groups(self, groups: list[dict], user_id: UUID) -> list[WithingsMeasureGroup]:
+        return [group for _, group in self._parse_measure_rows(groups, user_id)]
 
     def normalize_measures(
         self,
@@ -144,39 +228,13 @@ class Withings247Data(Base247DataTemplate):
         user_connection_id: UUID | None,
         default_timezone: str | None = None,
     ) -> list[TimeSeriesSampleCreate]:
-        ts = datetime.fromtimestamp(group.date, tz=timezone.utc)
-        zone_offset = zone_offset_at(
-            group.timezone or default_timezone,
-            ts,
-            logger,
-            action="measure_timezone_invalid",
-            user_id=str(user_id),
+        return measure_group_samples(
+            group,
+            user_id=user_id,
+            user_connection_id=user_connection_id,
+            provider_name=self.provider_name,
+            default_timezone=default_timezone,
         )
-        external_id = str(group.grpid) if group.grpid is not None else None
-        samples: list[TimeSeriesSampleCreate] = []
-        for measure in group.measures:
-            series_type = MEASURE_TYPE_MAP.get(measure.type)
-            if series_type is None:
-                continue
-            value = scale_measure(measure)
-            factor = _MEASURE_UNIT_FACTOR.get(measure.type)
-            if factor is not None:
-                value = value * factor
-            samples.append(
-                TimeSeriesSampleCreate(
-                    id=uuid4(),
-                    user_id=user_id,
-                    source=self.provider_name,
-                    provider=self.provider_name,
-                    user_connection_id=user_connection_id,
-                    external_id=external_id,
-                    recorded_at=ts,
-                    zone_offset=zone_offset,
-                    value=value,
-                    series_type=series_type,
-                )
-            )
-        return samples
 
     def save_measures(
         self,
@@ -203,23 +261,40 @@ class Withings247Data(Base247DataTemplate):
             list_key=MEASURES.list_key,
             connection_id=user_connection_id,
         )
-        groups = self._parse_measure_groups(page.rows, user_id)
-        samples = self._normalize_parsed(groups, user_id, user_connection_id, page.envelope.get("timezone"))
-        if not samples:
+        default_timezone = page.envelope.get("timezone")
+        rows = self._parse_measure_rows(page.rows, user_id)
+        if not rows:
             return WriteCounts(0, 0)
-        counts = timeseries_service.bulk_create_samples(db, samples)
+        groups = [group for _, group in rows]
+        parsed: list[ParsedGroup] = []
         new_groups: list[ParsedGroup] = []
+        withheld: set[str] = set()
         if user_connection_id is not None:
             parsed = [g for g in (parsed_group_of(x) for x in groups) if g is not None]
+            # Spec 2026-10-01 D1: an ambiguous weigh-in waits for the member's answer, but only on an
+            # account WE provisioned (the app asks about the scale we sold). The member's own Withings
+            # account registers it as before. Asked only when the batch holds an attrib 1 group.
+            hold_ambiguous = any(g.attrib == AMBIGUOUS_ATTRIB for g in parsed) and is_device_connection(
+                db, user_connection_id
+            )
             # Same transaction as the samples: a group is "recorded" only if its samples are.
             new_groups = record_new_groups(
                 db,
                 user_id=user_id,
                 user_connection_id=user_connection_id,
                 groups=parsed,
+                raw_by_grpid={
+                    str(group.grpid): raw_group(row, default_timezone) for row, group in rows if group.grpid is not None
+                },
+                hold_ambiguous=hold_ambiguous,
             )
+            # Pending and discarded sessions keep their samples out, on this ingest and every re-read.
+            withheld = withheld_grpids(db, user_connection_id=user_connection_id, grpids=[g.grpid for g in parsed])
             # Same transaction too: Getdevice names some devices null, their groups do not.
             backfill_models_from_groups(db, connection_id=user_connection_id, groups=parsed)
+        written = [g for g in groups if g.grpid is None or str(g.grpid) not in withheld]
+        samples = self._normalize_parsed(written, user_id, user_connection_id, default_timezone)
+        counts = timeseries_service.bulk_create_samples(db, samples) if samples else WriteCounts(0, 0)
         db.commit()
         if new_groups and user_connection_id is not None:
             # After commit: Robin reads the reading back as soon as it gets the event. Never raises.
