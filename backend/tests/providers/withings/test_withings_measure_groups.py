@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import null
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -15,6 +16,7 @@ from app.services.providers.withings.measure_groups import (
     ParsedGroup,
     parsed_group_of,
     record_new_groups,
+    session_status,
 )
 from tests.factories import UserConnectionFactory, UserFactory
 
@@ -147,3 +149,58 @@ def test_a_group_without_c2_metrics_is_still_recorded(db: Session) -> None:
     assert [g.grpid for g in first] == ["8"]
     assert not first[0].has_c2_metrics
     assert record_new_groups(db, groups=[bp_only], **kwargs) == []
+
+
+# --- status and raw (spec 2026-10-01 D1) ----------------------------------------------------------
+
+
+def test_a_new_group_is_registered_and_holds_no_raw(db: Session) -> None:
+    connection = UserConnectionFactory(user=UserFactory(), provider="withings")
+    row = _row(connection)
+    db.add(row)
+    db.flush()
+    db.refresh(row)
+    assert row.status == "registered"
+    record = WithingsMeasureGroupRecord
+    assert db.query(record).filter(record.id == row.id, record.raw.is_(None)).count() == 1
+
+
+def test_an_unknown_status_is_refused(db: Session) -> None:
+    connection = UserConnectionFactory(user=UserFactory(), provider="withings")
+    row = _row(connection)
+    row.status = "maybe"
+    db.add(row)
+    with pytest.raises(IntegrityError):
+        db.flush()
+
+
+def test_raw_round_trips_and_clearing_it_stores_sql_null(db: Session) -> None:
+    connection = UserConnectionFactory(user=UserFactory(), provider="withings")
+    payload = {"grpid": 123, "attrib": 1, "measures": [{"value": 72450, "type": 1, "unit": -3}]}
+    row = _row(connection)
+    row.status = "pending"
+    row.raw = payload
+    db.add(row)
+    db.flush()
+    db.expire(row)
+    assert row.raw == payload
+    row.raw = None
+    db.flush()
+    record = WithingsMeasureGroupRecord
+    assert db.query(record).filter(record.id == row.id, record.raw.is_(None)).count() == 1
+    assert db.query(record).filter(record.id == row.id, record.raw == null()).count() == 1
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (["registered"], "registered"),
+        (["pending", "pending"], "pending"),
+        (["discarded", "discarded"], "discarded"),
+        (["discarded", "pending"], "pending"),
+        (["pending", "registered"], "registered"),
+        ([None], "registered"),  # a row not yet flushed carries the column default
+    ],
+)
+def test_session_status_is_the_most_alive_one(statuses: list[str | None], expected: str) -> None:
+    assert session_status(statuses) == expected

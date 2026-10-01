@@ -3,6 +3,7 @@
 See ``WithingsMeasureGroupRecord`` for why these live beside the samples rather than on them.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -12,6 +13,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
 from app.models import WithingsMeasureGroupRecord
+from app.models.withings_measure_group import DISCARDED, PENDING, REGISTERED, ReadingStatus
 from app.schemas.enums import SeriesType
 from app.schemas.providers.withings import WithingsMeasureGroup
 from app.services.providers.withings.coverage import MEASURE_TYPE_MAP
@@ -63,6 +65,28 @@ def representative_grpid(grpids_with_weight: dict[str, bool]) -> str:
     """The grpid that stands for a session: the lowest one holding a weight, else the lowest one."""
     weighed = [g for g, has_weight in grpids_with_weight.items() if has_weight]
     return min(weighed or grpids_with_weight, key=grpid_order)
+
+
+# Withings ``attrib`` 1: device-captured, but the device could not tell which of its users stepped
+# on it (spec 2026-10-01 §2). On an account we provisioned such a weigh-in is held pending.
+AMBIGUOUS_ATTRIB = 1
+
+
+def session_status(statuses: Iterable[str | None]) -> ReadingStatus:
+    """A session's status from its groups': the most alive one wins (registered > pending > discarded).
+
+    The groups of a session share one status by construction (``record_new_groups`` decides it per
+    session; confirm, discard and the retirement change all of them together), so the precedence
+    only settles a mix that should not exist, and settles it safely: a session with any registered
+    group still has samples for a discard to delete. ``None`` (a row never flushed) is the column
+    default, registered.
+    """
+    seen = {status or REGISTERED for status in statuses}
+    if REGISTERED in seen:
+        return REGISTERED
+    if PENDING in seen:
+        return PENDING
+    return DISCARDED
 
 
 @dataclass(frozen=True)
