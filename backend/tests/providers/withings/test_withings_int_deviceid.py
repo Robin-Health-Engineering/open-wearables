@@ -24,13 +24,13 @@ from app.config import settings
 from app.models import DataPointSeries, DataSource, UserConnection, WithingsMeasureGroupRecord
 from app.models.withings_device import WithingsDevice
 from app.schemas.providers.withings import WithingsActivity, WithingsMeasureGroup, WithingsWorkout
-from app.services.providers.withings import reading_events
 from app.services.providers.withings._client import PaginatedResult
 from app.services.providers.withings.data_247 import Withings247Data
 from app.services.providers.withings.measure_groups import ParsedGroup, parsed_group_of
 from app.services.providers.withings.readings import get_reading, list_device_readings
 from app.services.providers.withings.sdk_devices import sync_devices_from_withings
 from tests.providers.withings.conftest import ProvisionedConnectionMaker
+from tests.providers.withings.weigh_ins import announce
 
 _HASH = "41a451ad428083cbf215257be7decbc02a3169c5"
 _INT_DEVICEID = 15542329
@@ -195,10 +195,12 @@ def test_save_measures_ingests_body_pro_2_groups_and_emits_with_the_groups_hash(
         "grpid",
         "measured_at",
         "types",
+        "pending",
     }
     assert payload["device_id"] == "15542329"
     assert payload["hash_deviceid"] == _HASH
     assert payload["grpid"] == "8530283247"
+    assert payload["pending"] is False
 
 
 # --------------------------------------------------------------------------- reading events
@@ -222,9 +224,7 @@ def test_a_group_with_its_own_hash_needs_no_device_row_and_no_refresh(
     _enable_events(monkeypatch)
     _, connection = make_provisioned_connection()  # no withings_device row at all
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        n = reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=[_parsed("1")], oauth=MagicMock()
-        )
+        n = announce(db, user_connection_id=connection.id, groups=[_parsed("1")], oauth=MagicMock())
     assert n == 1
     sync.assert_not_called()
     assert send.call_args.kwargs["args"][0]["hash_deviceid"] == _HASH
@@ -247,9 +247,7 @@ def test_a_group_without_a_hash_still_falls_back_to_the_device_row(
     db.flush()
     groups = [_parsed("1"), _parsed("2", device_id="dev-legacy", hash_device_id=None)]
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=groups, oauth=MagicMock()
-        )
+        announce(db, user_connection_id=connection.id, groups=groups, oauth=MagicMock())
     sync.assert_not_called()  # the only hashless group's device already has a stored hash
     assert [c.kwargs["args"][0]["hash_deviceid"] for c in send.call_args_list] == [_HASH, "hash-legacy"]
 
@@ -261,9 +259,7 @@ def test_only_a_hashless_group_can_trigger_the_getdevice_refresh(
     _, connection = make_provisioned_connection()
     groups = [_parsed("1"), _parsed("2", device_id="dev-unknown", hash_device_id=None)]
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=groups, oauth=MagicMock()
-        )
+        announce(db, user_connection_id=connection.id, groups=groups, oauth=MagicMock())
     sync.assert_called_once()
     assert [c.kwargs["args"][0]["hash_deviceid"] for c in send.call_args_list] == [_HASH, None]
 
@@ -289,6 +285,62 @@ def test_readings_are_listed_under_the_getdevice_id_and_the_groups_own_id(
     reading = get_reading(db, user_id=user.id, grpid="8530283247")
     assert reading is not None
     assert reading.is_first is True
+
+
+# --------------------------------------------------------------------------- one weigh-in, two groups
+# Staging 2026-10-01: each Body Pro 2 weigh-in came back as TWO groups with the same date and
+# device, body composition in 8530283247 and the heart pulse alone in 8530283250 (and again
+# 8530358979 / 8530358986). The member got two pushes and saw two readings.
+
+
+def _pulse_group(*, date: int, grpid: int = 8530283250) -> dict[str, Any]:
+    return _body_pro_2_group(date=date, grpid=grpid, measures=[{"value": 64, "type": 11, "unit": 0}])
+
+
+def test_a_weigh_in_saved_as_two_groups_is_one_event_and_one_reading(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_events(monkeypatch)
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id)
+    first, second = _recent(), _recent() + 60
+    rows = [
+        _body_pro_2_group(date=first),
+        _pulse_group(date=first),
+        _body_pro_2_group(date=second, grpid=8530358979),
+        _pulse_group(date=second, grpid=8530358986),
+    ]
+    with patch(_SEND) as send, patch(_SYNC):
+        _save(db, user.id, connection, rows)
+
+    payloads = [c.kwargs["args"][0] for c in send.call_args_list]
+    assert [p["grpid"] for p in payloads] == ["8530283247", "8530358979"]
+    assert all("heart_rate" in p["types"] and "weight" in p["types"] for p in payloads)
+
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["8530358979", "8530283247"]
+    assert page.items[1].metrics["heart_rate"] == 64.0
+    assert page.items[1].metrics["weight"] == pytest.approx(72.45)
+    by_sibling = get_reading(db, user_id=user.id, grpid="8530283250")
+    assert by_sibling == get_reading(db, user_id=user.id, grpid="8530283247")
+    assert by_sibling is not None
+    assert by_sibling.grpid == "8530283247"
+    assert by_sibling.is_first is True
+
+
+def test_a_pulse_group_arriving_in_a_later_ingest_is_not_pushed_again(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_events(monkeypatch)
+    user, connection = make_provisioned_connection()
+    _getdevice_row(db, connection.id)
+    measured = _recent()
+    with patch(_SEND) as send, patch(_SYNC):
+        _save(db, user.id, connection, [_body_pro_2_group(date=measured)])
+        _save(db, user.id, connection, [_body_pro_2_group(date=measured), _pulse_group(date=measured)])
+    assert [c.kwargs["args"][0]["grpid"] for c in send.call_args_list] == ["8530283247"]
+    (reading,) = list_device_readings(db, user_id=user.id, device_id=_HASH).items
+    assert reading.metrics["heart_rate"] == 64.0
 
 
 # --------------------------------------------------------------------------- device model backfill

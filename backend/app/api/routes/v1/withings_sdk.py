@@ -22,7 +22,7 @@ claimed it was.
 
 from datetime import datetime, timezone
 from logging import getLogger
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -40,7 +40,9 @@ from app.schemas.providers.withings.order_detail import OrderDetail
 from app.services.api_key_service import ApiKeyDep
 from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.withings.attribution import DiscardResult, confirm_reading, discard_reading
 from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.measure_groups import ReadingStatus
 from app.services.providers.withings.order_detail import WithingsOrderDetailError, get_order_detail
 from app.services.providers.withings.readings import (
     InvalidReadingCursor,
@@ -1038,17 +1040,29 @@ def _utc_z(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+VisibleStatus = Literal["registered", "pending"]
+
+
+def _visible(value: ReadingStatus) -> VisibleStatus:
+    """A served reading is registered or pending (contract A1); the readings service never returns a discarded one."""
+    if value == "discarded":
+        raise ValueError("a discarded reading is never served")
+    return value
+
+
 class DeviceReadingItem(BaseModel):
     """One reading (Withings measurement group) from the device we sold the member.
 
     ``metrics`` uses the Robin metric keys (weight, fat_ratio, ...). A key the reading does not
-    carry is ABSENT, never null; the app shows only what is there.
+    carry is ABSENT, never null; the app shows only what is there. ``status`` is ``pending`` for a weigh-in
+    the scale could not attribute; its metrics are the held values the member is asked to confirm.
     """
 
     grpid: str
     measured_at: datetime
     device_id: str | None
     metrics: dict[str, float]
+    status: VisibleStatus
 
     @field_serializer("measured_at")
     def _serialize_measured_at(self, value: datetime) -> str:
@@ -1057,7 +1071,11 @@ class DeviceReadingItem(BaseModel):
     @classmethod
     def of(cls, reading: Reading) -> "DeviceReadingItem":
         return cls(
-            grpid=reading.grpid, measured_at=reading.measured_at, device_id=reading.device_id, metrics=reading.metrics
+            grpid=reading.grpid,
+            measured_at=reading.measured_at,
+            device_id=reading.device_id,
+            metrics=reading.metrics,
+            status=_visible(reading.status),
         )
 
 
@@ -1076,6 +1094,7 @@ class DeviceReadingResponse(DeviceReadingItem):
             measured_at=reading.measured_at,
             device_id=reading.device_id,
             metrics=reading.metrics,
+            status=_visible(reading.status),
             is_first=bool(reading.is_first),
         )
 
@@ -1093,7 +1112,7 @@ def list_withings_device_readings(
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     cursor: str | None = None,
 ) -> DeviceReadingsResponse:
-    """Newest first, one item per measurement group, only from accounts we provisioned.
+    """Newest first, one item per weigh-in (its measurement groups merged), only from accounts we provisioned.
 
     An unknown device or a member with no provisioned account is an empty list, not a 404: the
     device hub renders the empty state either way.
@@ -1116,8 +1135,87 @@ def get_withings_device_reading(
     db: DbSession,
     _caller: ApiKeyDep,
 ) -> DeviceReadingResponse:
-    """404 unless the group is on one of THIS member's provisioned connections."""
+    """404 unless the group is on one of THIS member's provisioned connections.
+
+    A sibling group of a weigh-in returns the whole weigh-in, under its representative grpid.
+    """
     reading = get_reading(db, user_id=user_id, grpid=grpid)
     if reading is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such reading for this member")
     return DeviceReadingResponse.of(reading)
+
+
+_READING_NOT_FOUND = "reading_not_found"
+# Declared so the published schema shows the 404 the contract (A2) promises, not only the 200.
+_READING_NOT_FOUND_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {
+        "description": "No such reading for this member: missing, discarded, or cleaned up after 7 days",
+        "content": {"application/json": {"example": {"detail": _READING_NOT_FOUND}}},
+    },
+}
+
+
+class DiscardReadingResponse(BaseModel):
+    """What a discard removed: the weigh-in's representative grpid, all its grpids, its time, and its prior status.
+
+    Robin deletes its own rows for the weigh-in by ``measured_at`` (contract A5). ``was`` is
+    ``discarded`` on a repeat call, which changes nothing.
+    """
+
+    grpid: str
+    grpids: list[str]
+    measured_at: datetime
+    was: ReadingStatus
+
+    @field_serializer("measured_at")
+    def _serialize_measured_at(self, value: datetime) -> str:
+        return _utc_z(value)
+
+    @classmethod
+    def of(cls, result: DiscardResult) -> "DiscardReadingResponse":
+        return cls(grpid=result.grpid, grpids=result.grpids, measured_at=result.measured_at, was=result.was)
+
+
+@router.post(
+    "/withings/sdk/readings/{grpid}/confirm",
+    summary="Confirm a weigh-in the scale could not attribute is the member's",
+    tags=["External: Providers"],
+    responses=_READING_NOT_FOUND_RESPONSES,
+)
+def confirm_withings_device_reading(
+    grpid: str,
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> DeviceReadingResponse:
+    """Register a pending weigh-in: its samples are written from the groups held for it, and it is returned.
+
+    Idempotent: an already registered reading answers 200 unchanged. Any grpid of the weigh-in is
+    accepted. No reading event is sent (the member is already in the app).
+    """
+    reading = confirm_reading(db, user_id=user_id, grpid=grpid)
+    if reading is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_READING_NOT_FOUND)
+    return DeviceReadingResponse.of(reading)
+
+
+@router.post(
+    "/withings/sdk/readings/{grpid}/discard",
+    summary="Discard a weigh-in that is not the member's",
+    tags=["External: Providers"],
+    responses=_READING_NOT_FOUND_RESPONSES,
+)
+def discard_withings_device_reading(
+    grpid: str,
+    user_id: UUID,
+    db: DbSession,
+    _caller: ApiKeyDep,
+) -> DiscardReadingResponse:
+    """Pending: drop the held values. Registered: delete its samples too. Either way it is never served again.
+
+    Idempotent (``was: discarded``). Any grpid of the weigh-in is accepted.
+    """
+    result = discard_reading(db, user_id=user_id, grpid=grpid)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_READING_NOT_FOUND)
+    return DiscardReadingResponse.of(result)

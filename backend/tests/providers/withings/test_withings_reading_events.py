@@ -1,10 +1,12 @@
 """The Robin reading event: who gets one and what it says (delivery is Task 8's)."""
 
+import dataclasses
 import hashlib
 import hmac
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
@@ -19,13 +21,15 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.integrations.celery.core import create_celery
 from app.integrations.celery.tasks.withings_reading_event_task import deliver_withings_reading_event
-from app.models import UserConnection
+from app.models import DataSource, SeriesTypeDefinition, User, UserConnection, WithingsMeasureGroupRecord
 from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
+from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.services.providers.withings import reading_events
 from app.services.providers.withings.measure_groups import ParsedGroup
-from tests.factories import UserConnectionFactory, UserFactory
+from tests.factories import DataPointSeriesFactory, DataSourceFactory, UserConnectionFactory, UserFactory
 from tests.providers.withings.conftest import ProvisionedConnectionMaker
+from tests.providers.withings.weigh_ins import announce
 
 _NOW = datetime(2026, 9, 29, 8, 0, tzinfo=timezone.utc)
 _MODULE = "app.services.providers.withings.reading_events"
@@ -46,6 +50,7 @@ def _group(
     attrib: int | None = 0,
     age: timedelta = timedelta(minutes=5),
     metric_keys: tuple[str, ...] = ("weight", "fat_ratio"),
+    hash_device_id: str | None = None,
 ) -> ParsedGroup:
     return ParsedGroup(
         grpid=grpid,
@@ -54,6 +59,7 @@ def _group(
         attrib=attrib,
         measured_at=_NOW - age,
         metric_keys=metric_keys,
+        hash_device_id=hash_device_id,
     )
 
 
@@ -107,6 +113,7 @@ def test_build_payload_matches_the_contract() -> None:
         "grpid": "77",
         "measured_at": "2026-09-29T07:55:00Z",
         "types": ["weight", "fat_ratio"],
+        "pending": False,
     }
 
 
@@ -117,7 +124,7 @@ def test_unset_url_sends_nothing(
     monkeypatch.setattr(settings, "robin_reading_event_secret", SecretStr("s3cret"))
     connection = _provisioned(db, make_provisioned_connection)
     with patch(_SEND) as send:
-        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+        n = announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert n == 0
     send.assert_not_called()
 
@@ -130,17 +137,17 @@ def test_unset_secret_sends_nothing(
     assert reading_events.is_enabled() is False
     connection = _provisioned(db, make_provisioned_connection)
     with patch(_SEND) as send:
-        reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+        announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     send.assert_not_called()
 
 
-def test_provisioned_connection_emits_one_per_group(
+def test_provisioned_connection_emits_one_per_weigh_in(
     db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
 ) -> None:
     connection = _provisioned(db, make_provisioned_connection)
     with patch(_SEND) as send:
-        n = reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=[_group("1"), _group("2")], now=_NOW
+        n = announce(
+            db, user_connection_id=connection.id, groups=[_group("1"), _group("2", age=timedelta(minutes=6))], now=_NOW
         )
     assert n == 2
     sent = _sent(send)
@@ -157,9 +164,7 @@ def test_event_carries_the_stored_hash_deviceid(
     connection = _provisioned(db, make_provisioned_connection)
     _add_device(db, connection.id)
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=[_group()], now=_NOW, oauth=MagicMock()
-        )
+        announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW, oauth=MagicMock())
     assert send.call_args.kwargs["args"][0]["hash_deviceid"] == "hash-1"
     sync.assert_not_called()  # hash already known: no Getdevice call
 
@@ -176,10 +181,10 @@ def test_a_missing_hash_refreshes_getdevice_once_per_call(
         return []
 
     with patch(_SEND) as send, patch(_SYNC, side_effect=_getdevice) as sync:
-        n = reading_events.enqueue_new_reading_events(
+        n = announce(
             db,
             user_connection_id=connection.id,
-            groups=[_group("1"), _group("2", device_id="dev-2"), _group("3")],
+            groups=[_group("1"), _group("2", device_id="dev-2"), _group("3", age=timedelta(minutes=6))],
             now=_NOW,
             oauth=oauth,
         )
@@ -199,9 +204,7 @@ def test_a_failed_refresh_still_emits_with_a_null_hash(
         patch(_SYNC, side_effect=RuntimeError("withings down")) as sync,
         patch(f"{_MODULE}.log_and_capture_error") as capture,
     ):
-        n = reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=[_group()], now=_NOW, oauth=MagicMock()
-        )
+        n = announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW, oauth=MagicMock())
     assert n == 1
     sync.assert_called_once()
     capture.assert_called_once()
@@ -211,7 +214,7 @@ def test_a_failed_refresh_still_emits_with_a_null_hash(
 def test_self_linked_connection_never_emits(db: Session, enabled: None) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")  # no sdk account row
     with patch(_SEND) as send:
-        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+        n = announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert n == 0
     send.assert_not_called()
 
@@ -221,7 +224,7 @@ def test_old_groups_do_not_emit(
 ) -> None:
     connection = _provisioned(db, make_provisioned_connection)
     with patch(_SEND) as send:
-        n = reading_events.enqueue_new_reading_events(
+        n = announce(
             db,
             user_connection_id=connection.id,
             groups=[_group("old", age=timedelta(hours=25)), _group("fresh", age=timedelta(hours=23))],
@@ -236,7 +239,7 @@ def test_manual_deviceless_and_non_c2_groups_do_not_emit(
 ) -> None:
     connection = _provisioned(db, make_provisioned_connection)
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        n = reading_events.enqueue_new_reading_events(
+        n = announce(
             db,
             user_connection_id=connection.id,
             groups=[
@@ -261,7 +264,7 @@ def test_enqueue_error_is_swallowed(
         patch(_SEND, side_effect=ConnectionError("redis down")),
         patch(f"{_MODULE}.log_and_capture_error") as capture,
     ):
-        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+        n = announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert n == 0
     capture.assert_called_once()
 
@@ -274,8 +277,11 @@ def test_one_failed_enqueue_does_not_drop_the_rest_of_the_batch(
         patch(_SEND, side_effect=[None, ConnectionError("redis blip"), None]) as send,
         patch(f"{_MODULE}.log_and_capture_error") as capture,
     ):
-        n = reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=[_group("1"), _group("2"), _group("3")], now=_NOW
+        n = announce(
+            db,
+            user_connection_id=connection.id,
+            groups=[_group("1"), _group("2", age=timedelta(minutes=6)), _group("3", age=timedelta(minutes=7))],
+            now=_NOW,
         )
     assert n == 2
     assert [p["grpid"] for p in _sent(send)] == ["1", "2", "3"]
@@ -296,7 +302,7 @@ def test_a_failed_setup_query_leaves_the_session_usable(
         patch(f"{_MODULE}.UserConnectionRepository.get", side_effect=_broken_query),
         patch(f"{_MODULE}.log_and_capture_error") as capture,
     ):
-        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+        n = announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert n == 0
     send.assert_not_called()
     capture.assert_called_once()
@@ -309,9 +315,7 @@ def test_a_device_getdevice_listed_without_a_hash_is_not_refreshed(
     connection = _provisioned(db, make_provisioned_connection)
     _add_device(db, connection.id, hash_device_id=None, listed=True)  # Getdevice saw it, no hash reported
     with patch(_SEND) as send, patch(_SYNC) as sync:
-        n = reading_events.enqueue_new_reading_events(
-            db, user_connection_id=connection.id, groups=[_group()], now=_NOW, oauth=MagicMock()
-        )
+        n = announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW, oauth=MagicMock())
     assert n == 1
     sync.assert_not_called()
     assert send.call_args.kwargs["args"][0]["hash_deviceid"] is None
@@ -324,7 +328,7 @@ def test_a_missing_withings_userid_is_sent_as_null(
     connection.provider_user_id = None
     db.flush()
     with patch(_SEND) as send:
-        reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+        announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert send.call_args.kwargs["args"][0]["withings_user_id"] is None
 
 
@@ -441,7 +445,7 @@ def test_an_empty_url_or_secret_counts_as_unset(
     assert reading_events.is_enabled() is False
     connection = _provisioned(db, make_provisioned_connection)
     with patch(_SEND) as send:
-        n = reading_events.enqueue_new_reading_events(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
+        n = announce(db, user_connection_id=connection.id, groups=[_group()], now=_NOW)
     assert n == 0
     send.assert_not_called()
 
@@ -544,3 +548,242 @@ def test_task_does_not_retry_terminal_outcomes(outcome: str) -> None:
     ):
         assert deliver_withings_reading_event.run({"grpid": "1"}) == {"outcome": outcome}
     retry.assert_not_called()
+
+
+# --- One weigh-in = one event ---------------------------------------------------------------------
+# A cellular Body Pro 2 weigh-in, as seen on staging (2026-10-01): two groups, same date and device.
+_HASH = "41a451ad0c5e7f2b9d3a6c8e1f4b7a2d5c8e0f3a"
+_BODY_KEYS = (
+    "weight",
+    "fat_ratio",
+    "fat_mass",
+    "muscle_mass",
+    "hydration",
+    "bone_mass",
+    "visceral_fat",
+    "basal_metabolic_rate",
+)
+
+
+def _body(grpid: str = "8530283247", **kw: Any) -> ParsedGroup:
+    return _group(grpid, device_id="15542329", hash_device_id=_HASH, metric_keys=_BODY_KEYS, **kw)
+
+
+def _pulse(grpid: str = "8530283250", **kw: Any) -> ParsedGroup:
+    return _group(grpid, device_id="15542329", hash_device_id=_HASH, metric_keys=("heart_rate",), **kw)
+
+
+def _record(db: Session, connection: UserConnection, group: ParsedGroup, series: tuple[SeriesType, ...] = ()) -> None:
+    """``group`` as an earlier ingest left it: its withings_measure_group row and samples."""
+    db.add(
+        WithingsMeasureGroupRecord(
+            id=uuid4(),
+            user_id=connection.user_id,
+            user_connection_id=connection.id,
+            grpid=group.grpid,
+            device_id=group.device_id,
+            hash_device_id=group.hash_device_id,
+            model=group.model,
+            attrib=group.attrib,
+            measured_at=group.measured_at,
+            status=group.status,
+        )
+    )
+    source = db.query(DataSource).filter(DataSource.user_id == connection.user_id).one_or_none()
+    if source is None:
+        source = DataSourceFactory(
+            user=db.get(User, connection.user_id),
+            provider=ProviderName.WITHINGS,
+            device_model=None,
+            source="withings",
+            device_type=None,
+        )
+    for s in series:
+        DataPointSeriesFactory(
+            data_source=source,
+            series_type=db.get(SeriesTypeDefinition, get_series_type_id(s)),
+            value=Decimal("1"),
+            recorded_at=group.measured_at,
+            external_id=group.grpid,
+        )
+    db.flush()
+
+
+def test_a_weigh_in_in_two_groups_is_one_event_with_the_heart_rate_in_it(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[_body(), _pulse()], now=_NOW)
+    assert n == 1
+    (payload,) = _sent(send)
+    assert payload["grpid"] == "8530283247"
+    assert payload["types"] == [*_BODY_KEYS, "heart_rate"]
+    assert payload["hash_deviceid"] == _HASH
+    assert payload["device_id"] == "15542329"
+
+
+def test_the_weight_group_announces_the_weigh_in_whatever_the_batch_order(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[_pulse("8530283240"), _body()], now=_NOW)
+    assert n == 1
+    (payload,) = _sent(send)
+    assert payload["grpid"] == "8530283247"
+    assert set(payload["types"]) == {*_BODY_KEYS, "heart_rate"}
+
+
+def test_two_weigh_ins_in_one_batch_are_two_events(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    later = timedelta(minutes=1)
+    groups = [_body(), _pulse(), _body("8530358979", age=later), _pulse("8530358986", age=later)]
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=groups, now=_NOW)
+    assert n == 2
+    assert [p["grpid"] for p in _sent(send)] == ["8530283247", "8530358979"]
+
+
+def test_a_pulse_group_after_its_weigh_in_was_announced_sends_nothing(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    _record(db, connection, _body(), (SeriesType.weight, SeriesType.body_fat_percentage))
+    pulse = _pulse()
+    _record(db, connection, pulse, (SeriesType.heart_rate,))  # this batch's own row, as record_new_groups leaves it
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
+    assert n == 0
+    send.assert_not_called()
+
+
+def test_a_lone_pulse_group_is_still_announced(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    pulse = _pulse()
+    _record(db, connection, pulse, (SeriesType.heart_rate,))
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
+    assert n == 1
+    assert _sent(send)[0]["grpid"] == "8530283250"
+    assert _sent(send)[0]["types"] == ["heart_rate"]
+
+
+def test_an_earlier_sibling_with_nothing_to_announce_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """A sibling with no C2 sample (or a manual one) was never announced, so this batch still is."""
+    connection = _provisioned(db, make_provisioned_connection)
+    _record(db, connection, _group("8530283240", device_id="15542329", hash_device_id=_HASH, metric_keys=()))
+    _record(db, connection, _pulse("8530283241", attrib=2), (SeriesType.heart_rate,))
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[_body()], now=_NOW)
+    assert n == 1
+    assert _sent(send)[0]["grpid"] == "8530283247"
+
+
+def test_a_blood_pressure_only_sibling_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    bp_only = _group("8530283240", device_id="15542329", hash_device_id=_HASH, metric_keys=())
+    _record(db, connection, bp_only, (SeriesType.blood_pressure_systolic, SeriesType.blood_pressure_diastolic))
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[_body()], now=_NOW)
+    assert n == 1
+    assert _sent(send)[0]["grpid"] == "8530283247"
+
+
+def test_a_sibling_on_the_same_members_other_connection_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    _, historic = make_provisioned_connection(user=db.get(User, connection.user_id))
+    _record(db, historic, _pulse(), (SeriesType.heart_rate,))
+    with patch(_SEND):
+        n = announce(db, user_connection_id=connection.id, groups=[_body()], now=_NOW)
+    assert n == 1
+
+
+def test_an_earlier_group_of_another_device_or_time_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    _, other = make_provisioned_connection()
+    _record(db, connection, _group("1", device_id="15542329", hash_device_id="another-hash"), (SeriesType.weight,))
+    _record(db, connection, _body("2", age=timedelta(minutes=6)), (SeriesType.weight,))
+    _record(db, other, _body("3"), (SeriesType.weight,))
+    with patch(_SEND):
+        n = announce(db, user_connection_id=connection.id, groups=[_pulse()], now=_NOW)
+    assert n == 1
+
+
+# --- pending (spec 2026-10-01 D1, contract A3) ----------------------------------------------------
+
+
+def test_a_pending_weigh_in_is_announced_once_with_pending_true(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    groups = [dataclasses.replace(_body(), status="pending"), dataclasses.replace(_pulse(), status="pending")]
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=groups, now=_NOW)
+    assert n == 1
+    (payload,) = _sent(send)
+    assert payload["pending"] is True
+    assert payload["grpid"] == "8530283247"
+    assert payload["types"] == [*_BODY_KEYS, "heart_rate"]
+
+
+def test_a_registered_weigh_in_is_announced_with_pending_false(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    connection = _provisioned(db, make_provisioned_connection)
+    with patch(_SEND) as send:
+        announce(db, user_connection_id=connection.id, groups=[_body(), _pulse()], now=_NOW)
+    assert [p["pending"] for p in _sent(send)] == [False]
+
+
+def test_a_discarded_group_is_never_announced(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """A late sibling of a weigh-in the member already discarded is recorded as a tombstone, silently."""
+    connection = _provisioned(db, make_provisioned_connection)
+    groups = [dataclasses.replace(_pulse(), status="discarded")]
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=groups, now=_NOW)
+    assert n == 0
+    send.assert_not_called()
+
+
+def test_a_late_sibling_of_a_pending_session_is_not_announced_again(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """A pending sibling has no samples, so it is its status that says the weigh-in was announced."""
+    connection = _provisioned(db, make_provisioned_connection)
+    _record(db, connection, dataclasses.replace(_body(), status="pending"))
+    pulse = dataclasses.replace(_pulse(), status="pending")
+    _record(db, connection, pulse)  # this batch's own row, as record_new_groups leaves it
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
+    assert n == 0
+    send.assert_not_called()
+
+
+def test_an_earlier_hash_only_sibling_does_not_silence_the_weigh_in(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """A sibling with a hash but no deviceid was never announced (``_eligible`` needs one): it silences nothing."""
+    connection = _provisioned(db, make_provisioned_connection)
+    hash_only = _group("8530283247", device_id=None, hash_device_id=_HASH, metric_keys=_BODY_KEYS)
+    _record(db, connection, hash_only, (SeriesType.weight, SeriesType.body_fat_percentage))
+    pulse = _pulse()
+    _record(db, connection, pulse, (SeriesType.heart_rate,))  # this batch's own row, as record_new_groups leaves it
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
+    assert n == 1
+    assert _sent(send)[0]["grpid"] == "8530283250"

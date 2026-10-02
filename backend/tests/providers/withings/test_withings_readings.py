@@ -1,4 +1,4 @@
-"""Readings from the device we sold a member: one per Withings measurement group."""
+"""Readings from the device we sold a member: one per weigh-in (session of measurement groups)."""
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,6 +13,7 @@ from app.services.providers.withings.readings import (
     InvalidReadingCursor,
     get_reading,
     list_device_readings,
+    merge_session,
 )
 from tests.factories import DataPointSeriesFactory, DataSourceFactory, UserConnectionFactory
 from tests.providers.withings.conftest import ProvisionedConnectionMaker
@@ -22,6 +23,7 @@ _T0 = datetime(2026, 9, 1, 7, 0, tzinfo=timezone.utc)
 _SERIES = {
     "weight": SeriesType.weight,
     "fat_ratio": SeriesType.body_fat_percentage,
+    "fat_mass": SeriesType.body_fat_mass,
     "heart_rate": SeriesType.heart_rate,
     "vascular_age": SeriesType.cardiovascular_age,
     "visceral_fat": SeriesType.withings_visceral_fat,
@@ -47,7 +49,8 @@ def _reading(
     connection: UserConnection,
     grpid: str,
     at: datetime,
-    device_id: str = "dev-1",
+    device_id: str | None = "dev-1",
+    hash_device_id: str | None = None,
     **metrics: float,
 ) -> None:
     """A group and its samples. Callers keep ``at`` distinct per member (uq_data_point_series_source_type_time)."""
@@ -58,6 +61,7 @@ def _reading(
             user_connection_id=connection.id,
             grpid=grpid,
             device_id=device_id,
+            hash_device_id=hash_device_id,
             model="Body Pro 2",
             attrib=0,
             measured_at=at,
@@ -101,9 +105,12 @@ def test_list_paginates_by_cursor(db: Session, make_provisioned_connection: Prov
 
 
 def test_list_breaks_a_time_tie_by_grpid(db: Session, make_provisioned_connection: ProvisionedConnectionMaker) -> None:
+    """Same device and time on three provisioned connections: three sessions, ordered by grpid."""
     user, connection = make_provisioned_connection()
-    for grpid in ("a", "b", "c"):
-        _reading(db, user, connection, grpid, _T0)  # a group with no stored samples still lists
+    _, second_conn = make_provisioned_connection(user=user)
+    _, third_conn = make_provisioned_connection(user=user)
+    for grpid, conn in (("a", connection), ("b", second_conn), ("c", third_conn)):
+        _reading(db, user, conn, grpid, _T0)  # a group with no stored samples still lists
     first = list_device_readings(db, user_id=user.id, device_id="dev-1", limit=2)
     second = list_device_readings(db, user_id=user.id, device_id="dev-1", limit=2, cursor=first.next_cursor)
     assert [r.grpid for r in first.items + second.items] == ["c", "b", "a"]
@@ -268,3 +275,205 @@ def test_another_members_sample_with_the_same_grpid_and_time_is_not_a_metric(
     reading = get_reading(db, user_id=alice.id, grpid="1")
     assert reading is not None
     assert reading.metrics == {"weight": 70.0}
+
+
+# --- One weigh-in = one reading -------------------------------------------------------------------
+# The real shape, from a cellular Body Pro 2 on staging (2026-10-01): one weigh-in arrives as two
+# groups with the same date and device, the body composition in one and the heart pulse alone in
+# the next grpid.
+_HASH = "41a451ad0c5e7f2b9d3a6c8e1f4b7a2d5c8e0f3a"
+_DEVICE = "15542329"
+_BODY = {"weight": 72.4, "fat_ratio": 21.3, "fat_mass": 15.4}
+
+
+def _weigh_in(
+    db: Session,
+    user: User,
+    connection: UserConnection,
+    at: datetime,
+    body_grpid: str = "8530283247",
+    pulse_grpid: str = "8530283250",
+    *,
+    pulse: float = 64,
+    pulse_first: bool = False,
+) -> None:
+    def body() -> None:
+        _reading(db, user, connection, body_grpid, at, _DEVICE, _HASH, **_BODY)
+
+    def heart() -> None:
+        _reading(db, user, connection, pulse_grpid, at, _DEVICE, _HASH, heart_rate=pulse)
+
+    for add in (heart, body) if pulse_first else (body, heart):
+        add()
+
+
+def test_a_weigh_in_split_in_two_groups_lists_as_one_reading(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _weigh_in(db, user, connection, _T0)
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["8530283247"]
+    assert page.items[0].metrics == {**_BODY, "heart_rate": 64.0}
+    assert page.items[0].measured_at == _T0
+    assert page.items[0].device_id == _DEVICE
+    assert page.next_cursor is None
+    # The device hub may also ask by the integer deviceid: same single reading.
+    assert [r.grpid for r in list_device_readings(db, user_id=user.id, device_id=_DEVICE).items] == ["8530283247"]
+
+
+def test_the_representative_is_the_weight_group_even_when_its_grpid_is_higher(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _weigh_in(db, user, connection, _T0, body_grpid="8530283250", pulse_grpid="8530283247", pulse_first=True)
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["8530283250"]
+    assert page.items[0].metrics == {**_BODY, "heart_rate": 64.0}
+
+
+def test_without_a_weight_group_the_lowest_grpid_represents_the_session(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _reading(db, user, connection, "9100", _T0, _DEVICE, _HASH, heart_rate=60)
+    _reading(db, user, connection, "999", _T0, _DEVICE, _HASH, vascular_age=40)  # numerically lower
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["999"]
+    assert page.items[0].metrics == {"heart_rate": 60.0, "vascular_age": 40.0}
+
+
+def test_on_a_key_in_two_groups_the_representative_wins() -> None:
+    """Storage keeps one sample per (source, type, time), so samples cannot collide; the rule is pinned anyway."""
+    t = _T0
+    records = [
+        WithingsMeasureGroupRecord(grpid="8530283250", device_id=_DEVICE, hash_device_id=_HASH, measured_at=t),
+        WithingsMeasureGroupRecord(grpid="8530283247", device_id=_DEVICE, hash_device_id=_HASH, measured_at=t),
+    ]
+    metrics = {"8530283250": {"heart_rate": 64.0}, "8530283247": {"weight": 72.4, "heart_rate": 70.0}}
+    reading = merge_session(records, metrics)
+    assert reading.grpid == "8530283247"
+    assert reading.metrics == {"weight": 72.4, "heart_rate": 70.0}
+
+
+def test_two_weigh_ins_are_two_readings(db: Session, make_provisioned_connection: ProvisionedConnectionMaker) -> None:
+    user, connection = make_provisioned_connection()
+    _weigh_in(db, user, connection, _T0)
+    _weigh_in(db, user, connection, _T0 + timedelta(minutes=20), "8530358979", "8530358986", pulse=71)
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["8530358979", "8530283247"]
+    assert page.items[0].metrics == {**_BODY, "heart_rate": 71.0}
+    assert page.items[1].metrics == {**_BODY, "heart_rate": 64.0}
+
+
+def test_groups_at_different_times_are_not_merged(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _reading(db, user, connection, "8530283247", _T0, _DEVICE, _HASH, **_BODY)
+    _reading(db, user, connection, "8530283250", _T0 + timedelta(seconds=1), _DEVICE, _HASH, heart_rate=64)
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["8530283250", "8530283247"]
+    assert page.items[0].metrics == {"heart_rate": 64.0}
+
+
+def test_groups_from_different_devices_are_not_merged(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """Same time and the same integer deviceid, but different hashes: two devices, two readings."""
+    user, connection = make_provisioned_connection()
+    _reading(db, user, connection, "8530283247", _T0, _DEVICE, _HASH, **_BODY)
+    _reading(db, user, connection, "8530283250", _T0, _DEVICE, "another-hash", heart_rate=64)
+    by_int_id = list_device_readings(db, user_id=user.id, device_id=_DEVICE)
+    assert [r.grpid for r in by_int_id.items] == ["8530283250", "8530283247"]
+    assert [r.grpid for r in list_device_readings(db, user_id=user.id, device_id=_HASH).items] == ["8530283247"]
+    detail = get_reading(db, user_id=user.id, grpid="8530283250")
+    assert detail is not None
+    assert detail.metrics == {"heart_rate": 64.0}
+
+
+def test_hashless_groups_merge_on_their_deviceid(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _reading(db, user, connection, "11", _T0, weight=70)
+    _reading(db, user, connection, "12", _T0, heart_rate=60)
+    _reading(db, user, connection, "13", _T0, device_id="dev-2", vascular_age=41)
+    page = list_device_readings(db, user_id=user.id, device_id="dev-1")
+    assert [(r.grpid, r.metrics) for r in page.items] == [("11", {"weight": 70.0, "heart_rate": 60.0})]
+
+
+def test_the_same_weigh_in_on_two_connections_is_not_merged(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _, historic = make_provisioned_connection(user=user)
+    _reading(db, user, connection, "8530283247", _T0, _DEVICE, _HASH, weight=72.4)
+    _reading(db, user, historic, "8530283250", _T0, _DEVICE, _HASH)
+    page = list_device_readings(db, user_id=user.id, device_id=_HASH)
+    assert [r.grpid for r in page.items] == ["8530283250", "8530283247"]
+    detail = get_reading(db, user_id=user.id, grpid="8530283250")
+    assert detail is not None
+    assert detail.grpid == "8530283250"
+    assert detail.metrics == {}
+
+
+def test_limit_and_cursor_count_weigh_ins_not_groups(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    for i in range(3):
+        _weigh_in(db, user, connection, _T0 + timedelta(hours=i), f"85302832{i}0", f"85302832{i}5")
+    first = list_device_readings(db, user_id=user.id, device_id=_HASH, limit=2)
+    assert [r.grpid for r in first.items] == ["8530283220", "8530283210"]
+    assert all("heart_rate" in r.metrics and "weight" in r.metrics for r in first.items)
+    assert first.next_cursor is not None
+    second = list_device_readings(db, user_id=user.id, device_id=_HASH, limit=2, cursor=first.next_cursor)
+    assert [r.grpid for r in second.items] == ["8530283200"]
+    assert second.items[0].metrics == {**_BODY, "heart_rate": 64.0}
+    assert second.next_cursor is None
+    assert len(list_device_readings(db, user_id=user.id, device_id=_HASH, limit=3).items) == 3
+
+
+def test_detail_by_the_representative_or_its_sibling_is_the_same_merged_reading(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, connection = make_provisioned_connection()
+    _weigh_in(db, user, connection, _T0)
+    by_body = get_reading(db, user_id=user.id, grpid="8530283247")
+    by_pulse = get_reading(db, user_id=user.id, grpid="8530283250")
+    assert by_body is not None
+    assert by_body.grpid == "8530283247"
+    assert by_body.metrics == {**_BODY, "heart_rate": 64.0}
+    assert by_body.measured_at == _T0
+    assert by_body.device_id == _DEVICE
+    assert by_body.is_first is True
+    assert by_pulse == by_body
+
+
+def test_is_first_is_per_weigh_in(db: Session, make_provisioned_connection: ProvisionedConnectionMaker) -> None:
+    """The pulse group of the first weigh-in does not make that weigh-in's own body group 'not first'."""
+    user, connection = make_provisioned_connection()
+    _weigh_in(db, user, connection, _T0)
+    _weigh_in(db, user, connection, _T0 + timedelta(days=1), "8530358979", "8530358986")
+    for grpid in ("8530283247", "8530283250"):
+        first = get_reading(db, user_id=user.id, grpid=grpid)
+        assert first is not None
+        assert first.is_first is True
+    for grpid in ("8530358979", "8530358986"):
+        later = get_reading(db, user_id=user.id, grpid=grpid)
+        assert later is not None
+        assert later.grpid == "8530358979"
+        assert later.is_first is False
+
+
+def test_is_first_sees_an_older_weigh_in_recorded_before_the_hash_column(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """Groups recorded before migration a3c9d51e7f20 carry no hash; they still are this device's history."""
+    user, connection = make_provisioned_connection()
+    _reading(db, user, connection, "100", _T0 - timedelta(days=1), _DEVICE, None, weight=73)
+    _weigh_in(db, user, connection, _T0)
+    reading = get_reading(db, user_id=user.id, grpid="8530283250")
+    assert reading is not None
+    assert reading.is_first is False
