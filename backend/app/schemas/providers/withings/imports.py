@@ -20,6 +20,9 @@ def _id_as_str(value: Any) -> Any:
 # An opaque Withings identifier: string or integer on the wire, always a string here.
 WithingsId = Annotated[str | None, BeforeValidator(_id_as_str)]
 
+# The same, for a field the payload must carry (e.g. Getdevice's ``deviceid``).
+WithingsRequiredId = Annotated[str, BeforeValidator(_id_as_str)]
+
 
 class WithingsMeasure(BaseModel):
     """``measure_object``: the real value is ``value × 10^unit``."""
@@ -41,8 +44,8 @@ class WithingsMeasureGroup(BaseModel):
     # attrib 0/8 = device-captured & unambiguous, 2/4 = manual entry (see spec table).
     attrib: int | None = None
     category: int | None = None
-    # NOT the Getdevice deviceid for every device: the cellular Body Pro 2 sends an integer here
-    # that Getdevice never lists. ``hash_deviceid`` is what joins the group to its device row
+    # NOT always the Getdevice deviceid: the cellular Body Pro 2 sends an integer here that may
+    # not match what Getdevice lists. ``hash_deviceid`` is what joins the group to its device row
     # (Getdevice's deviceid/hash_deviceid) and to the order that shipped it.
     deviceid: WithingsId = None
     hash_deviceid: str | None = None
