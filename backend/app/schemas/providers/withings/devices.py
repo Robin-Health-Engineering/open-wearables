@@ -18,8 +18,9 @@ class WithingsDeviceEntry(BaseModel):
     # name collision with BaseModel's own API rather than a problem with the field.
     model_config = ConfigDict(protected_namespaces=())
 
-    # Getdevice returns this as a JSON string or a JSON integer depending on the device; a plain
-    # ``str`` rejected integer ids and failed the whole sync. Always stored as a string.
+    # A JSON string or a JSON integer on the wire, always a string here. Getdevice returned integer
+    # ids for both devices of one staging account on 2026-10-14 (OW-BACKEND-W), and a plain ``str``
+    # failed the whole sync. Whether those are the integers measure groups carry is not known.
     deviceid: WithingsRequiredId
 
     # Withings' hashed device id. It is the ONE key that appears both here and on the dropshipment

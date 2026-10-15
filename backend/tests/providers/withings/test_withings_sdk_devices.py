@@ -157,6 +157,17 @@ class TestSyncDevicesFromWithings:
 
         assert devices[0].model_id == 45
 
+    def test_integer_deviceids_are_stored_and_swept_as_strings(self, db: Session) -> None:
+        user_id = _member(db)
+        _sync(db, user_id, _entry(deviceid=7520742), _entry(deviceid=16715813))
+
+        _sync(db, user_id, _entry(deviceid=7520742))
+
+        rows = {d.device_id: d for d in db.query(WithingsDevice).all()}
+        assert set(rows) == {"7520742", "16715813"}
+        assert rows["7520742"].dissociated_at is None
+        assert rows["16715813"].dissociated_at is not None
+
     def test_never_erases_a_field_getdevice_did_not_carry(self, db: Session) -> None:
         # THE invariant. An omitted field means "this device did not report one", and reading
         # it as "no value" would wipe what an earlier response did carry.
