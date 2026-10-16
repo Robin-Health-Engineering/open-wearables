@@ -20,6 +20,9 @@ def _id_as_str(value: Any) -> Any:
 # An opaque Withings identifier: string or integer on the wire, always a string here.
 WithingsId = Annotated[str | None, BeforeValidator(_id_as_str)]
 
+# The same, for a field the payload must carry (e.g. Getdevice's ``deviceid``).
+WithingsRequiredId = Annotated[str, BeforeValidator(_id_as_str)]
+
 
 class WithingsMeasure(BaseModel):
     """``measure_object``: the real value is ``value × 10^unit``."""

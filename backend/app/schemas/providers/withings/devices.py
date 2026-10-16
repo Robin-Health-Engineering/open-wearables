@@ -2,6 +2,8 @@
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from app.schemas.providers.withings.imports import WithingsRequiredId
+
 
 class WithingsDeviceEntry(BaseModel):
     """One entry of ``getdevice``'s ``devices`` list.
@@ -16,7 +18,10 @@ class WithingsDeviceEntry(BaseModel):
     # name collision with BaseModel's own API rather than a problem with the field.
     model_config = ConfigDict(protected_namespaces=())
 
-    deviceid: str
+    # A JSON string or a JSON integer on the wire, always a string here. Getdevice returned integer
+    # ids for both devices of one staging account on 2026-10-14 (OW-BACKEND-W), and a plain ``str``
+    # failed the whole sync. Whether those are the integers measure groups carry is not known.
+    deviceid: WithingsRequiredId
 
     # Withings' hashed device id. It is the ONE key that appears both here and on the dropshipment
     # order detail (orderv2-getdetail products[].devices[].hash_deviceid), which is what lets

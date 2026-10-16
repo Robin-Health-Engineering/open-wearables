@@ -10,7 +10,7 @@ from app.schemas.providers.withings import (
     WithingsSleepSummary,
     WithingsWorkout,
 )
-from app.schemas.providers.withings.devices import WithingsDeviceEntry
+from app.schemas.providers.withings.devices import WithingsDeviceEntry, WithingsGetdeviceBody
 
 
 def test_notification_parses_form_fields() -> None:
@@ -140,3 +140,15 @@ def test_resolve_window_stringified_out_of_range_epoch_returns_none() -> None:
 def test_getdevice_entry_parses_optional_hash_deviceid() -> None:
     assert WithingsDeviceEntry.model_validate({"deviceid": "d", "hash_deviceid": "h"}).hash_deviceid == "h"
     assert WithingsDeviceEntry.model_validate({"deviceid": "d"}).hash_deviceid is None
+
+
+def test_getdevice_accepts_integer_deviceids_as_strings() -> None:
+    # Verbatim shape of OW-BACKEND-W: both entries carried a JSON integer deviceid.
+    body = WithingsGetdeviceBody.model_validate({"devices": [{"deviceid": 7520742}, {"deviceid": 16715813}]})
+    assert [d.deviceid for d in body.devices] == ["7520742", "16715813"]
+
+
+@pytest.mark.parametrize("entry", [{"deviceid": True}, {"deviceid": None}, {}])
+def test_getdevice_still_rejects_a_boolean_null_or_missing_deviceid(entry: dict) -> None:
+    with pytest.raises(ValidationError, match="deviceid"):
+        WithingsDeviceEntry.model_validate(entry)
