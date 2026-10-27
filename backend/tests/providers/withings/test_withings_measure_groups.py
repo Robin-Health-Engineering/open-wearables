@@ -303,3 +303,13 @@ def test_withheld_grpids_names_pending_and_discarded_groups_only(db: Session) ->
     withheld = withheld_grpids(db, user_connection_id=connection.id, grpids=["900", "800", "700", "unknown"])
     assert withheld == {"900", "700"}
     assert withheld_grpids(db, user_connection_id=connection.id, grpids=[]) == set()
+
+
+def test_on_a_self_linked_account_only_the_sold_devices_ambiguous_session_is_held(db: Session) -> None:
+    connection = UserConnectionFactory(user=UserFactory(), provider="withings")
+    groups = [_held("900", device_id="sold-dev"), _held("901", device_id="family-dev")]
+    new = _record(
+        db, connection, groups, raw_by_grpid=_raws("900", "901"), hold_sold_keys=frozenset({"sold-dev", "sold-hash"})
+    )
+    assert {g.grpid: g.status for g in new} == {"900": "pending", "901": "registered"}
+    assert _stored(db, connection)["901"] == ("registered", None)

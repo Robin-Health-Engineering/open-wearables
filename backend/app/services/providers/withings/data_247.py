@@ -33,11 +33,12 @@ from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings._client import paginate, scale_measure
-from app.services.providers.withings.connections import is_device_connection
+from app.services.providers.withings.connections import robin_device_scope
 from app.services.providers.withings.coverage import ACTIVITY_FIELD_MAP, MEASURE_TYPE_MAP
 from app.services.providers.withings.data_requests import ACTIVITY, MEASURES, SLEEP_SUMMARY
 from app.services.providers.withings.measure_groups import (
     AMBIGUOUS_ATTRIB,
+    lock_device_tags,
     lock_sessions,
     parsed_group_of,
     record_new_groups,
@@ -279,6 +280,9 @@ class Withings247Data(Base247DataTemplate):
             # session in the batch, so a concurrent ingest of the same weigh-in (or the member's
             # confirm / discard of it) waits, then sees what this one committed. Re-read sessions are
             # locked too: their samples are written or withheld by the status read below.
+            # Before the session locks (the order every caller keeps): which devices on this connection
+            # Robin sold cannot change between the hold below and the decision (spec 2026-10-27 O3).
+            lock_device_tags(db, user_connection_id, exclusive=False)
             lock_sessions(
                 db,
                 (
@@ -292,11 +296,14 @@ class Withings247Data(Base247DataTemplate):
                     for g in parsed
                 ),
             )
-            # Spec 2026-10-01 D1: an ambiguous weigh-in waits for the member's answer, but only on an
-            # account WE provisioned (the app asks about the scale we sold). The member's own Withings
-            # account registers it as before. Asked only when the batch holds an attrib 1 group.
-            hold_ambiguous = any(g.attrib == AMBIGUOUS_ATTRIB for g in parsed) and is_device_connection(
-                db, user_connection_id
+            # Spec 2026-10-01 D1, widened by spec 2026-10-27 O2: an ambiguous weigh-in waits for the
+            # member's answer when it is on the scale Robin sold them: any device on an account we
+            # provisioned, only the sold device on the member's own account. Asked only when the batch
+            # holds an attrib 1 group.
+            scope = (
+                robin_device_scope(db, user_connection_id)
+                if any(g.attrib == AMBIGUOUS_ATTRIB for g in parsed)
+                else None
             )
             # Same transaction as the samples: a group is "recorded" only if its samples are.
             new_groups = record_new_groups(
@@ -307,7 +314,8 @@ class Withings247Data(Base247DataTemplate):
                 raw_by_grpid={
                     str(group.grpid): raw_group(row, default_timezone) for row, group in rows if group.grpid is not None
                 },
-                hold_ambiguous=hold_ambiguous,
+                hold_ambiguous=scope is not None and scope.provisioned,
+                hold_sold_keys=scope.sold_keys if scope is not None else frozenset(),
             )
             # Pending and discarded sessions keep their samples out, on this ingest and every re-read.
             withheld = withheld_grpids(db, user_connection_id=user_connection_id, grpids=[g.grpid for g in parsed])
