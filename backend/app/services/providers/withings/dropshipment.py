@@ -26,6 +26,9 @@ authorization verdict, not a signature (342) or validation (503) error. As of 20
 277 from here means the contract, not the request.
 
 Reference: developer-guide/v3/integration-guide/dropship-cellular/logistics-api/create-user-order
+
+``createorder`` (``create_order``) is the same call WITHOUT the account: dropship-only, for a device
+the member activates on their own Withings account. Enabled on our client_id (2026-10-27).
 """
 
 from __future__ import annotations
@@ -53,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 _DROPSHIPMENT_PATH = "/v2/dropshipment"
 _ACTION = "createuserorder"
+_CREATE_ORDER = "createorder"
 _TIMEOUT_SECONDS = 30.0
 
 
@@ -81,6 +85,99 @@ class WithingsDropshipmentError(RuntimeError):
         # fault, and the cellular route answers 409 for it rather than 502.
         self.already_exists = already_exists
         super().__init__(detail or f"Withings createuserorder failed (status={withings_status})")
+
+
+def _post_dropshipment(
+    payload: dict[str, str], *, action: str, client_id: str, client_secret: str, api_base_url: str
+) -> dict[str, Any]:
+    """Sign and POST one ``/v2/dropshipment`` action; return the envelope's ``body`` once Withings answered 0.
+
+    Shared by ``createuserorder`` and ``createorder``: the signing, the shared request budget, and the
+    rule that NOTHING Withings send back reaches a log or an error — the request carried a postal
+    address and a signature, and the response may echo either (``redact_body`` does not cover an
+    address; see ``describe_body``). Only the envelope's own ``error`` string is surfaced
+    (``upstream_reason``), because without it a 503 is undiagnosable.
+    """
+    # Adds client_id, a fresh single-use nonce and the HMAC signature, and drops any secret.
+    signed = sign_payload(payload, client_id, client_secret, api_base_url=api_base_url)
+
+    acquire_request_slot()
+    try:
+        response = httpx.post(
+            f"{api_base_url}{_DROPSHIPMENT_PATH}",
+            data=signed,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        envelope = response.json()
+    except httpx.HTTPStatusError as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings {action} HTTP error ({describe_body(e.response.text)})",
+            provider="withings",
+            task=action,
+            status_code=e.response.status_code,
+        )
+        raise WithingsDropshipmentError(detail=f"Withings {action} failed (HTTP {e.response.status_code})") from e
+    except Exception as e:
+        log_structured(
+            logger,
+            "error",
+            f"Withings {action} request failed: {type(e).__name__}",
+            provider="withings",
+            task=action,
+        )
+        raise WithingsDropshipmentError(detail=f"Withings {action} request failed") from e
+
+    if not isinstance(envelope, dict):
+        # A shape the leniency policy does not cover, arriving after the order may already be placed.
+        raise WithingsDropshipmentError(detail=f"Withings {action} returned a non-object response")
+
+    status = envelope.get("status")
+    if status != STATUS_OK:
+        reason = upstream_reason(envelope)
+        log_structured(
+            logger,
+            "error",
+            f"Withings {action} returned a non-zero status",
+            provider="withings",
+            task=action,
+            withings_status=status,
+            withings_error=reason,
+        )
+        raise WithingsDropshipmentError(
+            withings_status=status, upstream_reason=reason, detail=f"Withings {action} failed (status={status})"
+        )
+    return envelope.get("body") or {}
+
+
+def _acknowledged_orders(body: dict[str, Any], *, action: str) -> list[DropshipOrderResult]:
+    """The orders a status-0 answer acknowledged, parsed; raise this module's error if none or any is unreadable.
+
+    A status-0 answer acknowledging NO order is either a silent no-ship or a key-name miss on a REAL
+    order (we send the block under ``order`` and read it back under ``orders``; nobody has seen the
+    response), and neither may read as a clean success with an empty list. Leniency covers unexpected
+    KEYS (``extra="allow"``, every field optional); an unexpected TYPE still lands here, after the
+    order is placed, and is re-raised as this module's own error so the caller can tell it from a
+    transport failure.
+    """
+    raw_orders = body.get("orders") or []
+    if not raw_orders:
+        log_structured(
+            logger,
+            "error",
+            f"Withings {action} succeeded but acknowledged no orders",
+            provider="withings",
+            task=action,
+            body_keys=sorted(body.keys()),
+        )
+        raise WithingsDropshipmentError(detail=f"Withings {action} returned no orders")
+    try:
+        return [DropshipOrderResult.model_validate(o) for o in raw_orders]
+    except ValidationError as e:
+        raise WithingsDropshipmentError(detail=f"Withings {action} returned an unreadable order") from e
 
 
 def create_user_order(
@@ -156,68 +253,9 @@ def create_user_order(
     if testmode:
         payload["testmode"] = "1"
 
-    # Adds client_id, a fresh single-use nonce and the HMAC signature, and drops any secret.
-    signed = sign_payload(payload, client_id, client_secret, api_base_url=api_base_url)
-
-    acquire_request_slot()
-    try:
-        response = httpx.post(
-            f"{api_base_url}{_DROPSHIPMENT_PATH}",
-            data=signed,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        envelope = response.json()
-    except httpx.HTTPStatusError as e:
-        # NOT logged: the request body carried a signature AND a postal address, and the response
-        # may echo either back. `redact_body` does not cover that — it masks credential-shaped keys
-        # and an address is not one, which was measured rather than assumed. See `describe_body`.
-        log_structured(
-            logger,
-            "error",
-            f"Withings createuserorder HTTP error ({describe_body(e.response.text)})",
-            provider="withings",
-            task=_ACTION,
-            status_code=e.response.status_code,
-        )
-        raise WithingsDropshipmentError(
-            detail=f"Withings createuserorder failed (HTTP {e.response.status_code})"
-        ) from e
-    except Exception as e:
-        log_structured(
-            logger,
-            "error",
-            f"Withings createuserorder request failed: {type(e).__name__}",
-            provider="withings",
-            task=_ACTION,
-        )
-        raise WithingsDropshipmentError(detail="Withings createuserorder request failed") from e
-
-    if not isinstance(envelope, dict):
-        # Same class as the unreadable-order case below: a shape the leniency policy does not
-        # cover, arriving after the order may already be placed.
-        raise WithingsDropshipmentError(detail="Withings createuserorder returned a non-object response")
-
-    status = envelope.get("status")
-    if status != STATUS_OK:
-        # Still no body echo — the response to a signed request repeats our parameters, and those
-        # include the member's email, birth date, weight and home address. But the envelope's own
-        # `error` string names the parameter Withings objected to, and without it a 503 is
-        # undiagnosable: see `upstream_reason`, which is where the reasoning and the bound live.
-        reason = upstream_reason(envelope)
-        log_structured(
-            logger,
-            "error",
-            "Withings createuserorder returned a non-zero status",
-            provider="withings",
-            task=_ACTION,
-            withings_status=status,
-            withings_error=reason,
-        )
-        raise WithingsDropshipmentError(withings_status=status, upstream_reason=reason)
-
-    body = envelope.get("body") or {}
+    body = _post_dropshipment(
+        payload, action=_ACTION, client_id=client_id, client_secret=client_secret, api_base_url=api_base_url
+    )
     user = body.get("user") or {}
     code = user.get("code")
     if not code:
@@ -243,34 +281,7 @@ def create_user_order(
             echoed_external_id=echoed,
         )
 
-    raw_orders = body.get("orders") or []
-    if not raw_orders:
-        # A status-0 response acknowledging NO order is the state the request-side guard exists
-        # to prevent, reached from the other direction: a real Withings account with nothing
-        # shipping to it. Raising strands an account, which is recoverable and nameable —
-        # ``external_id`` is deterministic — where a silent no-ship is detectable by nobody.
-        #
-        # It is also how a key-name miss degrades. We send the block under ``order`` and read the
-        # response under ``orders``; nobody has seen this response, and without this guard a real
-        # placed order arriving under a different key would return a clean success with an empty
-        # list. Same precedent as ``exchange_sdk_code``: partial success is worse than failure.
-        log_structured(
-            logger,
-            "error",
-            "Withings createuserorder succeeded but acknowledged no orders",
-            provider="withings",
-            task=_ACTION,
-            body_keys=sorted(body.keys()),
-        )
-        raise WithingsDropshipmentError(detail="Withings createuserorder returned no orders")
-
-    try:
-        order_results = [DropshipOrderResult.model_validate(o) for o in raw_orders]
-    except ValidationError as e:
-        # Leniency covers unexpected KEYS (extra="allow", every field optional); an unexpected
-        # TYPE still lands here, and after the order is placed. Re-raised as this module's own
-        # error so the caller can discriminate it from a transport failure.
-        raise WithingsDropshipmentError(detail="Withings createuserorder returned an unreadable order") from e
+    order_results = _acknowledged_orders(body, action=_ACTION)
 
     log_structured(
         logger,
@@ -286,3 +297,63 @@ def create_user_order(
         external_id=external_id,
         orders=order_results,
     )
+
+
+def _with_orderid(raw: object) -> object:
+    """One acknowledged order with its id under ``orderid``, as a string, as the caller reads it.
+
+    ``createuserorder`` answers ``orderid`` and ``getdetail`` answers ``order_id``; nobody has seen a
+    ``createorder`` answer, so either key is accepted, and a numeric id becomes a string rather than an
+    "unreadable order" after the parcel is placed. Anything that is not an object passes through
+    untouched, for ``model_validate`` to refuse.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    order_id = raw.get("orderid") or raw.get("order_id")
+    return {**raw, "orderid": str(order_id) if order_id is not None else None}
+
+
+def create_order(
+    *,
+    client_id: str,
+    client_secret: str,
+    orders: list[DropshipOrder],
+    testmode: bool = False,
+    api_base_url: str = WITHINGS_API_BASE_URL,
+) -> list[DropshipOrderResult]:
+    """Place a dropshipment order WITHOUT creating a Withings account (``action=createorder``, spec O1).
+
+    For a device the member sets up themselves (the non-cellular Body Comp): Withings ship the parcel
+    and that is all. The member creates or signs in to their OWN Withings account in Health Mate and
+    links it to Robin later through consumer OAuth. Same signing and the same ``order`` block as
+    ``createuserorder``; no profile, no ``unit_pref``, no code, and nothing is stored here.
+
+    An acknowledged order may come back without an id (``orderid`` None): the route resolves it from
+    getdetail. Not idempotent at Withings — the route's pre-flight is what stops a retry shipping twice.
+    """
+    if not orders:
+        raise ValueError("createorder needs at least one order")
+    payload: dict[str, str] = {
+        "action": _CREATE_ORDER,
+        "order": json.dumps([order.model_dump(exclude_none=True) for order in orders]),
+    }
+    if testmode:
+        payload["testmode"] = "1"
+
+    body = _post_dropshipment(
+        payload, action=_CREATE_ORDER, client_id=client_id, client_secret=client_secret, api_base_url=api_base_url
+    )
+    results = _acknowledged_orders(
+        {**body, "orders": [_with_orderid(o) for o in body.get("orders") or []]}, action=_CREATE_ORDER
+    )
+
+    log_structured(
+        logger,
+        "info",
+        "Withings order placed without an account",
+        provider="withings",
+        task=_CREATE_ORDER,
+        order_count=len(results),
+        testmode=testmode,
+    )
+    return results
