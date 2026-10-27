@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.user import User
+from app.models.user_connection import UserConnection
 from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
@@ -49,6 +50,9 @@ _PROVISION_CELLULAR = "app.api.routes.v1.withings_sdk.provision_cellular_order"
 _ACCOUNTS_URL = "/api/v1/providers/withings/sdk/accounts"
 _SESSION_URL = "/api/v1/providers/withings/sdk/session"
 _CELLULAR_URL = "/api/v1/providers/withings/cellular/orders"
+_ORDERS_URL = "/api/v1/providers/withings/orders"
+_CREATE_ORDER = "app.api.routes.v1.withings_sdk.create_order"
+_ALREADY_PLACED = "Withings already hold an order for this customer_ref_id; it was already placed"
 
 # The bare CustomerProfile id — what robin-backend sends, and the same on a member's every order,
 # because Withings reuse the account their first one created. Which ORDER a shipment belongs to is
@@ -1104,3 +1108,181 @@ class TestDeviceHashDeviceIdInResponse:
         body = self._get(client, user, api_key_header).json()[0]
         assert "hash_deviceid" in body
         assert body["hash_deviceid"] is None
+
+
+def _valid_order_payload(**overrides: Any) -> dict[str, Any]:
+    """Contract C1: the order block and testmode, nothing about the member."""
+    payload: dict[str, Any] = {"orders": _valid_cellular_payload()["orders"]}
+    payload.update(overrides)
+    return payload
+
+
+def _placed(orderid: str | None = "D0820094") -> list[DropshipOrderResult]:
+    return [DropshipOrderResult(orderid=orderid, status="VERIFIED")]
+
+
+class TestNoAccountOrderRoute:
+    """``POST /withings/orders``: a parcel with no Withings account (spec O1, contract C1)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_order_already_placed(self) -> Any:
+        # Every request asks getdetail first; unpatched that is a real signed call.
+        with patch(_GET_ORDER_DETAIL, return_value=[]) as stub:
+            yield stub
+
+    def test_places_the_order_and_returns_only_the_orders(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with patch(_CREATE_ORDER, return_value=_placed()) as create:
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 200
+        assert set(response.json()) == {"orders"}
+        assert [(o["orderid"], o["status"]) for o in response.json()["orders"]] == [("D0820094", "VERIFIED")]
+        orders = create.call_args.kwargs["orders"]
+        assert [type(o) for o in orders] == [DropshipOrder]
+        assert orders[0].customer_ref_id == _ORDER_REF
+        assert create.call_args.kwargs["testmode"] is False
+
+    def test_forwards_testmode_when_asked(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with patch(_CREATE_ORDER, return_value=_placed()) as create:
+            client.post(_ORDERS_URL, json=_valid_order_payload(testmode=True), headers=api_key_header)
+
+        assert create.call_args.kwargs["testmode"] is True
+
+    def test_creates_no_account_and_no_connection_and_ignores_a_profile_sent_anyway(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        before = (db.query(UserConnection).count(), db.query(WithingsSdkAccount).count())
+        body = _valid_order_payload(user_id=str(uuid4()), email="member@example.com", external_id=_EXTERNAL_ID)
+
+        with patch(_CREATE_ORDER, return_value=_placed()) as create, patch(_PROVISION_CELLULAR) as provision:
+            response = client.post(_ORDERS_URL, json=body, headers=api_key_header)
+
+        assert response.status_code == 200
+        provision.assert_not_called()
+        assert set(create.call_args.kwargs) == {"client_id", "client_secret", "orders", "testmode"}
+        assert (db.query(UserConnection).count(), db.query(WithingsSdkAccount).count()) == before
+
+    def test_status_0_with_no_id_is_resolved_from_getdetail(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        detail = [[], [OrderDetail(order_id="D0820568", customer_ref_id=_ORDER_REF, status="VERIFIED")]]
+
+        with patch(_CREATE_ORDER, return_value=_placed(None)), patch(_GET_ORDER_DETAIL, side_effect=detail):
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 200
+        assert [o["orderid"] for o in response.json()["orders"]] == ["D0820568"]
+
+    def test_the_order_still_comes_back_when_the_resolve_fails(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # The parcel is placed by now: a failed enrichment must not turn it into an error the caller
+        # reads as "no order" and retries.
+        detail = [[], WithingsOrderDetailError(withings_status=503)]
+
+        with patch(_CREATE_ORDER, return_value=_placed(None)), patch(_GET_ORDER_DETAIL, side_effect=detail):
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 200
+        assert [o["orderid"] for o in response.json()["orders"]] == [None]
+
+    def test_the_same_customer_ref_id_posted_twice_ships_once(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        # robin-backend retries the fulfiller after a timeout with the SAME customer_ref_id.
+        placed = OrderDetail(order_id="D0820094", customer_ref_id=_ORDER_REF, status="VERIFIED")
+
+        with (
+            patch(_GET_ORDER_DETAIL, side_effect=[[], [placed]]),
+            patch(_CREATE_ORDER, return_value=_placed()) as create,
+        ):
+            first = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+            second = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert (first.status_code, second.status_code) == (200, 409)
+        assert second.json()["detail"] == _ALREADY_PLACED
+        assert create.call_count == 1
+
+    def test_the_same_customer_ref_id_twice_in_one_request_is_400_before_any_withings_call(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        order = _valid_order_payload()["orders"][0]
+
+        with patch(_GET_ORDER_DETAIL) as detail, patch(_CREATE_ORDER) as create:
+            response = client.post(_ORDERS_URL, json={"orders": [order, order]}, headers=api_key_header)
+
+        assert response.status_code == 400  # the app maps 422 to 400
+        detail.assert_not_called()
+        create.assert_not_called()
+
+    def test_409_carries_the_cellular_routes_detail(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        already = OrderDetail(order_id="D1", customer_ref_id=_ORDER_REF, status="PROCESSING")
+
+        with patch(_GET_ORDER_DETAIL, return_value=[already]) as detail, patch(_CREATE_ORDER) as create:
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == _ALREADY_PLACED
+        create.assert_not_called()
+        assert detail.call_args.kwargs["customer_ref_ids"] == [_ORDER_REF]
+
+    def test_502_when_the_pre_flight_cannot_reach_withings(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with (
+            patch(_GET_ORDER_DETAIL, side_effect=WithingsOrderDetailError(detail="upstream down")),
+            patch(_CREATE_ORDER) as create,
+        ):
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Could not verify with Withings whether this order was already placed"
+        create.assert_not_called()
+
+    def test_502_names_withings_status_like_the_cellular_route_and_never_the_address(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        error = WithingsDropshipmentError(
+            withings_status=503, detail="createorder refused for Via Roma 1", upstream_reason="Invalid Params: ean"
+        )
+
+        with patch(_CREATE_ORDER, side_effect=error):
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Withings declined the cellular order (status=503)"
+        assert "Via Roma" not in response.text
+
+    def test_a_transport_failure_is_502_with_this_codebases_own_message(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with patch(_CREATE_ORDER, side_effect=WithingsDropshipmentError(detail="Withings createorder request failed")):
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Withings cellular order failed: Withings createorder request failed"
+
+    def test_400_when_no_order_is_attached(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        with patch(_CREATE_ORDER) as create:
+            response = client.post(_ORDERS_URL, json={"orders": []}, headers=api_key_header)
+
+        assert response.status_code == 400
+        create.assert_not_called()
+
+    def test_requires_authentication(self, client: TestClient) -> None:
+        assert client.post(_ORDERS_URL, json=_valid_order_payload()).status_code == 401
+
+    def test_503_when_the_deployment_has_no_withings_credentials(
+        self, client: TestClient, api_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "withings_client_id", None)
+
+        assert client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header).status_code == 503
