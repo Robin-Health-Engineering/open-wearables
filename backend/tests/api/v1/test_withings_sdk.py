@@ -195,6 +195,21 @@ class TestSessionRoute:
         assert response.status_code == 404
         assert "no Withings SDK account" in response.json()["detail"]
 
+    def test_404_for_a_member_whose_sold_scale_is_on_their_own_account(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str]
+    ) -> None:
+        # Spec O4: the WebViews act on an account WE created; a tagged device on the member's own
+        # account does not make one.
+        user, own = self_linked_connection(db)
+        add_device(db, own, "bodycomp-1", hash_device_id="bc-hash", order_ref="ORDER-1")
+        db.commit()
+
+        with patch(_TOKEN, return_value="access-current"):
+            response = client.get(_SESSION_URL, params={"user_id": str(user.id)}, headers=api_key_header)
+
+        assert response.status_code == 404
+        assert "no Withings SDK account" in response.json()["detail"]
+
     def test_409_when_the_account_has_no_csrf_token(
         self, client: TestClient, db: Session, api_key_header: dict[str, str]
     ) -> None:
