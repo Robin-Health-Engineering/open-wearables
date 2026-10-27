@@ -18,6 +18,7 @@ from app.models import WithingsMeasureGroupRecord
 from app.models.withings_measure_group import DISCARDED, PENDING, REGISTERED, ReadingStatus
 from app.schemas.enums import SeriesType
 from app.schemas.providers.withings import WithingsMeasureGroup
+from app.services.providers.withings.connections import RobinDeviceScope
 from app.services.providers.withings.coverage import MEASURE_TYPE_MAP
 
 # SeriesType -> the metric key Robin and the app use (spec Appendix C2). Every C2 key is producible
@@ -128,7 +129,8 @@ def representative_grpid(grpids_with_weight: dict[str, bool]) -> str:
 
 
 # Withings ``attrib`` 1: device-captured, but the device could not tell which of its users stepped
-# on it (spec 2026-10-01 §2). On an account we provisioned such a weigh-in is held pending.
+# on it (spec 2026-10-01 §2). On a device Robin sold (any device on an account we provisioned, the
+# tagged device on the member's own) such a weigh-in is held pending.
 AMBIGUOUS_ATTRIB = 1
 
 
@@ -223,8 +225,7 @@ def record_new_groups(
     user_connection_id: UUID,
     groups: list[ParsedGroup],
     raw_by_grpid: Mapping[str, dict[str, Any]] | None = None,
-    hold_ambiguous: bool = False,
-    hold_sold_keys: frozenset[str] = frozenset(),
+    hold_scope: RobinDeviceScope | None = None,
 ) -> list[ParsedGroup]:
     """Insert the groups not yet recorded for this connection and return exactly those, with their status.
 
@@ -238,9 +239,9 @@ def record_new_groups(
     * a session already stored (a sibling recorded by an earlier ingest) passes its status on: a
       pulse group arriving after its pending or discarded weigh-in joins it instead of registering
       on its own;
-    * otherwise, when the session is on the scale Robin sold: ``hold_ambiguous`` (an account we
-      provisioned: every device on it) or a group naming a device in ``hold_sold_keys`` (the sold
-      device on the member's own account, by ``hash_deviceid`` or ``deviceid``). A session holding an
+    * otherwise, when the session is on the scale Robin sold: a group ``hold_scope`` covers (an
+      account we provisioned: every device on it; the member's own account: the sold device, matched
+      by ``connections.RobinDeviceScope.covers``). A session holding an
       ``attrib 1`` group is then ``pending``, and each of its groups keeps its payload from
       ``raw_by_grpid``, which must then hold it (``ValueError`` otherwise: a pending group without
       its payload could never be confirmed);
@@ -261,9 +262,7 @@ def record_new_groups(
     for (device, measured_at), members in batch.items():
         status = stored.get((device, measured_at)) if device is not None else None
         if status is None:
-            sold = hold_ambiguous or any(
-                m.hash_device_id in hold_sold_keys or m.device_id in hold_sold_keys for m in members
-            )
+            sold = hold_scope is not None and any(hold_scope.covers(m.hash_device_id, m.device_id) for m in members)
             ambiguous = sold and any(m.attrib == AMBIGUOUS_ATTRIB for m in members)
             status = PENDING if ambiguous else REGISTERED
         for member in members:

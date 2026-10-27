@@ -174,6 +174,8 @@ def _acknowledged_orders(body: dict[str, Any], *, action: str) -> list[DropshipO
             body_keys=sorted(body.keys()),
         )
         raise WithingsDropshipmentError(detail=f"Withings {action} returned no orders")
+    if not isinstance(raw_orders, list):
+        raise WithingsDropshipmentError(detail=f"Withings {action} returned an unreadable order")
     try:
         return [DropshipOrderResult.model_validate(o) for o in raw_orders]
     except ValidationError as e:
@@ -343,8 +345,10 @@ def create_order(
     body = _post_dropshipment(
         payload, action=_CREATE_ORDER, client_id=client_id, client_secret=client_secret, api_base_url=api_base_url
     )
+    raw_orders = body.get("orders")
     results = _acknowledged_orders(
-        {**body, "orders": [_with_orderid(o) for o in body.get("orders") or []]}, action=_CREATE_ORDER
+        {**body, "orders": [_with_orderid(o) for o in raw_orders] if isinstance(raw_orders, list) else raw_orders},
+        action=_CREATE_ORDER,
     )
 
     log_structured(

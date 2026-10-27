@@ -1,6 +1,7 @@
 """Purchased-scale attribution: the member confirms or discards a weigh-in (spec 2026-10-01 D1-D5, D9).
 
-A weigh-in Withings could not attribute to one user (``attrib 1``) on an account we provisioned is
+A weigh-in Withings could not attribute to one user (``attrib 1``) on a device Robin sold the member (any device on
+an account we provisioned, the tagged device on their own account) is
 held ``pending`` at ingest: its groups are recorded with their payload as received (``raw``) and no
 samples. The member answers in the app ("È tua questa pesata?"), or removes a registered reading
 ("Non sono io"):
@@ -92,7 +93,7 @@ class DiscardResult:
 def confirm_reading(db: DbSession, *, user_id: UUID, grpid: str) -> Reading | None:
     """Register a pending weigh-in and return it as the detail route serves it.
 
-    None when no group of it is on this member's provisioned accounts, or it was discarded or
+    None when no group of it is on a device Robin sold this member, or it was discarded or
     retired. An already registered reading is returned unchanged (idempotent).
     """
     session = _locked_session(db, user_id=user_id, grpid=grpid)
@@ -159,7 +160,7 @@ def discard_reading(db: DbSession, *, user_id: UUID, grpid: str) -> DiscardResul
 
     Pending: the held payload is erased. Registered: its samples are deleted too. Already
     discarded: nothing changes and ``was`` says so (idempotent). None when no group of it is on this
-    member's provisioned accounts.
+    a device Robin sold this member.
     """
     # Any connection state: a repeat discard of a disconnected account's tombstone still answers (A2b.1).
     session = _locked_session(db, user_id=user_id, grpid=grpid, any_state=True)

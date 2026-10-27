@@ -291,6 +291,14 @@ class TestTheResponse:
         with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
             _call(post)
 
+    def test_a_non_list_orders_value_raises_this_modules_error_not_a_type_error(self) -> None:
+        post = MagicMock(
+            return_value=_ok({"user": {"code": "auth-code", "external_id": "profile-1#order-1"}, "orders": 5})
+        )
+
+        with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
+            _call(post)
+
     def test_a_success_with_no_code_raises_rather_than_returning_half_a_result(self) -> None:
         # status 0 and no code is a contract change, and a dangerous one: the account and the
         # order may both exist upstream.
@@ -349,6 +357,12 @@ def _create(post: Any, **overrides: Any) -> list[DropshipOrderResult]:
 
 class TestCreateOrder:
     """``createorder``: the parcel and nothing else — no account, no profile, no code (spec O1)."""
+
+    def test_a_non_list_orders_value_raises_this_modules_error_not_a_type_error(self) -> None:
+        post = MagicMock(return_value=_ok({"orders": 5}))
+
+        with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
+            _create(post)
 
     def test_posts_a_signed_createorder_with_the_order_block_and_no_profile(self) -> None:
         post = MagicMock(return_value=_placed())

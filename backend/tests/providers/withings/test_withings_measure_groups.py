@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.models import UserConnection, WithingsMeasureGroupRecord
 from app.schemas.enums import SeriesType
 from app.schemas.providers.withings import WithingsMeasureGroup
+from app.services.providers.withings.connections import RobinDeviceScope
 from app.services.providers.withings.measure_groups import (
     C2_KEYS,
     ParsedGroup,
@@ -229,6 +230,10 @@ def _stored(db: Session, connection: UserConnection) -> dict[str, tuple[str, dic
     return {grpid: (status, raw) for grpid, status, raw in rows}
 
 
+def _provisioned(connection: UserConnection) -> RobinDeviceScope:
+    return RobinDeviceScope(connection.id, provisioned=True)
+
+
 def _record(db: Session, connection: UserConnection, groups: list[ParsedGroup], **kw: Any) -> list[ParsedGroup]:
     return record_new_groups(db, user_id=connection.user_id, user_connection_id=connection.id, groups=groups, **kw)
 
@@ -237,34 +242,41 @@ def test_an_ambiguous_session_on_a_held_connection_is_pending_with_its_raw(db: S
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
     raws = _raws("900", "901")
     # One weigh-in (same device, same time): only the weight group is flagged ambiguous.
-    new = _record(db, connection, [_held("900"), _held("901", attrib=0)], raw_by_grpid=raws, hold_ambiguous=True)
+    new = _record(
+        db, connection, [_held("900"), _held("901", attrib=0)], raw_by_grpid=raws, hold_scope=_provisioned(connection)
+    )
     assert [(g.grpid, g.status) for g in new] == [("900", "pending"), ("901", "pending")]
     assert _stored(db, connection) == {"900": ("pending", raws["900"]), "901": ("pending", raws["901"])}
 
 
 def test_an_ambiguous_session_on_a_connection_not_held_is_registered(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
-    new = _record(db, connection, [_held("900")], raw_by_grpid=_raws("900"), hold_ambiguous=False)
+    new = _record(db, connection, [_held("900")], raw_by_grpid=_raws("900"))
     assert [g.status for g in new] == ["registered"]
     assert _stored(db, connection) == {"900": ("registered", None)}
 
 
 def test_an_unambiguous_session_is_registered_without_raw(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
-    _record(db, connection, [_held("900", attrib=0), _held("901", attrib=8, device_id="dev-2")], hold_ambiguous=True)
+    _record(
+        db,
+        connection,
+        [_held("900", attrib=0), _held("901", attrib=8, device_id="dev-2")],
+        hold_scope=_provisioned(connection),
+    )
     assert _stored(db, connection) == {"900": ("registered", None), "901": ("registered", None)}
 
 
 def test_sessions_in_one_batch_are_decided_separately(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
     groups = [_held("900"), _held("901", attrib=0, device_id="dev-2")]
-    _record(db, connection, groups, raw_by_grpid=_raws("900", "901"), hold_ambiguous=True)
+    _record(db, connection, groups, raw_by_grpid=_raws("900", "901"), hold_scope=_provisioned(connection))
     assert {g: s for g, (s, _) in _stored(db, connection).items()} == {"900": "pending", "901": "registered"}
 
 
 def test_a_late_sibling_inherits_its_sessions_status(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
-    _record(db, connection, [_held("900")], raw_by_grpid=_raws("900"), hold_ambiguous=True)
+    _record(db, connection, [_held("900")], raw_by_grpid=_raws("900"), hold_scope=_provisioned(connection))
     # The pulse group arrives in a later ingest, unflagged, on a call that would not hold it alone.
     (late,) = _record(db, connection, [_held("901", attrib=0)], raw_by_grpid=_raws("901"))
     assert late.status == "pending"
@@ -279,9 +291,9 @@ def test_a_late_sibling_inherits_its_sessions_status(db: Session) -> None:
 
 def test_a_late_sibling_of_a_registered_session_is_registered(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
-    _record(db, connection, [_held("900", attrib=0)], hold_ambiguous=True)
+    _record(db, connection, [_held("900", attrib=0)], hold_scope=_provisioned(connection))
     # An ambiguous late group of an already registered weigh-in is not held: it inherits "registered".
-    (late,) = _record(db, connection, [_held("901")], raw_by_grpid=_raws("901"), hold_ambiguous=True)
+    (late,) = _record(db, connection, [_held("901")], raw_by_grpid=_raws("901"), hold_scope=_provisioned(connection))
     assert late.status == "registered"
     assert _stored(db, connection) == {"900": ("registered", None), "901": ("registered", None)}
 
@@ -289,12 +301,12 @@ def test_a_late_sibling_of_a_registered_session_is_registered(db: Session) -> No
 def test_a_pending_group_without_its_raw_is_refused(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
     with pytest.raises(ValueError, match="raw"):
-        _record(db, connection, [_held("900")], raw_by_grpid={}, hold_ambiguous=True)
+        _record(db, connection, [_held("900")], raw_by_grpid={}, hold_scope=_provisioned(connection))
 
 
 def test_withheld_grpids_names_pending_and_discarded_groups_only(db: Session) -> None:
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
-    _record(db, connection, [_held("900")], raw_by_grpid=_raws("900"), hold_ambiguous=True)
+    _record(db, connection, [_held("900")], raw_by_grpid=_raws("900"), hold_scope=_provisioned(connection))
     _record(db, connection, [_held("800", attrib=0, device_id="dev-2")])
     record = WithingsMeasureGroupRecord
     db.add(_row(connection, grpid="700", device_id="dev-3"))
@@ -309,7 +321,11 @@ def test_on_a_self_linked_account_only_the_sold_devices_ambiguous_session_is_hel
     connection = UserConnectionFactory(user=UserFactory(), provider="withings")
     groups = [_held("900", device_id="sold-dev"), _held("901", device_id="family-dev")]
     new = _record(
-        db, connection, groups, raw_by_grpid=_raws("900", "901"), hold_sold_keys=frozenset({"sold-dev", "sold-hash"})
+        db,
+        connection,
+        groups,
+        raw_by_grpid=_raws("900", "901"),
+        hold_scope=RobinDeviceScope(connection.id, provisioned=False, sold_keys=frozenset({"sold-dev", "sold-hash"})),
     )
     assert {g.grpid: g.status for g in new} == {"900": "pending", "901": "registered"}
     assert _stored(db, connection)["901"] == ("registered", None)

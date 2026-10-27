@@ -314,8 +314,7 @@ class Withings247Data(Base247DataTemplate):
                 raw_by_grpid={
                     str(group.grpid): raw_group(row, default_timezone) for row, group in rows if group.grpid is not None
                 },
-                hold_ambiguous=scope is not None and scope.provisioned,
-                hold_sold_keys=scope.sold_keys if scope is not None else frozenset(),
+                hold_scope=scope,
             )
             # Pending and discarded sessions keep their samples out, on this ingest and every re-read.
             withheld = withheld_grpids(db, user_connection_id=user_connection_id, grpids=[g.grpid for g in parsed])

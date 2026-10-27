@@ -56,7 +56,7 @@ _STORED_PRECISION = Decimal("0.001")
 
 # A cursor is ``<body>.<signature>``: the body is the last session's (measured_at, lowest grpid), the
 # signature an HMAC over the body AND the member and device it was issued for. It only ever
-# narrows a query that is already scoped to the requesting member's provisioned connections, so a
+# narrows a query that is already scoped to the requesting member's connections (and their sold devices), so a
 # forged cursor could not reach another member's rows anyway; the signature makes a tampered or
 # transplanted one a clean 4xx instead of a silently different page.
 _MAX_CURSOR_LENGTH = 256
@@ -234,9 +234,9 @@ def find_session(
     """Every group of the session ``grpid`` belongs to, discarded ones included.
 
     Returns None unless the group is from a device Robin sold this member (any device on a provisioned
-    connection, the tagged device on their own account). Any grpid of
-    the session names it. ``lock`` takes a row lock on the session's groups (``SELECT … FOR UPDATE``)
-    so a confirm and a discard of one weigh-in, or a retried call, run one after the other.
+    connection, the tagged device on their own account). Any grpid of the session names it. ``lock``
+    takes a row lock on the session's groups (``SELECT … FOR UPDATE``) so a confirm and a discard of
+    one weigh-in, or a retried call, run one after the other.
 
     Only active connections count, unless ``any_state``: then a revoked or inactive one
     does too, so a repeated discard still finds the tombstone of a disconnected account.

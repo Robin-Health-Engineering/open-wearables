@@ -11,7 +11,7 @@ Sent only for groups that are
   tagged with its order (``withings_device.order_ref``, spec 2026-10-27 O2). ``external_user_id`` is
   the provisioned account's ``external_id``, or the member's ``User.external_user_id``; none, no event;
 * device-captured (a ``deviceid``, attrib not 2/4 = manual entry). An ambiguous ``attrib 1``
-  weigh-in on a provisioned account is recorded ``pending`` (spec 2026-10-01 D1) and IS announced,
+  weigh-in on a sold device is recorded ``pending`` (spec 2026-10-01 D1) and IS announced,
   with ``pending: true``, so Robin asks the member "È tua questa pesata?"; a ``discarded`` group
   (the late sibling of a weigh-in the member already rejected) never is;
 * carrying at least one C2 metric (a blood-pressure-only group has nothing to announce);
@@ -33,7 +33,9 @@ its commit. A later ingest of the same weigh-in (the pulse group Withings expose
 the body group) waits on that lock, then sees the earlier ingest's committed groups, and decides
 nothing if one of them was announceable: that ingest DECIDED to announce the session. A pending
 session's one event carries ``pending: true``; a late sibling of a pending or discarded session
-announces nothing (R10). The SEND (``send_reading_events``) runs after the commit. Both steps are
+announces nothing (R10). A device's FIRST tag re-decides the weigh-ins it already holds
+(``device_tagging.set_order_ref``, via ``decide_tagged_device``), so a device tagged after its first readings is not
+silent. The SEND (``send_reading_events``) runs after the commit. Both steps are
 best effort and never fail the ingest, and the groups are committed between them.
 
 What a failure costs: if the decision or the enqueue fails, the session gets no push. The reading
@@ -69,7 +71,12 @@ from app.models.withings_device import WithingsDevice
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName, get_series_type_id
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
-from app.services.providers.withings.connections import robin_device_scope, robin_external_user_id
+from app.services.providers.withings.connections import (
+    RobinDeviceScope,
+    robin_device_scope,
+    robin_external_user_id,
+    robin_groups_clause,
+)
 from app.services.providers.withings.measure_groups import (
     AMBIGUOUS_ATTRIB,
     C2_KEYS,
@@ -141,7 +148,7 @@ def _eligible(group: ParsedGroup, cutoff: datetime) -> bool:
     """Device-captured, not discarded, with something to announce, and recent.
 
     Manual entries (attrib 2 and 4) are refused. Ambiguous ones (attrib 1) are accepted: on an
-    account we provisioned they arrive ``pending`` and the event says so, so the member is asked
+    sold device they arrive ``pending`` and the event says so, so the member is asked
     rather than handed another person's weigh-in; on any other device they are registered as before
     and never emit. A discarded group is the late sibling of a weigh-in the member already rejected:
     nothing to say.
@@ -268,7 +275,7 @@ def _refresh_hashes(db: DbSession, *, user_id: UUID, user_connection_id: UUID, o
     """One Getdevice sweep of this connection, so a first reading can carry its hash_deviceid.
 
     A best effort: on failure the event still goes out with a null hash (Robin then falls back to
-    the provisioned-account check), so this logs and swallows.
+    the sold-device check), so this logs and swallows.
     """
     try:
         sync_devices_from_withings(db, user_id=user_id, oauth=oauth, connection_id=user_connection_id)
@@ -352,10 +359,11 @@ def decide_reading_events(
             scope = robin_device_scope(db, user_connection_id)
             if scope is None:
                 return None
+            covers = scope.covers
 
             def _announceable(connection: UserConnection, cutoff: datetime) -> list[ParsedGroup]:
                 batch_grpids = {g.grpid for g in groups}
-                eligible = [g for g in groups if _eligible(g, cutoff) and scope.covers(g.hash_device_id, g.device_id)]
+                eligible = [g for g in groups if _eligible(g, cutoff) and covers(g.hash_device_id, g.device_id)]
                 return [
                     session
                     for session in _sessions(eligible)
@@ -452,12 +460,17 @@ def decide_tagged_device(
             def _untold(connection: UserConnection, cutoff: datetime) -> list[ParsedGroup]:
                 keys = [key for key in (device.hash_device_id, device.device_id) if key]
                 record = WithingsMeasureGroupRecord
+                # Only THIS device's keys: robin_device_scope would re-announce other tagged devices.
+                only_this_device = robin_groups_clause(
+                    [RobinDeviceScope(connection_id, provisioned=False, sold_keys=frozenset(keys))]
+                )
+                if only_this_device is None:  # unreachable: one scope in, one clause out
+                    return []
                 rows = (
                     db.query(record)
                     .filter(
-                        record.user_connection_id == connection_id,
                         record.measured_at >= cutoff,
-                        or_(record.hash_device_id.in_(keys), record.device_id.in_(keys)),
+                        only_this_device,
                     )
                     .order_by(record.measured_at.asc(), record.grpid.asc())
                     .all()
