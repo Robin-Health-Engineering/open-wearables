@@ -6,9 +6,10 @@ group plus a heart-pulse-only group, and the member made ONE measurement. A read
 its session's representative grpid (the group holding the weight, else the lowest grpid) and
 carries the union of its groups' metrics.
 
-Only groups on a connection WE provisioned are visible here. A member's own Withings account may
-hold the same kind of device, but it is not the one this feature is about, and its readings stay
-in the ordinary timeseries API.
+Only groups from a device Robin SOLD are visible here (``connections.robin_device_scopes``): any
+device on a connection we provisioned, and on the member's own Withings account only the device
+robin-backend tagged with its order (spec 2026-10-27 O2). Every other device's readings stay in
+the ordinary timeseries API.
 
 A session is ``registered``, ``pending`` (an ambiguous weigh-in awaiting the member's answer, spec
 2026-10-01 D1) or ``discarded``. Discarded sessions are never served. A pending one has no samples:
@@ -26,13 +27,13 @@ from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import ColumnElement, and_, func, or_
 
 from app.config import settings
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, WithingsMeasureGroupRecord
 from app.schemas.enums import ProviderName, get_series_type_id
-from app.services.providers.withings.connections import all_device_connection_ids, device_connections
+from app.services.providers.withings.connections import robin_device_scopes, robin_groups_clause
 from app.services.providers.withings.data_247 import raw_group_samples
 from app.services.providers.withings.measure_groups import (
     C2_KEYS,
@@ -118,8 +119,9 @@ def _decode_cursor(user_id: UUID, device_id: str, cursor: str) -> tuple[datetime
     return measured_at, grpid
 
 
-def _provisioned_ids(db: DbSession, user_id: UUID) -> list[UUID]:
-    return [c.id for c in device_connections(db, user_id)]
+def _robin_groups(db: DbSession, user_id: UUID, *, any_state: bool = False) -> ColumnElement[bool] | None:
+    """The member's groups this module may serve: from a device Robin sold (``connections.robin_device_scopes``)."""
+    return robin_groups_clause(robin_device_scopes(db, user_id, any_state=any_state))
 
 
 def _metrics(db: DbSession, user_id: UUID, records: list[WithingsMeasureGroupRecord]) -> dict[str, dict[str, float]]:
@@ -231,23 +233,19 @@ def find_session(
 ) -> list[WithingsMeasureGroupRecord] | None:
     """Every group of the session ``grpid`` belongs to, discarded ones included.
 
-    Returns None unless the group is on one of this member's provisioned connections. Any grpid of
+    Returns None unless the group is from a device Robin sold this member (any device on a provisioned
+    connection, the tagged device on their own account). Any grpid of
     the session names it. ``lock`` takes a row lock on the session's groups (``SELECT … FOR UPDATE``)
     so a confirm and a discard of one weigh-in, or a retried call, run one after the other.
 
-    Only active provisioned connections count, unless ``any_state``: then a revoked or inactive one
+    Only active connections count, unless ``any_state``: then a revoked or inactive one
     does too, so a repeated discard still finds the tombstone of a disconnected account.
     """
-    connection_ids = all_device_connection_ids(db, user_id) if any_state else _provisioned_ids(db, user_id)
-    if not connection_ids:
+    scope = _robin_groups(db, user_id, any_state=any_state)
+    if scope is None:
         return None
     group = WithingsMeasureGroupRecord
-    record = (
-        db.query(group)
-        .filter(group.user_connection_id.in_(connection_ids), group.grpid == grpid)
-        .order_by(group.measured_at.asc())
-        .first()
-    )
+    record = db.query(group).filter(scope, group.grpid == grpid).order_by(group.measured_at.asc()).first()
     if record is None:
         return None
     return _session_groups(db, record, lock=lock)
@@ -256,7 +254,7 @@ def find_session(
 def list_device_readings(
     db: DbSession, *, user_id: UUID, device_id: str, limit: int = 20, cursor: str | None = None
 ) -> ReadingPage:
-    """One device's readings on the member's provisioned connections, newest first, one per session.
+    """One device's readings from a device Robin sold the member, newest first, one per session.
 
     ``device_id`` matches a group's own ``deviceid`` or its ``hash_deviceid``.
 
@@ -266,8 +264,8 @@ def list_device_readings(
     ``device_id``.
     """
     position = _decode_cursor(user_id, device_id, cursor) if cursor is not None else None
-    connection_ids = _provisioned_ids(db, user_id)
-    if not connection_ids:
+    scope = _robin_groups(db, user_id)
+    if scope is None:
         return ReadingPage(items=[], next_cursor=None)
     limit = max(1, min(limit, _MAX_LIMIT))
     group = WithingsMeasureGroupRecord
@@ -277,7 +275,7 @@ def list_device_readings(
     query = (
         db.query(group.user_connection_id, device, group.measured_at, tie)
         .filter(
-            group.user_connection_id.in_(connection_ids),
+            scope,
             group.status != DISCARDED,
             # Either id names the device: the device hub asks by withings_device.device_id, which for
             # the cellular Body Pro 2 is the hash, while that scale's groups carry an unrelated
@@ -318,7 +316,7 @@ def list_device_readings(
 
 
 def get_reading(db: DbSession, *, user_id: UUID, grpid: str) -> Reading | None:
-    """One reading with ``is_first`` set, or None unless the group is on a provisioned connection of this member.
+    """One reading with ``is_first`` set, or None unless the group is from a device Robin sold this member.
 
     Any grpid of a session returns that whole session, under its representative grpid: an event
     or a link naming a sibling group still resolves to the reading the member saw.
@@ -327,13 +325,13 @@ def get_reading(db: DbSession, *, user_id: UUID, grpid: str) -> Reading | None:
     Withings deviceid is not unique across accounts. None as well for a discarded session (contract A1:
     detail → 404).
     """
-    connection_ids = _provisioned_ids(db, user_id)
-    if not connection_ids:
+    scope = _robin_groups(db, user_id)
+    if scope is None:
         return None
     group = WithingsMeasureGroupRecord
     record = (
         db.query(group)
-        .filter(group.user_connection_id.in_(connection_ids), group.grpid == grpid, group.status != DISCARDED)
+        .filter(scope, group.grpid == grpid, group.status != DISCARDED)
         .order_by(group.measured_at.asc())
         .first()
     )

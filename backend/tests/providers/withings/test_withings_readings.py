@@ -16,7 +16,7 @@ from app.services.providers.withings.readings import (
     merge_session,
 )
 from tests.factories import DataPointSeriesFactory, DataSourceFactory, UserConnectionFactory
-from tests.providers.withings.conftest import ProvisionedConnectionMaker
+from tests.providers.withings.conftest import ProvisionedConnectionMaker, add_device, self_linked_connection
 
 _T0 = datetime(2026, 9, 1, 7, 0, tzinfo=timezone.utc)
 
@@ -477,3 +477,51 @@ def test_is_first_sees_an_older_weigh_in_recorded_before_the_hash_column(
     reading = get_reading(db, user_id=user.id, grpid="8530283250")
     assert reading is not None
     assert reading.is_first is False
+
+
+# --- the sold device on the member's own account (spec 2026-10-27 O2, contract C4) -----------------
+
+
+def test_a_sold_device_on_a_self_linked_account_lists_its_readings_and_not_the_familys(db: Session) -> None:
+    user, own = self_linked_connection(db)
+    add_device(db, own, "bodycomp-1", hash_device_id="bc-hash", order_ref="ORDER-1")
+    add_device(db, own, "family-1", hash_device_id="family-hash")
+    _reading(db, user, own, "1", _T0, device_id="bodycomp-1", hash_device_id="bc-hash", weight=70.0)
+    _reading(
+        db, user, own, "2", _T0 + timedelta(hours=1), device_id="family-1", hash_device_id="family-hash", weight=55.0
+    )
+
+    assert [r.grpid for r in list_device_readings(db, user_id=user.id, device_id="bodycomp-1").items] == ["1"]
+    assert list_device_readings(db, user_id=user.id, device_id="family-1").items == []
+    assert get_reading(db, user_id=user.id, grpid="1") is not None
+    assert get_reading(db, user_id=user.id, grpid="2") is None
+
+
+def test_a_weigh_in_before_the_tag_is_served_once_the_device_is_tagged(db: Session) -> None:
+    user, own = self_linked_connection(db)
+    device = add_device(db, own, "bodycomp-1", hash_device_id="bc-hash")
+    _reading(db, user, own, "1", _T0, device_id="bodycomp-1", hash_device_id="bc-hash", weight=70.0)
+    assert get_reading(db, user_id=user.id, grpid="1") is None
+
+    device.order_ref = "ORDER-1"
+    db.flush()
+
+    reading = get_reading(db, user_id=user.id, grpid="1")
+    assert reading is not None
+    assert reading.metrics == {"weight": 70.0}
+    assert reading.is_first is True
+
+
+def test_a_member_with_both_accounts_sees_each_device_only_under_its_own_id(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, provisioned = make_provisioned_connection()
+    _, own = self_linked_connection(db, user=user)
+    add_device(db, own, "bodycomp-1", hash_device_id="bc-hash", order_ref="ORDER-2")
+    _reading(db, user, provisioned, "p1", _T0, device_id="cell-1", weight=80.0)
+    _reading(
+        db, user, own, "o1", _T0 + timedelta(hours=1), device_id="bodycomp-1", hash_device_id="bc-hash", weight=70.0
+    )
+
+    assert [r.grpid for r in list_device_readings(db, user_id=user.id, device_id="cell-1").items] == ["p1"]
+    assert [r.grpid for r in list_device_readings(db, user_id=user.id, device_id="bodycomp-1").items] == ["o1"]
