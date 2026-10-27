@@ -105,22 +105,6 @@ def is_device_connection(db: DbSession, connection_id: UUID) -> bool:
     return bool(_provisioned_connection_ids(db, [connection_id]))
 
 
-def all_device_connection_ids(db: DbSession, user_id: UUID) -> list[UUID]:
-    """Ids of the accounts we provisioned for this member, in any state (active, revoked, inactive).
-
-    For callers that must still recognise a weigh-in after its account was disconnected, such as a
-    repeated discard (contract A2b.1).
-    """
-    ids = [
-        row[0]
-        for row in db.query(UserConnection.id)
-        .filter(UserConnection.user_id == user_id, UserConnection.provider == ProviderName.WITHINGS.value)
-        .all()
-    ]
-    provisioned = _provisioned_connection_ids(db, ids)
-    return [connection_id for connection_id in ids if connection_id in provisioned]
-
-
 @dataclass(frozen=True)
 class RobinDeviceScope:
     """Which weigh-ins on ONE Withings connection come from a device Robin sold the member.

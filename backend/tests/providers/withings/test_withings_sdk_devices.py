@@ -29,11 +29,11 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.models.withings_device import WithingsDevice
+from app.services.providers.withings.device_tagging import set_order_ref
 from app.services.providers.withings.sdk_devices import (
     list_devices,
     mark_dissociated,
     record_installed_device,
-    set_order_ref,
     sync_devices_from_withings,
 )
 from tests.factories import UserConnectionFactory, UserFactory
@@ -407,12 +407,15 @@ class TestSetOrderRef:
         assert found is not None
         assert found.order_ref == "REF-9"
 
-    def test_a_device_on_a_self_linked_account_is_none_and_untouched(self, db: Session) -> None:
+    def test_a_device_on_a_self_linked_account_is_tagged(self, db: Session) -> None:
+        # Spec O3: the non-cellular scale Robin sold sits on the member's OWN account.
         user_id = _member(db)  # self-linked only: no withings_sdk_account row
         _sync(db, user_id, _entry())
 
-        assert set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1") is None
-        assert _order_ref(db, "device-1") is None
+        found = set_order_ref(db, user_id=user_id, device_id="device-1", order_ref="REF-1")
+
+        assert found is not None
+        assert _order_ref(db, "device-1") == "REF-1"
 
     def test_a_dissociated_device_can_still_be_tagged(self, db: Session, make_provisioned_connection: Any) -> None:
         user, _ = _shipped(db, make_provisioned_connection)

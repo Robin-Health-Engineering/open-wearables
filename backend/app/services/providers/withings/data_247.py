@@ -276,13 +276,13 @@ class Withings247Data(Base247DataTemplate):
         plan: ReadingEventPlan | None = None
         if user_connection_id is not None:
             parsed = [g for g in (parsed_group_of(x) for x in groups) if g is not None]
+            # Before the session locks (the order every caller keeps): which devices on this connection
+            # Robin sold cannot change between the hold below and the decision (spec 2026-10-27 O3).
+            lock_device_tags(db, user_connection_id, exclusive=False)
             # One weigh-in, one decision: from here to the commit this ingest holds the lock of every
             # session in the batch, so a concurrent ingest of the same weigh-in (or the member's
             # confirm / discard of it) waits, then sees what this one committed. Re-read sessions are
             # locked too: their samples are written or withheld by the status read below.
-            # Before the session locks (the order every caller keeps): which devices on this connection
-            # Robin sold cannot change between the hold below and the decision (spec 2026-10-27 O3).
-            lock_device_tags(db, user_connection_id, exclusive=False)
             lock_sessions(
                 db,
                 (

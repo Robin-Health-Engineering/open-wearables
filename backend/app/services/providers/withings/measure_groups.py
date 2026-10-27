@@ -77,6 +77,10 @@ def session_lock_key(
     return f"withings-session|{user_connection_id}|device|{device}|{int(measured_at.timestamp())}"
 
 
+_LOCK_SHARED = text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:key, 0))")
+_LOCK_EXCLUSIVE = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
+
+
 def lock_sessions(db: DbSession, keys: Iterable[str]) -> None:
     """Take each session's transaction-scoped advisory lock; released by the caller's commit or rollback.
 
@@ -87,16 +91,12 @@ def lock_sessions(db: DbSession, keys: Iterable[str]) -> None:
     two unrelated sessions, never lets two of one through.
     """
     for key in sorted(set(keys)):
-        db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": key})
+        db.execute(_LOCK_EXCLUSIVE, {"key": key})
 
 
 def device_tags_lock_key(user_connection_id: UUID) -> str:
     """The name of a connection's tag lock (``lock_device_tags``); the prefix keeps it apart from every session key."""
     return f"withings-device-tags|{user_connection_id}"
-
-
-_LOCK_SHARED = text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:key, 0))")
-_LOCK_EXCLUSIVE = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
 
 
 def lock_device_tags(db: DbSession, user_connection_id: UUID, *, exclusive: bool) -> None:
@@ -110,7 +110,8 @@ def lock_device_tags(db: DbSession, user_connection_id: UUID, *, exclusive: bool
     is decided once. Ingests share it and never wait for each other.
 
     Lock order, everywhere: tag lock first, then session locks (``lock_sessions``). A tagging takes no
-    session lock, so the two kinds of lock cannot deadlock.
+    session lock, so the two kinds of lock cannot deadlock. A tagging takes the tag lock EXCLUSIVE
+    before it writes or refreshes any ``withings_device`` row, so it reads the tag an ingest last saw.
     """
     db.execute(_LOCK_EXCLUSIVE if exclusive else _LOCK_SHARED, {"key": device_tags_lock_key(user_connection_id)})
 

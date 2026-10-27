@@ -41,6 +41,7 @@ from app.services.api_key_service import ApiKeyDep
 from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.withings.attribution import DiscardResult, confirm_reading, discard_reading
+from app.services.providers.withings.device_tagging import set_order_ref
 from app.services.providers.withings.dropshipment import WithingsDropshipmentError, create_order
 from app.services.providers.withings.measure_groups import ReadingStatus
 from app.services.providers.withings.order_detail import WithingsOrderDetailError, get_order_detail
@@ -55,7 +56,6 @@ from app.services.providers.withings.sdk_devices import (
     list_devices,
     mark_dissociated,
     record_installed_device,
-    set_order_ref,
     sync_devices_from_withings,
 )
 from app.services.providers.withings.sdk_provisioning import (
@@ -1094,11 +1094,15 @@ def set_withings_device_order_ref(
     db: DbSession,
     _caller: ApiKeyDep,
 ) -> SdkDeviceResponse:
-    """Idempotent. 404 unless the device is on one of this member's Withings accounts.
+    """Idempotent. 404 unless the device is on one of this member's ACTIVE Withings accounts (contract C2).
 
-    A different ``order_ref`` than the one held overwrites it: Robin is the authority on orders.
+    Any of them: an account we provisioned, or the member's own holding the scale they bought. A
+    different ``order_ref`` than the one held overwrites it: Robin is the authority on orders. The
+    first tag of a device on the member's own account announces its weigh-ins of the last
+    ``robin_reading_event_max_age_hours`` (``device_tagging``).
     """
-    device = set_order_ref(db, user_id=user_id, device_id=device_id, order_ref=payload.order_ref)
+    strategy = ProviderFactory().get_provider(ProviderName.WITHINGS.value)
+    device = set_order_ref(db, user_id=user_id, device_id=device_id, order_ref=payload.order_ref, oauth=strategy.oauth)
     if device is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such device for this member")
     return SdkDeviceResponse.of(device)

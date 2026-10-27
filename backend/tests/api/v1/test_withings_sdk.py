@@ -42,6 +42,8 @@ from app.services.providers.withings.order_detail import WithingsOrderDetailErro
 from app.services.providers.withings.sdk_provisioning import CellularProvisioning
 from app.services.providers.withings.sdk_users import WithingsSdkUserError
 from tests.factories import UserConnectionFactory, UserFactory
+from tests.providers.withings.conftest import add_device, self_linked_connection
+from tests.providers.withings.weigh_ins import HASH, SEND, body_group, enable_events, recent, save
 
 _TOKEN = "app.api.routes.v1.withings_sdk._get_valid_token"
 _PROVISION = "app.api.routes.v1.withings_sdk.provision_sdk_account"
@@ -1057,7 +1059,7 @@ class TestOrderRefRoute:
         user, _ = self._device(db, make_provisioned_connection)
         assert self._put(client, user, {"order_ref": "   "}, api_key_header).status_code == 400
 
-    def test_404_and_no_write_for_a_device_on_a_self_linked_account(
+    def test_tags_a_device_on_the_members_own_account(
         self, client: TestClient, db: Session, api_key_header: dict[str, str]
     ) -> None:
         user = UserFactory()
@@ -1069,8 +1071,33 @@ class TestOrderRefRoute:
         )
         db.commit()
 
-        assert self._put(client, user, {"order_ref": "REF-1"}, api_key_header).status_code == 404
+        assert self._put(client, user, {"order_ref": "REF-1"}, api_key_header).status_code == 200
+        assert db.query(WithingsDevice).filter_by(device_id="dev-1").one().order_ref == "REF-1"
+
+    def test_404_and_no_write_for_a_device_on_another_members_own_account(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str]
+    ) -> None:
+        _, own = self_linked_connection(db)
+        add_device(db, own, "dev-1")
+        stranger, _ = self_linked_connection(db)
+        db.commit()
+
+        assert self._put(client, stranger, {"order_ref": "REF-1"}, api_key_header).status_code == 404
         assert db.query(WithingsDevice).filter_by(device_id="dev-1").one().order_ref is None
+
+    def test_tagging_a_self_linked_scale_announces_its_recent_weigh_in_once(
+        self, client: TestClient, db: Session, api_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        enable_events(monkeypatch)
+        user, own = self_linked_connection(db, external_user_id="cp-route-1")
+        add_device(db, own, "dev-1", hash_device_id=HASH)
+        with patch(SEND) as send:
+            save(db, user.id, own.id, [body_group(recent(), attrib=0)])
+            first = self._put(client, user, {"order_ref": "REF-1"}, api_key_header)
+            again = self._put(client, user, {"order_ref": "REF-1"}, api_key_header)
+
+        assert (first.status_code, again.status_code) == (200, 200)
+        assert [c.kwargs["args"][0]["external_user_id"] for c in send.call_args_list] == ["cp-route-1"]
 
 
 class TestDeviceHashDeviceIdInResponse:

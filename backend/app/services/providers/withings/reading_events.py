@@ -71,6 +71,7 @@ from app.schemas.enums import ProviderName, get_series_type_id
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.withings.connections import robin_device_scope, robin_external_user_id
 from app.services.providers.withings.measure_groups import (
+    AMBIGUOUS_ATTRIB,
     C2_KEYS,
     DISCARDED,
     PENDING,
@@ -80,6 +81,7 @@ from app.services.providers.withings.measure_groups import (
     representative_grpid,
     session_device,
     session_device_column,
+    session_status,
 )
 from app.services.providers.withings.sdk_devices import sync_devices_from_withings
 from app.utils.sentry_helpers import log_and_capture_error
@@ -154,15 +156,18 @@ def _eligible(group: ParsedGroup, cutoff: datetime) -> bool:
 
 
 _C2_TYPE_IDS = [get_series_type_id(series) for series in C2_KEYS]
+_C2_KEY_BY_TYPE_ID = {get_series_type_id(series): key for series, key in C2_KEYS.items()}
+
+
+def _session_key(group: ParsedGroup) -> tuple[str | None, datetime]:
+    return session_device(group.hash_device_id, group.device_id), group.measured_at
 
 
 def _sessions(groups: list[ParsedGroup]) -> list[ParsedGroup]:
     """One group per session, in batch order: the representative, carrying the union of the C2 keys."""
     by_session: dict[tuple[str | None, datetime], list[ParsedGroup]] = {}
     for group in groups:
-        by_session.setdefault((session_device(group.hash_device_id, group.device_id), group.measured_at), []).append(
-            group
-        )
+        by_session.setdefault(_session_key(group), []).append(group)
     out = []
     for members in by_session.values():
         rep_grpid = representative_grpid({g.grpid: WEIGHT_KEY in g.metric_keys for g in members})
@@ -302,8 +307,7 @@ def plan_for_connection(
     ``select_sessions(connection, cutoff)`` picks the sessions to announce (the caller owns which
     groups are in scope and what already counts as announced). Returns None when the connection is
     gone, has no Robin id to address the event to (contract C3: no id, no event), or nothing was
-    selected. ``decide_reading_events`` uses it; Task 8's ``decide_tagged_device`` reuses it rather
-    than repeating the block.
+    selected. ``decide_reading_events`` and ``decide_tagged_device`` both use it.
     """
     connection = UserConnectionRepository().get(db, user_connection_id)
     if connection is None:
@@ -373,6 +377,102 @@ def decide_reading_events(
             logger,
             "Withings reading event decision failed",
             extra={"provider": "withings", "user_connection_id": str(user_connection_id)},
+        )
+        return None
+
+
+def _stored_groups(db: DbSession, user_id: UUID, records: list[WithingsMeasureGroupRecord]) -> list[ParsedGroup]:
+    """``records`` as an ingest parsed them, with the C2 keys read back from their samples.
+
+    Samples join back by ``external_id = grpid`` on the member's Withings data source AND the group's
+    time, exactly as ``readings._metrics`` does, so a colliding grpid of another weigh-in adds nothing.
+    A pending or discarded group has no samples, so it gets no keys (and ``_eligible`` refuses it).
+    """
+    times = {r.grpid: r.measured_at for r in records}
+    found: set[tuple[str, int]] = set()
+    if times:
+        rows = (
+            db.query(
+                DataPointSeries.external_id, DataPointSeries.series_type_definition_id, DataPointSeries.recorded_at
+            )
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == ProviderName.WITHINGS,
+                DataPointSeries.external_id.in_(list(times)),
+                DataPointSeries.series_type_definition_id.in_(_C2_TYPE_IDS),
+                DataPointSeries.recorded_at.in_(set(times.values())),
+            )
+        )
+        found = {
+            (grpid, type_id)
+            for grpid, type_id, recorded_at in rows
+            if grpid is not None and grpid in times and recorded_at == times[grpid]
+        }
+    return [
+        ParsedGroup(
+            grpid=record.grpid,
+            device_id=record.device_id,
+            model=record.model,
+            attrib=record.attrib,
+            measured_at=record.measured_at,
+            metric_keys=tuple(key for type_id, key in _C2_KEY_BY_TYPE_ID.items() if (record.grpid, type_id) in found),
+            hash_device_id=record.hash_device_id,
+            status=session_status([record.status]),
+        )
+        for record in records
+    ]
+
+
+def decide_tagged_device(
+    db: DbSession, *, device: WithingsDevice, now: datetime | None = None
+) -> ReadingEventPlan | None:
+    """The weigh-ins a device's FIRST order tag makes announceable on the member's own account (spec O3, C2).
+
+    Before the tag the device was not one Robin sold, so no ingest announced any of its weigh-ins; this
+    decides them now with the ingest's own rules (``_eligible``: device-captured, not manual, not
+    discarded, a C2 metric, within ``robin_reading_event_max_age_hours``), one event per session.
+    Decision D-c: a session with ANY ambiguous (``attrib 1``) group is never announced, not even its
+    unambiguous siblings — an unconfirmed weigh-in is never pushed as the member's own.
+
+    No ``_announced_earlier``: nothing of an untagged device on a self-linked connection was ever
+    announced, and the only caller (``device_tagging.set_order_ref``) calls this for a first tag only,
+    after the tag is written and before its commit, holding the connection's exclusive tag lock — so no
+    ingest decides beside it, and every ingest after it sees these sessions as decided.
+
+    Database reads only; no commit. Never raises: a failure is captured (Sentry), the savepoint rolled
+    back, and None returned — the tag still commits, those weigh-ins simply get no push.
+    """
+    connection_id = device.user_connection_id
+    if not is_enabled():
+        return None
+    try:
+        with db.begin_nested():
+
+            def _untold(connection: UserConnection, cutoff: datetime) -> list[ParsedGroup]:
+                keys = [key for key in (device.hash_device_id, device.device_id) if key]
+                record = WithingsMeasureGroupRecord
+                rows = (
+                    db.query(record)
+                    .filter(
+                        record.user_connection_id == connection_id,
+                        record.measured_at >= cutoff,
+                        or_(record.hash_device_id.in_(keys), record.device_id.in_(keys)),
+                    )
+                    .order_by(record.measured_at.asc(), record.grpid.asc())
+                    .all()
+                )
+                groups = _stored_groups(db, connection.user_id, rows)
+                ambiguous = {_session_key(g) for g in groups if g.attrib == AMBIGUOUS_ATTRIB}
+                return _sessions([g for g in groups if _eligible(g, cutoff) and _session_key(g) not in ambiguous])
+
+            return plan_for_connection(db, user_connection_id=connection_id, now=now, select_sessions=_untold)
+    except Exception as e:
+        log_and_capture_error(
+            e,
+            logger,
+            "Withings reading event re-decision after tagging failed",
+            extra={"provider": "withings", "user_connection_id": str(connection_id)},
         )
         return None
 

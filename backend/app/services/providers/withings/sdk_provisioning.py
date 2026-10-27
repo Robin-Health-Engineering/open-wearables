@@ -247,8 +247,8 @@ def _store_provisioned_account(
         existing.scope = tokens.scope
         # REVOKED is an ORDINARY state on this path, not an exotic one. A member who disconnected
         # a device and then ordered another comes back to the same Withings account, and
-        # `_revoke_local_connections` revokes EVERY Withings connection a member has when Withings
-        # revoke upstream. Leaving the row revoked while writing live tokens onto it is incoherent
+        # `_revoke_local_connections` revokes the connection holding this account when Withings
+        # revoke it upstream (appli 46). Leaving the row revoked while writing live tokens onto it is incoherent
         # and silent: `active_withings_connections` filters on ACTIVE, so the new device is
         # invisible to sync AND to `end_program` — the one with a SIM billing every month — while
         # the route answers 201 and the parcel ships. `ensure_sdk_connection` and `base_oauth`
