@@ -477,8 +477,11 @@ def _refuse_if_already_placed(refs: list[str], *, client_id: str, client_secret:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ALREADY_PLACED)
 
 
-def _order_failure_detail(e: WithingsDropshipmentError) -> str:
-    """The 502 detail for a failed order call, the same on both order routes (contract C1).
+def _order_failure_detail(e: WithingsDropshipmentError, *, order: str) -> str:
+    """The 502 detail for a failed order call, shaped the same on both order routes (contract C1).
+
+    ``order`` names what was ordered — "cellular order" or "order" — so a Body Comp failure is not
+    reported, and triaged, as a cellular one.
 
     NEVER the upstream body: it answers a signed payload carrying the member's home address.
     `withings_status` is set only on a non-zero envelope; otherwise the exception's own message, which
@@ -486,8 +489,8 @@ def _order_failure_detail(e: WithingsDropshipmentError) -> str:
     codebase writes (dropshipment.py and sdk_provisioning.py) — keep that invariant when adding a raise.
     """
     if e.withings_status is not None:
-        return f"Withings declined the cellular order (status={e.withings_status})"
-    return f"Withings cellular order failed: {e}"
+        return f"Withings declined the {order} (status={e.withings_status})"
+    return f"Withings {order} failed: {e}"
 
 
 @router.post(
@@ -631,7 +634,9 @@ def create_withings_cellular_order(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account already exists for this external_id; the order was already placed",
             ) from e
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e)) from e
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="cellular order")
+        ) from e
 
     if not result.account.csrf_token:
         # Same invariant as the SDK route, and worse to discover late here: the order is already
@@ -739,7 +744,9 @@ def create_withings_order(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except WithingsDropshipmentError as e:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e)) from e
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="order")
+        ) from e
 
     # Never raises: the order exists by now (see `_fill_missing_order_ids`).
     _fill_missing_order_ids(orders, refs, client_id=client_id, client_secret=client_secret)

@@ -1298,7 +1298,7 @@ class TestNoAccountOrderRoute:
             response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
 
         assert response.status_code == 502
-        assert response.json()["detail"] == "Withings declined the cellular order (status=503)"
+        assert response.json()["detail"] == "Withings declined the order (status=503)"
         assert "Via Roma" not in response.text
 
     def test_a_transport_failure_is_502_with_this_codebases_own_message(
@@ -1308,7 +1308,7 @@ class TestNoAccountOrderRoute:
             response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
 
         assert response.status_code == 502
-        assert response.json()["detail"] == "Withings cellular order failed: Withings createorder request failed"
+        assert response.json()["detail"] == "Withings order failed: Withings createorder request failed"
 
     def test_400_when_no_order_is_attached(
         self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
