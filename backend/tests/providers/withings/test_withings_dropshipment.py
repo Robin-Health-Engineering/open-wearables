@@ -19,18 +19,21 @@ Withings has actually given us.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from app.schemas.providers.withings.dropshipment import (
     DropshipAddress,
     DropshipOrder,
+    DropshipOrderResult,
     DropshipProduct,
     DropshipUserOrder,
 )
-from app.services.providers.withings.dropshipment import WithingsDropshipmentError, create_user_order
+from app.services.providers.withings.dropshipment import WithingsDropshipmentError, create_order, create_user_order
 
 _POST = "app.services.providers.withings.dropshipment.httpx.post"
 _SIGN = "app.services.providers.withings.dropshipment.sign_payload"
@@ -288,6 +291,14 @@ class TestTheResponse:
         with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
             _call(post)
 
+    def test_a_non_list_orders_value_raises_this_modules_error_not_a_type_error(self) -> None:
+        post = MagicMock(
+            return_value=_ok({"user": {"code": "auth-code", "external_id": "profile-1#order-1"}, "orders": 5})
+        )
+
+        with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
+            _call(post)
+
     def test_a_success_with_no_code_raises_rather_than_returning_half_a_result(self) -> None:
         # status 0 and no code is a contract change, and a dangerous one: the account and the
         # order may both exist upstream.
@@ -308,3 +319,140 @@ class TestTheResponse:
 
         assert "Via Roma" not in str(exc.value)
         assert "HTTP 400" in str(exc.value)
+
+
+def _placed(orders: list[Any] | None = None, *, status: int = 0, error: str | None = None) -> MagicMock:
+    """A createorder answer. Nobody has seen a live one: the order entry is modelled on getdetail's."""
+    envelope: dict[str, Any] = {
+        "status": status,
+        "body": {
+            "orders": orders
+            if orders is not None
+            else [{"order_id": "D0820094", "customer_ref_id": "order-1", "status": "VERIFIED"}]
+        },
+    }
+    if error is not None:
+        envelope["error"] = error
+    response = MagicMock()
+    response.json.return_value = envelope
+    response.raise_for_status.return_value = None
+    return response
+
+
+def _create(post: Any, **overrides: Any) -> list[DropshipOrderResult]:
+    kwargs: dict[str, Any] = {
+        "client_id": "client-id",
+        "client_secret": "client-secret",
+        "orders": [_order()],
+        "api_base_url": "https://wbsapi.example.net",
+    }
+    kwargs.update(overrides)
+    with (
+        patch(_SIGN, side_effect=lambda payload, *_a, **_k: {**payload, "signature": "sig", "nonce": "n"}),
+        patch(_SLOT),
+        patch(_POST, post),
+    ):
+        return create_order(**kwargs)
+
+
+class TestCreateOrder:
+    """``createorder``: the parcel and nothing else — no account, no profile, no code (spec O1)."""
+
+    def test_a_non_list_orders_value_raises_this_modules_error_not_a_type_error(self) -> None:
+        post = MagicMock(return_value=_ok({"orders": 5}))
+
+        with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
+            _create(post)
+
+    def test_posts_a_signed_createorder_with_the_order_block_and_no_profile(self) -> None:
+        post = MagicMock(return_value=_placed())
+
+        _create(post)
+
+        assert post.call_args.args[0] == "https://wbsapi.example.net/v2/dropshipment"
+        sent = post.call_args.kwargs["data"]
+        assert sent["action"] == "createorder"
+        assert sent["signature"] == "sig"
+        order = json.loads(sent["order"])
+        assert [o["customer_ref_id"] for o in order] == ["order-1"]
+        assert order[0]["products"] == [{"quantity": 1, "ean": "3700546705526"}]
+        assert order[0]["address"]["country"] == "IT"
+        for profile_field in ("email", "shortname", "birthdate", "external_id", "unit_pref", "measures", "testmode"):
+            assert profile_field not in sent
+        assert "client_secret" not in sent
+
+    def test_testmode_is_sent_only_when_asked(self) -> None:
+        post = MagicMock(return_value=_placed())
+
+        _create(post, testmode=True)
+
+        assert post.call_args.kwargs["data"]["testmode"] == "1"
+
+    @pytest.mark.parametrize(
+        ("entry", "expected"),
+        [
+            ({"orderid": "D1"}, "D1"),
+            ({"order_id": "D1"}, "D1"),
+            ({"order_id": 820094}, "820094"),
+        ],
+    )
+    def test_the_order_id_comes_back_as_orderid_whichever_key_withings_used(
+        self, entry: dict[str, Any], expected: str
+    ) -> None:
+        # createuserorder answers `orderid`, getdetail `order_id`; the caller reads `orderid`. A number
+        # must not become "an unreadable order" after the parcel is placed.
+        post = MagicMock(return_value=_placed([{**entry, "customer_ref_id": "order-1", "status": "VERIFIED"}]))
+
+        (result,) = _create(post)
+
+        assert result.orderid == expected
+
+    def test_an_acknowledged_order_without_an_id_comes_back_with_a_null_id(self) -> None:
+        # The 2026-09-16 createuserorder shape, expected here too: status 0, a real order, no id.
+        # The route resolves it from getdetail; the service must not invent or refuse it.
+        post = MagicMock(return_value=_placed([{"customer_ref_id": "order-1", "status": "VERIFIED"}]))
+
+        (result,) = _create(post)
+
+        assert result.orderid is None
+        assert result.status == "VERIFIED"
+
+    def test_a_503_carries_withings_reason_and_status_but_never_the_body(self) -> None:
+        post = MagicMock(return_value=_placed([], status=503, error="Invalid Params: invalid ean"))
+
+        with pytest.raises(WithingsDropshipmentError) as exc:
+            _create(post)
+
+        assert exc.value.withings_status == 503
+        assert exc.value.upstream_reason == "Invalid Params: invalid ean"
+        assert str(exc.value) == "Withings createorder failed (status=503)"
+
+    def test_an_http_error_never_puts_the_body_in_the_error(self) -> None:
+        response = MagicMock(status_code=400, text="invalid address: Via Roma 1, Milano")
+        post = MagicMock(side_effect=httpx.HTTPStatusError("boom", request=MagicMock(), response=response))
+
+        with pytest.raises(WithingsDropshipmentError) as exc:
+            _create(post)
+
+        assert "Via Roma" not in str(exc.value)
+        assert "HTTP 400" in str(exc.value)
+
+    def test_a_success_that_acknowledged_no_orders_raises(self) -> None:
+        post = MagicMock(return_value=_placed([]))
+
+        with pytest.raises(WithingsDropshipmentError, match="no orders"):
+            _create(post)
+
+    def test_an_unreadable_order_raises_this_modules_error_not_a_pydantic_one(self) -> None:
+        post = MagicMock(return_value=_placed(["D1"]))
+
+        with pytest.raises(WithingsDropshipmentError, match="unreadable order"):
+            _create(post)
+
+    def test_an_empty_order_list_is_refused_before_any_request(self) -> None:
+        post = MagicMock()
+
+        with pytest.raises(ValueError, match="at least one order"):
+            _create(post, orders=[])
+
+        post.assert_not_called()

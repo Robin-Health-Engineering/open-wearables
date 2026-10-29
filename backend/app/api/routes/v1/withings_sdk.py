@@ -26,7 +26,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_serializer
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_serializer, model_validator
 
 from app.config import settings
 from app.database import DbSession
@@ -41,7 +41,8 @@ from app.services.api_key_service import ApiKeyDep
 from app.services.providers.api_client import _get_valid_token
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.withings.attribution import DiscardResult, confirm_reading, discard_reading
-from app.services.providers.withings.dropshipment import WithingsDropshipmentError
+from app.services.providers.withings.device_tagging import set_order_ref
+from app.services.providers.withings.dropshipment import WithingsDropshipmentError, create_order
 from app.services.providers.withings.measure_groups import ReadingStatus
 from app.services.providers.withings.order_detail import WithingsOrderDetailError, get_order_detail
 from app.services.providers.withings.readings import (
@@ -55,7 +56,6 @@ from app.services.providers.withings.sdk_devices import (
     list_devices,
     mark_dissociated,
     record_installed_device,
-    set_order_ref,
     sync_devices_from_withings,
 )
 from app.services.providers.withings.sdk_provisioning import (
@@ -441,6 +441,58 @@ def _fill_missing_order_ids(
     )
 
 
+_ALREADY_PLACED = "Withings already hold an order for this customer_ref_id; it was already placed"
+
+
+def _refuse_if_already_placed(refs: list[str], *, client_id: str, client_secret: str, label: str) -> None:
+    """PRE-FLIGHT for every route that places a Withings order: 409 when Withings already hold one of ``refs``.
+
+    One signed round trip against the authority, and the difference between a retry costing a round
+    trip and a retry costing a second parcel: robin-backend retries its fulfiller after a timeout with
+    the same ``customer_ref_id``, and neither ``createuserorder`` nor ``createorder`` is idempotent.
+
+    It is NOT best-effort. "We could not find out whether this order exists" and "this order does not
+    exist" are different facts, and treating the first as the second is precisely how a retry ships
+    twice — so every failure REFUSES, and only an empty answer falls through. The refusal is not always
+    this 502: `acquire_request_slot()` sits outside `get_order_detail`'s try, so an exhausted shared
+    Withings budget escapes as 429 and an unreachable Redis as 503. Nothing degrades to "no order, ship
+    it". 502 rather than 409 because getdetail changes nothing at Withings: this one IS safe to retry.
+
+    A TOCTOU narrowing, not a fix: two SIMULTANEOUS requests can both see "no order" and both ship.
+    """
+    try:
+        placed = get_order_detail(client_id=client_id, client_secret=client_secret, customer_ref_ids=refs)
+    except WithingsOrderDetailError as e:
+        # Every `detail=` handed to a WithingsOrderDetailError is a fixed string this codebase writes.
+        logger.error(
+            f"{label}: could not check whether the order was already placed",
+            extra={"withings_status": e.withings_status, "reason": str(e)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not verify with Withings whether this order was already placed",
+        ) from e
+    if placed:
+        logger.error(f"{label}: an order already exists for this customer_ref_id", extra={"order_count": len(placed)})
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ALREADY_PLACED)
+
+
+def _order_failure_detail(e: WithingsDropshipmentError, *, order: str) -> str:
+    """The 502 detail for a failed order call, shaped the same on both order routes (contract C1).
+
+    ``order`` names what was ordered — "cellular order" or "order" — so a Body Comp failure is not
+    reported, and triaged, as a cellular one.
+
+    NEVER the upstream body: it answers a signed payload carrying the member's home address.
+    `withings_status` is set only on a non-zero envelope; otherwise the exception's own message, which
+    is safe to echo because every `detail=` handed to WithingsDropshipmentError is a fixed string this
+    codebase writes (dropshipment.py and sdk_provisioning.py) — keep that invariant when adding a raise.
+    """
+    if e.withings_status is not None:
+        return f"Withings declined the {order} (status={e.withings_status})"
+    return f"Withings {order} failed: {e}"
+
+
 @router.post(
     "/withings/cellular/orders",
     summary="Create a Withings account and ship a cellular device to the member",
@@ -505,52 +557,14 @@ def create_withings_cellular_order(
             detail="Withings credentials are not configured on this deployment",
         )
 
-    # PRE-FLIGHT, before any Withings call — see the docstring. One signed round trip against the
-    # authority, and it is the difference between a retry costing a round trip and a retry costing
-    # a second parcel.
-    #
-    # It is NOT best-effort. "We could not find out whether this order exists" and "this order
-    # does not exist" are different facts, and treating the first as the second is precisely how a
-    # retry ships twice — so every failure REFUSES, and only an empty answer falls through.
-    #
-    # The refusal is not always this 502, and the difference is worth knowing when reading logs:
-    # `acquire_request_slot()` sits outside `get_order_detail`'s try, so an exhausted shared
-    # Withings budget escapes as 429 and an unreachable Redis as 503, neither reaching the handler
-    # below. Three answers, one property — nothing degrades to "no order, ship it". The 429 is not
-    # hypothetical now that the pre-flight spends a slot on every fulfilment (Lucas, #13).
-    #
-    # 502 rather than 409 because getdetail changes nothing at Withings: this one IS safe to
-    # retry, which is the opposite of a 502 from the order call itself.
+    # PRE-FLIGHT, before any Withings call — see the docstring and `_refuse_if_already_placed`.
     refs = [order.customer_ref_id for order in payload.orders]
-    try:
-        placed = get_order_detail(
-            client_id=settings.withings_client_id,
-            client_secret=settings.withings_client_secret.get_secret_value(),
-            customer_ref_ids=refs,
-        )
-    except WithingsOrderDetailError as e:
-        # `withings_status` is None for everything except a non-zero Withings envelope — the HTTP
-        # and transport branches construct the error with `detail=` only — so the message is
-        # carried too rather than leaving an uninformative line at the place someone looks first.
-        # It is safe to echo for the reason audited on the branch below: every `detail=` handed to
-        # a WithingsOrderDetailError is a fixed string this codebase writes, never a response body.
-        logger.error(
-            "Withings cellular order: could not check whether the order was already placed",
-            extra={"withings_status": e.withings_status, "reason": str(e)},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not verify with Withings whether this order was already placed",
-        ) from e
-    if placed:
-        logger.error(
-            "Withings cellular order: an order already exists for this customer_ref_id",
-            extra={"order_count": len(placed)},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Withings already hold an order for this customer_ref_id; it was already placed",
-        )
+    _refuse_if_already_placed(
+        refs,
+        client_id=settings.withings_client_id,
+        client_secret=settings.withings_client_secret.get_secret_value(),
+        label="Withings cellular order",
+    )
 
     try:
         result = provision_cellular_order(
@@ -620,26 +634,9 @@ def create_withings_cellular_order(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account already exists for this external_id; the order was already placed",
             ) from e
-        # NEVER the upstream body. It answers a signed payload that, on this route, carries the
-        # member's home address as well as their email, birth date and weight.
-        #
-        # `withings_status` is set only on the non-zero-envelope branch (dropshipment.py:199); the
-        # HTTPStatusError branch and the four detail-only raises leave it None, and
-        # "status=None" reads as though Withings answered without a status rather than as a
-        # transport or contract failure. Fall back to the exception's own message (Lucas, #12).
-        #
-        # Safe to echo, and audited rather than assumed: every `detail=` handed to
-        # WithingsDropshipmentError is a fixed string this codebase writes — the six raises in
-        # dropshipment.py (lines 169, 180, 185, 207, 246, 254) plus the store failure in
-        # sdk_provisioning.py. None interpolates a response body or a payload field. A future
-        # `detail=f"...{response.text}"` would turn this line into the leak the 277 branch exists
-        # to prevent, so keep that invariant when adding a raise.
-        detail = (
-            f"Withings declined the cellular order (status={e.withings_status})"
-            if e.withings_status is not None
-            else f"Withings cellular order failed: {e}"
-        )
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from e
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="cellular order")
+        ) from e
 
     if not result.account.csrf_token:
         # Same invariant as the SDK route, and worse to discover late here: the order is already
@@ -676,6 +673,84 @@ def create_withings_cellular_order(
         csrf_token=result.account.csrf_token,
         orders=result.orders,
     )
+
+
+class NoAccountOrderRequest(BaseModel):
+    """What robin-backend sends to ship a device that needs NO Withings account (contract C1).
+
+    Only the parcel: no profile, no ``user_id``, no ``external_id``, no ``unit_pref``. The member sets
+    the device up on their own Withings account in Health Mate and links that account to Robin later,
+    through the ordinary consumer OAuth. Unknown fields are ignored, never used.
+    """
+
+    # ``min_length=1``: an order call with nothing in it ships nothing and answers 0.
+    orders: list[DropshipOrder] = Field(min_length=1)
+    # Places a real order against Withings without shipping hardware.
+    testmode: bool = False
+
+    @model_validator(mode="after")
+    def _one_order_per_customer_ref_id(self) -> "NoAccountOrderRequest":
+        refs = [order.customer_ref_id for order in self.orders]
+        if len(set(refs)) != len(refs):
+            # customer_ref_id is the join to robin-backend's order row, the pre-flight's key and the
+            # id resolve's key: two parcels under one ref could never be told apart again.
+            raise ValueError("every order needs its own customer_ref_id")
+        return self
+
+
+class NoAccountOrderResponse(BaseModel):
+    """The orders as Withings acknowledged them, ids filled from getdetail where Withings sent none."""
+
+    orders: list[DropshipOrderResult]
+
+
+@router.post(
+    "/withings/orders",
+    summary="Ship a Withings device without creating a Withings account",
+    tags=["External: Providers"],
+)
+def create_withings_order(
+    payload: NoAccountOrderRequest,
+    _caller: ApiKeyDep,
+) -> NoAccountOrderResponse:
+    """Place a ``createorder`` dropshipment: a parcel and nothing else (spec O1, contract C1).
+
+    For the non-cellular Body Comp. No account is created, no connection or ``withings_sdk_account`` is
+    written, and nothing is stored: the orders go back to robin-backend, which owns shipment state.
+    Answers 200, not the cellular route's 201, because contract C1 says so and nothing is created here.
+
+    Same caller, same authority and the same retry hazard as ``POST /withings/cellular/orders`` (see its
+    docstring): any principal ``ApiKeyDep`` admits can spend money and pick the address, and a 409 means
+    Withings already hold an order under this ``customer_ref_id`` — reconcile, do not retry.
+    """
+    if not settings.withings_client_id or not settings.withings_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Withings credentials are not configured on this deployment",
+        )
+    client_id = settings.withings_client_id
+    client_secret = settings.withings_client_secret.get_secret_value()
+
+    refs = [order.customer_ref_id for order in payload.orders]
+    _refuse_if_already_placed(refs, client_id=client_id, client_secret=client_secret, label="Withings order")
+
+    try:
+        orders = create_order(
+            client_id=client_id,
+            client_secret=client_secret,
+            orders=payload.orders,
+            testmode=payload.testmode,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except WithingsDropshipmentError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="order")
+        ) from e
+
+    # Never raises: the order exists by now (see `_fill_missing_order_ids`).
+    _fill_missing_order_ids(orders, refs, client_id=client_id, client_secret=client_secret)
+    return NoAccountOrderResponse(orders=orders)
 
 
 class CellularOrderDetailResponse(BaseModel):
@@ -1026,11 +1101,15 @@ def set_withings_device_order_ref(
     db: DbSession,
     _caller: ApiKeyDep,
 ) -> SdkDeviceResponse:
-    """Idempotent. 404 unless the device is on one of this member's Withings accounts.
+    """Idempotent. 404 unless the device is on one of this member's ACTIVE Withings accounts (contract C2).
 
-    A different ``order_ref`` than the one held overwrites it: Robin is the authority on orders.
+    Any of them: an account we provisioned, or the member's own holding the scale they bought. A
+    different ``order_ref`` than the one held overwrites it: Robin is the authority on orders. The
+    first tag of a device on the member's own account announces its weigh-ins of the last
+    ``robin_reading_event_max_age_hours`` (``device_tagging``).
     """
-    device = set_order_ref(db, user_id=user_id, device_id=device_id, order_ref=payload.order_ref)
+    strategy = ProviderFactory().get_provider(ProviderName.WITHINGS.value)
+    device = set_order_ref(db, user_id=user_id, device_id=device_id, order_ref=payload.order_ref, oauth=strategy.oauth)
     if device is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such device for this member")
     return SdkDeviceResponse.of(device)

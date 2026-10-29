@@ -12,9 +12,10 @@ from sqlalchemy.orm import Session
 from app.models import WithingsMeasureGroupRecord
 from app.services.providers.withings.data_247 import raw_group
 from tests.factories import UserConnectionFactory, UserFactory
-from tests.providers.withings.conftest import ProvisionedConnectionMaker
+from tests.providers.withings.conftest import ProvisionedConnectionMaker, add_device, self_linked_connection
 from tests.providers.withings.weigh_ins import (
     BODY_GRPID,
+    HASH,
     PULSE_GRPID,
     SEND,
     body_group,
@@ -159,3 +160,35 @@ def test_raw_group_keeps_the_groups_own_timezone_and_fills_only_a_missing_one() 
     assert raw_group({"date": 1}, "America/New_York") == {"date": 1, "timezone": "America/New_York"}
     assert raw_group({"date": 1, "timezone": ""}, "UTC") == {"date": 1, "timezone": "UTC"}
     assert raw_group({"date": 1}, None) == {"date": 1}
+
+
+def test_ambiguous_on_the_sold_scale_of_a_self_linked_account_is_held_and_announced_pending(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 2026-10-27 O2: the Body Comp on the member's own account gets the "È tua?" hold."""
+    enable_events(monkeypatch)
+    user, own = self_linked_connection(db, external_user_id="cp-bodycomp-2")
+    add_device(db, own, "bodycomp-1", hash_device_id=HASH, order_ref="ORDER-1")
+    at = recent()
+    with patch(SEND) as send:
+        save(db, user.id, own.id, [body_group(at), pulse_group(at)])
+    assert samples_at(db, user.id, at) == []
+    assert {r.status for r in records(db, own.id).values()} == {"pending"}
+    (call,) = send.call_args_list
+    assert call.kwargs["args"][0]["pending"] is True
+    assert call.kwargs["args"][0]["external_user_id"] == "cp-bodycomp-2"
+
+
+def test_ambiguous_on_an_unsold_scale_beside_a_sold_one_is_registered_and_silent(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    enable_events(monkeypatch)
+    user, own = self_linked_connection(db, external_user_id="cp-bodycomp-3")
+    add_device(db, own, "bodycomp-1", hash_device_id=HASH, order_ref="ORDER-1")
+    at = recent()
+    family = body_group(at, grpid=8530400001, hash_deviceid="family-hash", deviceid=777)
+    with patch(SEND) as send:
+        save(db, user.id, own.id, [family])
+    assert records(db, own.id)["8530400001"].status == "registered"
+    assert len(samples_at(db, user.id, at)) == 4
+    send.assert_not_called()

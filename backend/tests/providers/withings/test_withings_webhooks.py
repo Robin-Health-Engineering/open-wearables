@@ -7,11 +7,13 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from pydantic import SecretStr
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.repositories.data_point_series_repository import WriteCounts
-from app.schemas.auth import LiveSyncMode
+from app.schemas.auth import ConnectionStatus, LiveSyncMode
 from app.services.providers.withings.webhook_handler import WithingsWebhookHandler
+from tests.providers.withings.conftest import ProvisionedConnectionMaker, self_linked_connection
 
 _CALLBACK_TOKEN = "withings-test-token"
 
@@ -480,14 +482,15 @@ def test_process_payload_revokes_connections_on_delete_or_unlink(mock_revoked: M
     user_id = uuid4()
     connection = MagicMock(user_id=user_id, updated_at=datetime.now(timezone.utc))
     h.connection_repo.get_all_by_provider_user_id.return_value = [connection]
-    h.connection_repo.disconnect.return_value = 1
+    h.connection_repo.disconnect_connection.return_value = 1
     payload = {"userid": "123", "appli": "46", "action": action}
     result = h.process_payload(MagicMock(), payload, "trace-1")
     assert result["status"] == "revoked"
     assert result["action"] == action
     assert result["withings_user_id"] == "123"
     assert result["user_ids"] == [str(user_id)]
-    h.connection_repo.disconnect.assert_called_once_with(ANY, user_id, "withings")
+    h.connection_repo.disconnect_connection.assert_called_once_with(ANY, connection)
+    h.connection_repo.disconnect.assert_not_called()
     mock_revoked.assert_called_once()
     assert mock_revoked.call_args.kwargs["reason"] == f"provider_{action}"
 
@@ -498,12 +501,12 @@ def test_process_payload_revokes_every_connection_for_multi_account_fanout() -> 
     h.connection_repo.get_all_by_provider_user_id.return_value = [
         MagicMock(user_id=uid, updated_at=datetime.now(timezone.utc)) for uid in user_ids
     ]
-    h.connection_repo.disconnect.return_value = 1
+    h.connection_repo.disconnect_connection.return_value = 1
     payload = {"userid": "123", "appli": "46", "action": "unlink"}
     result = h.process_payload(MagicMock(), payload, "trace-1")
     assert result["status"] == "revoked"
     assert set(result["user_ids"]) == {str(uid) for uid in user_ids}
-    assert h.connection_repo.disconnect.call_count == 2
+    assert h.connection_repo.disconnect_connection.call_count == 2
 
 
 def test_process_payload_profile_change_unknown_user_is_reported() -> None:
@@ -513,7 +516,7 @@ def test_process_payload_profile_change_unknown_user_is_reported() -> None:
     result = h.process_payload(MagicMock(), payload, "trace-1")
     assert result["status"] == "user_not_found"
     assert result["withings_user_id"] == "999"
-    h.connection_repo.disconnect.assert_not_called()
+    h.connection_repo.disconnect_connection.assert_not_called()
 
 
 def test_process_payload_ignores_profile_change_update() -> None:
@@ -522,7 +525,7 @@ def test_process_payload_ignores_profile_change_update() -> None:
     result = h.process_payload(MagicMock(), payload, "trace-1")
     assert result["status"] == "ignored"
     assert result["reason"] == "profile_change"
-    h.connection_repo.disconnect.assert_not_called()
+    h.connection_repo.disconnect_connection.assert_not_called()
 
 
 def test_process_payload_fetches_with_the_notified_connection() -> None:
@@ -550,3 +553,30 @@ def test_process_payload_syncs_sleep_and_activity_with_the_notified_connection()
     assert h.data_247.save_sleep.call_args.kwargs["connection_id"] == connection.id
     assert h.data_247.save_activity.call_args.kwargs["connection_id"] == connection.id
     assert h.workouts.load_data.call_args.kwargs["connection_id"] == connection.id
+
+
+def test_an_unlink_revokes_only_the_notified_account_not_the_members_other_withings_connection(
+    db: Session, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    """Spec O5: appli 46 on ONE Withings account used to revoke every Withings connection the member held.
+
+    A cellular buyer who also linked their own account, or a Body Comp buyer with an older personal
+    account, lost the device account the moment they unlinked the other one. Real repository, real rows.
+    """
+    user, provisioned = make_provisioned_connection()
+    _, own = self_linked_connection(db, user=user)
+    handler = WithingsWebhookHandler(data_247=MagicMock(), workouts=MagicMock())
+    payload = {"userid": own.provider_user_id, "appli": "46", "action": "unlink"}
+
+    with patch("app.services.providers.withings.webhook_handler.on_connection_revoked") as revoked:
+        result = handler.process_payload(db, payload, "trace-o5")
+
+    assert result["status"] == "revoked"
+    db.refresh(own)
+    db.refresh(provisioned)
+    assert own.status == ConnectionStatus.REVOKED
+    assert own.access_token is None
+    assert provisioned.status == ConnectionStatus.ACTIVE
+    assert provisioned.access_token is not None
+    revoked.assert_called_once()
+    assert revoked.call_args.kwargs["connection_id"] == own.id

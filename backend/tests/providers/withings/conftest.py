@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.models import User, UserConnection
+from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from tests.factories import UserConnectionFactory, UserFactory
 
@@ -45,3 +46,39 @@ def make_provisioned_connection(db: Session) -> ProvisionedConnectionMaker:
         return user, connection
 
     return _make
+
+
+def self_linked_connection(
+    db: Session, *, user: User | None = None, external_user_id: str | None = None
+) -> tuple[User, UserConnection]:
+    """The member's OWN Withings account (consumer OAuth): an active connection with no withings_sdk_account row.
+
+    ``external_user_id`` is the Robin CustomerProfile id ``ensureOwUser`` writes on the OW user; it is
+    what a self-linked connection's reading event carries (contract C3). Ignored when ``user`` is given.
+    """
+    user = user or UserFactory(external_user_id=external_user_id)
+    connection = UserConnectionFactory(user=user, provider="withings", provider_user_id=f"own-{uuid4().hex[:8]}")
+    db.flush()
+    return user, connection
+
+
+def add_device(
+    db: Session,
+    connection: UserConnection,
+    device_id: str,
+    *,
+    hash_device_id: str | None = None,
+    order_ref: str | None = None,
+) -> WithingsDevice:
+    """A withings_device row on ``connection``. ``order_ref`` set makes it a device Robin SOLD (spec O2)."""
+    device = WithingsDevice(
+        id=uuid4(),
+        user_connection_id=connection.id,
+        device_id=device_id,
+        hash_device_id=hash_device_id,
+        order_ref=order_ref,
+        updated_at=_PROVISIONED_AT,
+    )
+    db.add(device)
+    db.flush()
+    return device

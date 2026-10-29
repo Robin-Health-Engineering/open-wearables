@@ -11,7 +11,7 @@ from app.schemas.auth import ConnectionStatus
 from app.services.providers.withings.attribution import DiscardResult, confirm_reading, discard_reading
 from app.services.providers.withings.readings import get_reading, list_device_readings
 from tests.factories import UserConnectionFactory
-from tests.providers.withings.conftest import ProvisionedConnectionMaker
+from tests.providers.withings.conftest import ProvisionedConnectionMaker, add_device, self_linked_connection
 from tests.providers.withings.weigh_ins import (
     BODY_GRPID,
     HASH,
@@ -270,3 +270,47 @@ def test_discard_still_finds_a_session_whose_connection_was_revoked(
     assert {r.status for r in records(db, connection.id).values()} == {"discarded"}
     # Confirm, like the list and detail, serves active connections only.
     assert confirm_reading(db, user_id=user.id, grpid=_BODY) is None
+
+
+# --- the sold device on the member's own account (spec 2026-10-27 O2, contract C4) -----------------
+
+
+def test_a_pending_weigh_in_on_a_sold_self_linked_scale_can_be_confirmed(db: Session) -> None:
+    user, own = self_linked_connection(db)
+    add_device(db, own, "bodycomp-1", hash_device_id=HASH, order_ref="ORDER-1")
+    at = recent()
+    save(db, user.id, own.id, [body_group(at), pulse_group(at)])
+    assert samples_at(db, user.id, at) == []
+
+    reading = confirm_reading(db, user_id=user.id, grpid=_PULSE)
+
+    assert reading is not None
+    assert reading.status == "registered"
+    assert len(samples_at(db, user.id, at)) == 5
+
+
+def test_a_weigh_in_on_an_unsold_device_cannot_be_confirmed_or_discarded(db: Session) -> None:
+    user, own = self_linked_connection(db)
+    add_device(db, own, "bodycomp-1", hash_device_id="bc-hash", order_ref="ORDER-1")
+    at = recent()
+    save(db, user.id, own.id, [body_group(at, attrib=0)])  # HASH: not the sold device
+
+    assert confirm_reading(db, user_id=user.id, grpid=_BODY) is None
+    assert discard_reading(db, user_id=user.id, grpid=_BODY) is None
+    assert len(samples_at(db, user.id, at)) == 4
+
+
+def test_a_discard_on_a_sold_self_linked_scale_repeats_after_the_account_is_revoked(db: Session) -> None:
+    user, own = self_linked_connection(db)
+    add_device(db, own, "bodycomp-1", hash_device_id=HASH, order_ref="ORDER-1")
+    save(db, user.id, own.id, [body_group(recent(), attrib=0)])
+
+    first = discard_reading(db, user_id=user.id, grpid=_BODY)
+    own.status = ConnectionStatus.REVOKED
+    db.commit()
+    again = discard_reading(db, user_id=user.id, grpid=_BODY)
+
+    assert first is not None
+    assert first.was == "registered"
+    assert again is not None
+    assert again.was == "discarded"

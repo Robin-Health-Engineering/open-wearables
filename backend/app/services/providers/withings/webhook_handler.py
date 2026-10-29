@@ -296,10 +296,12 @@ class WithingsWebhookHandler(BaseWebhookHandler):
     def _revoke_local_connections(
         self, db: DbSession, notification: WithingsNotification, trace_id: str
     ) -> dict[str, Any]:
-        """Revoke every local connection for this Withings account — access was lost upstream.
+        """Revoke the local connections holding THIS Withings account — access to it was lost upstream.
 
-        One Withings account can be linked to multiple OW users (multi-account
-        fan-out); all of them lose access together, so all of them are revoked.
+        One Withings account can be linked to several OW users (multi-account fan-out); each of them
+        loses this account, so each such connection is revoked. Only that connection: a member's
+        OTHER Withings accounts (their own, or one we provisioned to ship them a device) are separate
+        accounts Withings did not unlink, and revoking them too stopped their scale syncing (spec O5).
         """
         connections = self.connection_repo.get_all_by_provider_user_id(db, "withings", notification.userid)
         if not connections:
@@ -307,7 +309,7 @@ class WithingsWebhookHandler(BaseWebhookHandler):
 
         user_ids = [str(connection.user_id) for connection in connections]
         for connection in connections:
-            if self.connection_repo.disconnect(db, connection.user_id, "withings"):
+            if self.connection_repo.disconnect_connection(db, connection):
                 db.refresh(connection)
                 on_connection_revoked(
                     user_id=connection.user_id,

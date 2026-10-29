@@ -18,6 +18,7 @@ from app.models import WithingsMeasureGroupRecord
 from app.models.withings_measure_group import DISCARDED, PENDING, REGISTERED, ReadingStatus
 from app.schemas.enums import SeriesType
 from app.schemas.providers.withings import WithingsMeasureGroup
+from app.services.providers.withings.connections import RobinDeviceScope
 from app.services.providers.withings.coverage import MEASURE_TYPE_MAP
 
 # SeriesType -> the metric key Robin and the app use (spec Appendix C2). Every C2 key is producible
@@ -77,6 +78,10 @@ def session_lock_key(
     return f"withings-session|{user_connection_id}|device|{device}|{int(measured_at.timestamp())}"
 
 
+_LOCK_SHARED = text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:key, 0))")
+_LOCK_EXCLUSIVE = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
+
+
 def lock_sessions(db: DbSession, keys: Iterable[str]) -> None:
     """Take each session's transaction-scoped advisory lock; released by the caller's commit or rollback.
 
@@ -87,7 +92,29 @@ def lock_sessions(db: DbSession, keys: Iterable[str]) -> None:
     two unrelated sessions, never lets two of one through.
     """
     for key in sorted(set(keys)):
-        db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": key})
+        db.execute(_LOCK_EXCLUSIVE, {"key": key})
+
+
+def device_tags_lock_key(user_connection_id: UUID) -> str:
+    """The name of a connection's tag lock (``lock_device_tags``); the prefix keeps it apart from every session key."""
+    return f"withings-device-tags|{user_connection_id}"
+
+
+def lock_device_tags(db: DbSession, user_connection_id: UUID, *, exclusive: bool) -> None:
+    """Take the connection's tag lock until the transaction ends: SHARED by an ingest, EXCLUSIVE by a tagging.
+
+    Which devices on a connection Robin sold (``withings_device.order_ref``) decides whether an ingest
+    holds an ambiguous weigh-in and whether it announces one (spec 2026-10-27 O2). Tagging a device
+    (``device_tagging.set_order_ref``) changes that answer and re-decides the device's recent weigh-ins
+    in the same transaction. With this lock an ingest's answer cannot change while it decides, and a
+    tagging only starts once every ingest that decided without the tag has committed, so each weigh-in
+    is decided once. Ingests share it and never wait for each other.
+
+    Lock order, everywhere: tag lock first, then session locks (``lock_sessions``). A tagging takes no
+    session lock, so the two kinds of lock cannot deadlock. A tagging takes the tag lock EXCLUSIVE
+    before it writes or refreshes any ``withings_device`` row, so it reads the tag an ingest last saw.
+    """
+    db.execute(_LOCK_EXCLUSIVE if exclusive else _LOCK_SHARED, {"key": device_tags_lock_key(user_connection_id)})
 
 
 def grpid_order(grpid: str) -> tuple[int, int, str]:
@@ -102,7 +129,8 @@ def representative_grpid(grpids_with_weight: dict[str, bool]) -> str:
 
 
 # Withings ``attrib`` 1: device-captured, but the device could not tell which of its users stepped
-# on it (spec 2026-10-01 §2). On an account we provisioned such a weigh-in is held pending.
+# on it (spec 2026-10-01 §2). On a device Robin sold (any device on an account we provisioned, the
+# tagged device on the member's own) such a weigh-in is held pending.
 AMBIGUOUS_ATTRIB = 1
 
 
@@ -197,7 +225,7 @@ def record_new_groups(
     user_connection_id: UUID,
     groups: list[ParsedGroup],
     raw_by_grpid: Mapping[str, dict[str, Any]] | None = None,
-    hold_ambiguous: bool = False,
+    hold_scope: RobinDeviceScope | None = None,
 ) -> list[ParsedGroup]:
     """Insert the groups not yet recorded for this connection and return exactly those, with their status.
 
@@ -211,10 +239,12 @@ def record_new_groups(
     * a session already stored (a sibling recorded by an earlier ingest) passes its status on: a
       pulse group arriving after its pending or discarded weigh-in joins it instead of registering
       on its own;
-    * otherwise, with ``hold_ambiguous`` (the caller's "this is an account we provisioned"), a
-      session holding an ``attrib 1`` group is ``pending``, and each of its groups keeps its
-      payload from ``raw_by_grpid``, which must then hold it (``ValueError`` otherwise: a pending
-      group without its payload could never be confirmed);
+    * otherwise, when the session is on the scale Robin sold: a group ``hold_scope`` covers (an
+      account we provisioned: every device on it; the member's own account: the sold device, matched
+      by ``connections.RobinDeviceScope.covers``). A session holding an
+      ``attrib 1`` group is then ``pending``, and each of its groups keeps its payload from
+      ``raw_by_grpid``, which must then hold it (``ValueError`` otherwise: a pending group without
+      its payload could never be confirmed);
     * otherwise ``registered``.
 
     The caller holds the batch's session locks (``lock_sessions``): two ingests that each carry one
@@ -232,7 +262,8 @@ def record_new_groups(
     for (device, measured_at), members in batch.items():
         status = stored.get((device, measured_at)) if device is not None else None
         if status is None:
-            ambiguous = hold_ambiguous and any(m.attrib == AMBIGUOUS_ATTRIB for m in members)
+            sold = hold_scope is not None and any(hold_scope.covers(m.hash_device_id, m.device_id) for m in members)
+            ambiguous = sold and any(m.attrib == AMBIGUOUS_ATTRIB for m in members)
             status = PENDING if ambiguous else REGISTERED
         for member in members:
             status_by_grpid[member.grpid] = status

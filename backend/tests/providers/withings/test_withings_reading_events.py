@@ -28,7 +28,7 @@ from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.services.providers.withings import reading_events
 from app.services.providers.withings.measure_groups import ParsedGroup
 from tests.factories import DataPointSeriesFactory, DataSourceFactory, UserConnectionFactory, UserFactory
-from tests.providers.withings.conftest import ProvisionedConnectionMaker
+from tests.providers.withings.conftest import ProvisionedConnectionMaker, add_device, self_linked_connection
 from tests.providers.withings.weigh_ins import announce
 
 _NOW = datetime(2026, 9, 29, 8, 0, tzinfo=timezone.utc)
@@ -787,3 +787,70 @@ def test_an_earlier_hash_only_sibling_does_not_silence_the_weigh_in(
         n = announce(db, user_connection_id=connection.id, groups=[pulse], now=_NOW)
     assert n == 1
     assert _sent(send)[0]["grpid"] == "8530283250"
+
+
+# --- the sold device on the member's own account (spec 2026-10-27 O2, contract C3) -----------------
+
+
+def test_a_sold_device_on_a_self_linked_account_emits_for_the_members_robin_id(db: Session, enabled: None) -> None:
+    _, own = self_linked_connection(db, external_user_id="cp-self-1")
+    own.provider_user_id = "5151"
+    db.flush()
+    add_device(db, own, "dev-1", hash_device_id="hash-1", order_ref="ORDER-1")
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=own.id, groups=[_group("1")], now=_NOW)
+    assert n == 1
+    (payload,) = _sent(send)
+    assert payload["external_user_id"] == "cp-self-1"
+    assert payload["withings_user_id"] == "5151"
+    assert payload["device_id"] == "dev-1"
+    assert payload["pending"] is False
+
+
+def test_a_self_linked_account_never_announces_a_device_robin_did_not_sell(db: Session, enabled: None) -> None:
+    """The family's scale on the same Withings account: same member, same account, not ours."""
+    _, own = self_linked_connection(db, external_user_id="cp-self-1")
+    add_device(db, own, "dev-1", hash_device_id="hash-1", order_ref="ORDER-1")
+    add_device(db, own, "family-scale", hash_device_id="family-hash")
+    groups = [
+        _group("1"),
+        _group("2", device_id="family-scale", hash_device_id="family-hash", age=timedelta(minutes=6)),
+    ]
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=own.id, groups=groups, now=_NOW)
+    assert n == 1
+    assert [p["grpid"] for p in _sent(send)] == ["1"]
+
+
+def test_a_sold_device_is_recognised_by_its_hash_whatever_the_groups_deviceid(db: Session, enabled: None) -> None:
+    _, own = self_linked_connection(db, external_user_id="cp-self-1")
+    add_device(db, own, "bodycomp-hex-id", hash_device_id=_HASH, order_ref="ORDER-1")
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=own.id, groups=[_body(), _pulse()], now=_NOW)
+    assert n == 1
+    assert _sent(send)[0]["hash_deviceid"] == _HASH
+
+
+def test_a_self_linked_member_without_a_robin_id_gets_no_event(db: Session, enabled: None) -> None:
+    _, own = self_linked_connection(db, external_user_id=None)
+    add_device(db, own, "dev-1", hash_device_id="hash-1", order_ref="ORDER-1")
+    with patch(_SEND) as send:
+        n = announce(db, user_connection_id=own.id, groups=[_group("1")], now=_NOW)
+    assert n == 0
+    send.assert_not_called()
+
+
+def test_a_member_with_both_accounts_gets_each_event_under_that_accounts_id(
+    db: Session, enabled: None, make_provisioned_connection: ProvisionedConnectionMaker
+) -> None:
+    user, provisioned = make_provisioned_connection()
+    user.external_user_id = "cp-member-1"
+    _, own = self_linked_connection(db, user=user)
+    add_device(db, own, "bodycomp-1", hash_device_id="bc-hash", order_ref="ORDER-2")
+    with patch(_SEND) as send:
+        announce(db, user_connection_id=provisioned.id, groups=[_group("p1", device_id="cell-1")], now=_NOW)
+        announce(db, user_connection_id=own.id, groups=[_group("o1", device_id="bodycomp-1")], now=_NOW)
+    assert {p["grpid"]: p["external_user_id"] for p in _sent(send)} == {
+        "p1": _external_id(db, provisioned.id),
+        "o1": "cp-member-1",
+    }

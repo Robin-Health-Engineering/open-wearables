@@ -24,13 +24,19 @@ import pytest
 from sqlalchemy import Engine, delete, text
 from sqlalchemy.orm import Session
 
-from app.models import User, UserConnection, WithingsMeasureGroupRecord
+from app.models import User, UserConnection, WithingsDevice, WithingsMeasureGroupRecord
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.schemas.auth import ConnectionStatus
 from app.services.providers.withings import attribution
 from app.services.providers.withings._client import PaginatedResult
 from app.services.providers.withings.data_247 import Withings247Data
-from app.services.providers.withings.measure_groups import lock_sessions, session_lock_key
+from app.services.providers.withings.device_tagging import set_order_ref
+from app.services.providers.withings.measure_groups import (
+    device_tags_lock_key,
+    lock_device_tags,
+    lock_sessions,
+    session_lock_key,
+)
 from tests.providers.withings.conftest import ProvisionedConnectionMaker
 from tests.providers.withings.weigh_ins import (
     BODY_GRPID,
@@ -425,3 +431,72 @@ def test_confirm_discard_and_retire_wait_for_the_session_lock_an_ingest_holds(
     assert waited, f"{action} did not wait for the session lock"
     statuses = _statuses(engine, committed_member)
     assert (statuses[str(BODY_GRPID)], statuses[str(PULSE_GRPID)]) == (_AFTER[action], _AFTER[action])
+
+
+def test_an_ingest_waits_for_a_tagging_that_holds_the_connections_tag_lock(
+    engine: Engine, committed_member: Member, make_worker: Callable[..., Worker]
+) -> None:
+    """Spec O3: whether a device is sold cannot change between an ingest's hold and its decision."""
+    worker = make_worker("ingest", [body_group(recent(), attrib=0)])
+    with (
+        Session(bind=engine) as holder,
+        patch(_PAGINATE, side_effect=_rows_by_thread([worker])),
+        patch(SEND),
+    ):
+        lock_device_tags(holder, committed_member.connection_id, exclusive=True)  # what a tagging holds
+        worker.start(engine, committed_member)
+        waited = _waits_on_advisory_lock(engine, worker)
+        holder.rollback()  # the "tagging" ends
+        worker.join()
+    assert waited, "the ingest did not wait for the tag lock"
+
+
+def test_a_tagging_cannot_take_the_tag_lock_while_an_ingest_is_deciding(
+    engine: Engine, committed_member: Member, make_worker: Callable[..., Worker]
+) -> None:
+    """The ingest holds the lock SHARED from before it records until it commits."""
+    key = device_tags_lock_key(committed_member.connection_id)
+    try_lock = text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))")
+    worker = make_worker("ingest", [body_group(recent(), attrib=0)], pause_before_commit=True)
+    with patch(_PAGINATE, side_effect=_rows_by_thread([worker])), patch(SEND):
+        worker.start(engine, committed_member)
+        assert worker.paused.wait(_WAIT)  # recorded and decided, not committed
+        with Session(bind=engine) as tagger:
+            during = tagger.execute(try_lock, {"key": key}).scalar_one()
+            tagger.rollback()
+        worker.resume.set()
+        worker.join()
+        with Session(bind=engine) as tagger:
+            after = tagger.execute(try_lock, {"key": key}).scalar_one()
+            tagger.rollback()
+    assert (during, after) == (False, True)
+
+
+def test_set_order_ref_waits_for_the_tag_lock_an_ingest_holds(
+    engine: Engine, committed_member: Member, make_worker: Callable[..., Worker]
+) -> None:
+    """Spec O3, the tagging side: set_order_ref itself takes the connection's tag lock EXCLUSIVE.
+
+    The holder takes it SHARED, the way an ingest does, so this fails both if the tagging takes no
+    lock and if it takes it shared.
+    """
+    with Session(bind=engine) as s:
+        s.add(
+            WithingsDevice(
+                id=uuid4(),
+                user_connection_id=committed_member.connection_id,
+                device_id="dev-1",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        s.commit()  # removed with the member: user_connection -> withings_device is ON DELETE CASCADE
+    worker = make_worker(
+        "tag", [], job=lambda s, m: set_order_ref(s, user_id=m.user_id, device_id="dev-1", order_ref="ORDER-1")
+    )
+    with Session(bind=engine) as holder:
+        lock_device_tags(holder, committed_member.connection_id, exclusive=False)  # what an ingest holds
+        worker.start(engine, committed_member)
+        waited = _waits_on_advisory_lock(engine, worker)
+        holder.rollback()  # the "ingest" ends
+        worker.join()
+    assert waited, "set_order_ref did not wait for the tag lock"
