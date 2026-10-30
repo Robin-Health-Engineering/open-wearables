@@ -1,11 +1,14 @@
 """Tests for SDK token exchange endpoint."""
 
+from uuid import uuid4
+
 from jose import jwt
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
 from app.config import settings
 from tests.factories import ApplicationFactory, DeveloperFactory, UserFactory
+from tests.utils.auth import developer_auth_headers
 
 
 class TestCreateUserToken:
@@ -99,3 +102,32 @@ class TestCreateUserToken:
             json={},
         )
         assert response.status_code in [400, 422]
+
+    def test_create_token_unknown_user_returns_404(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+        """Valid app credentials for a non-existent user should return 404, not a FK violation 500."""
+        developer = DeveloperFactory()
+        application = ApplicationFactory(developer=developer, app_secret="test_app_secret")
+
+        user_id = uuid4()
+        response = client.post(
+            f"{api_v1_prefix}/users/{user_id}/token",
+            json={"app_id": application.app_id, "app_secret": "test_app_secret"},
+        )
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": f"User with ID: {user_id} not found."}
+
+    def test_create_token_admin_unknown_user_returns_404(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """Admin auth for a non-existent user should return 404, not a FK violation 500."""
+        developer = DeveloperFactory()
+
+        user_id = uuid4()
+        response = client.post(
+            f"{api_v1_prefix}/users/{user_id}/token",
+            headers=developer_auth_headers(developer.id),
+        )
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": f"User with ID: {user_id} not found."}

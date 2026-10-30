@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, HTTPException, status
 from app.config import settings
 from app.database import DbSession
 from app.schemas.auth import SDKTokenRequest, TokenResponse
-from app.services import application_service, create_sdk_user_token, refresh_token_service
+from app.services import application_service, create_sdk_user_token, refresh_token_service, user_service
 from app.utils.auth import DeveloperOptionalDep
 
 router = APIRouter()
@@ -41,8 +41,9 @@ def create_user_token(
         TokenResponse containing access_token, token_type, and refresh_token
 
     Raises:
-        401: If app credentials are invalid or admin auth is missing
-        400: If neither app credentials nor admin auth is provided
+        401: If app credentials are invalid
+        400: If neither valid app credentials nor a valid developer Bearer token is provided
+        404: If no user exists with the given user_id
     """
     app_id: str
 
@@ -61,6 +62,12 @@ def create_user_token(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either app credentials (app_id, app_secret) or admin authentication (Bearer token) is required",
         )
+
+    # Ensure the user exists before minting tokens; otherwise the refresh_token insert
+    # violates refresh_token_user_id_fkey and surfaces as an unhandled 500 (OW-BACKEND-N).
+    # Robin-specific divergence from upstream; keep it on rebase (move into
+    # refresh_token_service.issue_sdk_tokens if upstream's route rewrite lands).
+    user_service.get(db, user_id, raise_404=True)
 
     # Generate user-scoped SDK token
     access_token = create_sdk_user_token(
