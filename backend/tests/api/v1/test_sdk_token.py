@@ -108,12 +108,14 @@ class TestCreateUserToken:
         developer = DeveloperFactory()
         application = ApplicationFactory(developer=developer, app_secret="test_app_secret")
 
+        user_id = uuid4()
         response = client.post(
-            f"{api_v1_prefix}/users/{uuid4()}/token",
+            f"{api_v1_prefix}/users/{user_id}/token",
             json={"app_id": application.app_id, "app_secret": "test_app_secret"},
         )
 
         assert response.status_code == 404
+        assert response.json() == {"detail": f"User with ID: {user_id} not found."}
 
     def test_create_token_admin_unknown_user_returns_404(
         self, client: TestClient, db: Session, api_v1_prefix: str
@@ -121,9 +123,11 @@ class TestCreateUserToken:
         """Admin auth for a non-existent user should return 404, not a FK violation 500."""
         developer = DeveloperFactory()
 
+        user_id = uuid4()
         response = client.post(
-            f"{api_v1_prefix}/users/{uuid4()}/token",
+            f"{api_v1_prefix}/users/{user_id}/token",
             headers=developer_auth_headers(developer.id),
         )
 
         assert response.status_code == 404
+        assert response.json() == {"detail": f"User with ID: {user_id} not found."}
