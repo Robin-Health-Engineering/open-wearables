@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 import pytest
 from sqlalchemy.orm import Session
 
-from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
+from app.integrations.celery.tasks.sync_vendor_data_task import _is_sdk_only_connection, sync_vendor_data
 from app.schemas.auth import ConnectionStatus, LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.services.providers.factory import ProviderFactory
@@ -41,7 +41,12 @@ def _247_implementations() -> dict[str, type]:
 PROVIDER_247_IMPLEMENTATIONS = _247_implementations()
 
 
-def _strategy_mock(*, rest_pull: bool = True, live_sync_mode: LiveSyncMode | None = LiveSyncMode.PULL) -> MagicMock:
+def _strategy_mock(
+    *,
+    rest_pull: bool = True,
+    live_sync_mode: LiveSyncMode | None = LiveSyncMode.PULL,
+    client_sdk: bool = False,
+) -> MagicMock:
     """A strategy mock carrying the fields the periodic-pull filter reads.
 
     ``default_live_sync_mode`` has to hold a real value: a bare MagicMock is truthy, so
@@ -50,6 +55,7 @@ def _strategy_mock(*, rest_pull: bool = True, live_sync_mode: LiveSyncMode | Non
     strategy = MagicMock()
     strategy.capabilities.rest_pull = rest_pull
     strategy.capabilities.webhook_stream = False
+    strategy.capabilities.client_sdk = client_sdk
     strategy.default_live_sync_mode = live_sync_mode
     return strategy
 
@@ -526,3 +532,80 @@ class TestSync247Signatures:
             assert passed["connection_id"] == connection.id
         else:
             assert "connection_id" not in passed
+
+
+class TestSdkOnlyConnectionSkip:
+    """Hybrid providers (Google) must not REST-pull connections created by the SDK upload path."""
+
+    @pytest.mark.parametrize(
+        ("client_sdk", "access_token", "expected"),
+        [
+            (True, None, True),
+            (True, "", True),
+            (True, "token", False),
+            (False, None, False),
+            (False, "token", False),
+        ],
+    )
+    def test_is_sdk_only_connection(self, client_sdk: bool, access_token: str | None, expected: bool) -> None:
+        caps = MagicMock()
+        caps.client_sdk = client_sdk
+        connection = MagicMock()
+        connection.access_token = access_token
+        assert _is_sdk_only_connection(caps, connection) is expected
+
+    @pytest.mark.parametrize("is_historical", [False, True])
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_sdk_only_google_connection_is_not_pulled(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        is_historical: bool,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="google",
+            status=ConnectionStatus.ACTIVE,
+            access_token=None,
+            refresh_token=None,
+            token_expires_at=None,
+        )
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        mock_strategy = _strategy_mock(client_sdk=True)
+        mock_get_provider.return_value = mock_strategy
+
+        result = sync_vendor_data(str(user.id), is_historical=is_historical)
+
+        assert "google" not in result["providers_synced"]
+        mock_strategy.workouts.load_data.assert_not_called()
+        mock_strategy.data_247.load_and_save_all.assert_not_called()
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_oauth_google_connection_is_still_pulled(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="google", status=ConnectionStatus.ACTIVE)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        mock_strategy = _strategy_mock(client_sdk=True)
+        mock_strategy.workouts.load_data.return_value = True
+        mock_strategy.data_247.load_and_save_all.return_value = {}
+        mock_get_provider.return_value = mock_strategy
+
+        result = sync_vendor_data(str(user.id))
+
+        assert "google" in result["providers_synced"]
+        mock_strategy.data_247.load_and_save_all.assert_called_once()
