@@ -103,8 +103,8 @@ def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is
 def _is_sdk_only_connection(caps: Any, connection: Any) -> bool:
     """True if this connection exists only for SDK pushes and has no OAuth credentials.
 
-    Hybrid providers (Google: Health Connect SDK + Health API REST) share one connection
-    per user. A connection created by ``ensure_sdk_connection`` carries no access token,
+    Hybrid providers (Google: Health Connect SDK + Health API REST) usually share one
+    connection per user. A connection created by ``ensure_sdk_connection`` carries no access token,
     so every REST call for it would 401 — its data arrives via the SDK instead.
     """
     return bool(caps.client_sdk) and not connection.access_token
@@ -200,6 +200,9 @@ def sync_vendor_data(
 
             # SDK-only connections of hybrid providers have no OAuth token: REST pulls
             # cannot succeed for them, so skip rather than fail every data type.
+            # Robin fork only: superseded upstream by the health_connect/google_health split
+            # (the-momentum/open-wearables#1634). Drop this filter, _is_sdk_only_connection and
+            # TestSdkOnlyConnectionSkip on rebase.
             sdk_only = [c for c in connections if _is_sdk_only_connection(strategies[c.provider].capabilities, c)]
             for c in sdk_only:
                 log_structured(

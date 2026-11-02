@@ -535,7 +535,11 @@ class TestSync247Signatures:
 
 
 class TestSdkOnlyConnectionSkip:
-    """Hybrid providers (Google) must not REST-pull connections created by the SDK upload path."""
+    """Hybrid providers (Google) must not REST-pull connections created by the SDK upload path.
+
+    Robin fork only: drop on rebase onto upstream's health_connect/google_health split
+    (the-momentum/open-wearables#1634), where ``provider="google"`` no longer resolves.
+    """
 
     @pytest.mark.parametrize(
         ("client_sdk", "access_token", "expected"),
@@ -586,12 +590,14 @@ class TestSdkOnlyConnectionSkip:
         mock_strategy.workouts.load_data.assert_not_called()
         mock_strategy.data_247.load_and_save_all.assert_not_called()
 
+    @pytest.mark.parametrize("is_historical", [False, True])
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     @patch("app.services.providers.factory.ProviderFactory.get_provider")
     def test_oauth_google_connection_is_still_pulled(
         self,
         mock_get_provider: MagicMock,
         mock_session_local: MagicMock,
+        is_historical: bool,
         db: Session,
         mock_celery_app: MagicMock,
     ) -> None:
@@ -605,7 +611,8 @@ class TestSdkOnlyConnectionSkip:
         mock_strategy.data_247.load_and_save_all.return_value = {}
         mock_get_provider.return_value = mock_strategy
 
-        result = sync_vendor_data(str(user.id))
+        result = sync_vendor_data(str(user.id), is_historical=is_historical)
 
         assert "google" in result["providers_synced"]
+        mock_strategy.workouts.load_data.assert_called_once()
         mock_strategy.data_247.load_and_save_all.assert_called_once()
