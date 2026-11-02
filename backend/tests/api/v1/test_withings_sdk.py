@@ -37,6 +37,7 @@ from app.models.withings_device import WithingsDevice
 from app.models.withings_sdk_account import WithingsSdkAccount
 from app.schemas.providers.withings.dropshipment import DropshipOrder, DropshipOrderResult
 from app.schemas.providers.withings.order_detail import OrderDetail
+from app.services.providers.withings._body_logging import upstream_reason
 from app.services.providers.withings.dropshipment import WithingsDropshipmentError
 from app.services.providers.withings.order_detail import WithingsOrderDetailError
 from app.services.providers.withings.sdk_provisioning import CellularProvisioning
@@ -1318,6 +1319,46 @@ class TestNoAccountOrderRoute:
         assert response.headers["X-Withings-Refusal"] == "address_invalid"
         assert response.json()["detail"] == "Withings refused the shipping address"
         assert "Invalid Params" not in response.text
+
+    @pytest.mark.parametrize(
+        ("withings_status", "upstream_reason"),
+        [
+            (2554, f"Invalid Params: Addresses of orders [{_ORDER_REF}] are invalid"),
+            (503, None),
+        ],
+    )
+    def test_only_a_503_carrying_the_address_text_is_a_refusal(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+        withings_configured: None,
+        withings_status: int,
+        upstream_reason: str | None,
+    ) -> None:
+        # Pins the other two conjuncts (Lucas, #25): another status with the same text, and a 503
+        # with no `error` at all (which would raise on the regex and answer 500).
+        error = WithingsDropshipmentError(withings_status=withings_status, upstream_reason=upstream_reason)
+
+        with patch(_CREATE_ORDER, side_effect=error):
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 502
+        assert "X-Withings-Refusal" not in response.headers
+
+    def test_a_refusal_listing_many_refs_past_the_200_char_cap_is_still_a_refusal(
+        self, client: TestClient, api_key_header: dict[str, str], withings_configured: None
+    ) -> None:
+        refs = ", ".join("X" * 64 for _ in range(4))
+        envelope = {"status": 503, "error": f"Invalid Params: Addresses of orders [{refs}] are invalid"}
+        # Through the real `upstream_reason()`, which applies the cap.
+        error = WithingsDropshipmentError(withings_status=503, upstream_reason=upstream_reason(envelope))
+        assert "are invalid" not in (error.upstream_reason or "")
+
+        with patch(_CREATE_ORDER, side_effect=error):
+            response = client.post(_ORDERS_URL, json=_valid_order_payload(), headers=api_key_header)
+
+        assert response.status_code == 422
+        assert response.headers["X-Withings-Refusal"] == "address_invalid"
 
     def test_another_invalid_params_stays_a_502_without_the_header(
         self, client: TestClient, api_key_header: dict[str, str], withings_configured: None

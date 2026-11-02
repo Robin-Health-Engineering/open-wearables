@@ -482,7 +482,10 @@ def _refuse_if_already_placed(refs: list[str], *, client_id: str, client_secret:
 # 2026-11-02): "Invalid Params: Addresses of orders [<customer_ref_id>] are invalid". It is how they
 # say the street does not match their own data for that town ("Via Generale Armando Diaz 2", Rho:
 # refused; "Via Armando Diaz 2": accepted) — a real address can be refused, so only they can say.
-_ADDRESS_REFUSAL = re.compile(r"\bAddresses of orders\b.*\bare invalid\b", re.IGNORECASE)
+#
+# The PREFIX alone is matched: `upstream_reason()` caps the text at 200 characters, and a call with
+# several orders lists every ref before "are invalid", which the cap would cut off (Lucas, #25).
+_ADDRESS_REFUSAL = re.compile(r"\bAddresses of orders\b", re.IGNORECASE)
 
 # The header that tells the caller WHICH 422 this is, without it reading a body: robin-backend reads
 # no upstream body on this route by rule (a detail has quoted the signed payload back before), and
@@ -653,6 +656,12 @@ def create_withings_cellular_order(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account already exists for this external_id; the order was already placed",
             ) from e
+        # NOT classified as an address refusal here, on purpose (Mike, #25). The refusal is measured
+        # on createorder only. createuserorder creates the member's Withings account in the same
+        # call, and whether a refused one leaves that account behind is not known; if it does, the
+        # retry after the member's fix would meet the pre-flight's 409, which robin-backend reads as
+        # "already placed" — an order marked ORDERED that never ships. Until that is measured on
+        # staging, a refused cellular address stays the 502 it was.
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="cellular order")
         ) from e
@@ -766,6 +775,13 @@ def create_withings_order(
         if _is_address_refusal(e):
             # The member can fix this and nothing else can, so it is not a 502 to retry: the caller
             # parks the order and asks them for another address (robin-backend withingsDeviceOrder).
+            #
+            # The fix places the order again under the SAME customer_ref_id, through
+            # `_refuse_if_already_placed`, which refuses on any entry getdetail lists. That is safe
+            # only because getdetail does not list a refused ref — measured on staging 2026-11-02:
+            # ref 01M6DVG8D4TVX9PEWYPRXT1V02 was refused at 10:07 and 10:31, then passed the
+            # pre-flight and was placed under the same ref as D0850278 at 10:36; 01M6DSA3… was
+            # refused twice at 09:34 and placed as D0850266 at 09:45. Single-order calls only.
             # A fixed detail, never Withings' text: it names our order ref, not the address, but the
             # rule on this route is that no upstream words reach a client.
             raise HTTPException(
