@@ -15,6 +15,8 @@ from app.integrations.celery.tasks import (
     sync_vendor_data,
     trigger_garmin_backfill_for_type,
 )
+from app.integrations.celery.tasks.sync_vendor_data_task import _is_sdk_only_connection
+from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName
 from app.services import ApiKeyDep
 from app.services.providers.factory import ProviderFactory
@@ -161,6 +163,17 @@ def sync_user_data(
 
     # Synchronous mode
     strategy = factory.get_provider(provider.value)
+
+    # A token-less connection of a hybrid provider (Google Health Connect via the SDK) has no
+    # REST credentials: every provider call would 401 and the 247 sync would raise. Answer
+    # that up front, as the async worker skips the same connections.
+    # Robin fork only: drop with the sync_vendor_data filter on rebase (the-momentum/open-wearables#1634).
+    connection = UserConnectionRepository().get_active_connection(db, user_id, provider.value)
+    if connection is not None and _is_sdk_only_connection(strategy.capabilities, connection):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Connection to '{provider.value}' is SDK-only and has no REST credentials",
+        )
 
     results: dict[str, Any] = {}
 

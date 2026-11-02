@@ -217,14 +217,18 @@ def sync_vendor_data(
             connections = [c for c in connections if c not in sdk_only]
 
             if not connections:
+                if sdk_only:
+                    message = "Only SDK-only connections found; REST pull skipped"
+                else:
+                    message = "No active provider connections found"
                 log_structured(
                     logger,
                     "info",
-                    f"No active connections found for user {user_id}",
+                    f"{message} for user {user_id}",
                     task="sync_vendor_data",
                     user_id=user_id,
                 )
-                result.message = "No active provider connections found"
+                result.message = message
                 return result.model_dump()
 
             log_structured(

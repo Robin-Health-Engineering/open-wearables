@@ -587,6 +587,7 @@ class TestSdkOnlyConnectionSkip:
         result = sync_vendor_data(str(user.id), is_historical=is_historical)
 
         assert "google" not in result["providers_synced"]
+        assert result["message"] == "Only SDK-only connections found; REST pull skipped"
         mock_strategy.workouts.load_data.assert_not_called()
         mock_strategy.data_247.load_and_save_all.assert_not_called()
 
