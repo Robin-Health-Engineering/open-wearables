@@ -656,12 +656,14 @@ def create_withings_cellular_order(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account already exists for this external_id; the order was already placed",
             ) from e
-        # NOT classified as an address refusal here, on purpose (Mike, #25). The refusal is measured
-        # on createorder only. createuserorder creates the member's Withings account in the same
-        # call, and whether a refused one leaves that account behind is not known; if it does, the
-        # retry after the member's fix would meet the pre-flight's 409, which robin-backend reads as
-        # "already placed" — an order marked ORDERED that never ships. Until that is measured on
-        # staging, a refused cellular address stays the 502 it was.
+        # NOT classified as an address refusal here, on purpose (Mike, #25). Measured on createorder
+        # only. Unmeasured for createuserorder: (1) whether it refuses with the same "Addresses of
+        # orders [...]" envelope; (2) whether getdetail then lists the refused ref. If it did, the
+        # pre-flight would answer the member's fix with a 409, which robin-backend reads as "already
+        # placed" (ORDERED, nothing ships); (3) if the refusal leaves the member's Withings account
+        # behind, whether the next createuserorder reuses it. A leftover account alone cannot trip the
+        # pre-flight, which asks for orders by customer_ref_id (Lucas, #25). Until measured, it stays a
+        # 502.
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="cellular order")
         ) from e
