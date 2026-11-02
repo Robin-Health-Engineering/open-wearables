@@ -201,8 +201,10 @@ def sync_vendor_data(
             # SDK-only connections of hybrid providers have no OAuth token: REST pulls
             # cannot succeed for them, so skip rather than fail every data type.
             # Robin fork only: superseded upstream by the health_connect/google_health split
-            # (the-momentum/open-wearables#1634). Drop this filter, _is_sdk_only_connection and
-            # TestSdkOnlyConnectionSkip on rebase.
+            # (the-momentum/open-wearables#1634). Drop on rebase, together: this filter,
+            # _is_sdk_only_connection, TestSdkOnlyConnectionSkip, the SDK-only 409 guard and its
+            # import in app/api/routes/v1/sync_data.py, and test_sync_sdk_only_google_connection_returns_409
+            # / test_sync_oauth_google_connection_still_runs in tests/api/v1/test_sync_data.py.
             sdk_only = [c for c in connections if _is_sdk_only_connection(strategies[c.provider].capabilities, c)]
             for c in sdk_only:
                 log_structured(

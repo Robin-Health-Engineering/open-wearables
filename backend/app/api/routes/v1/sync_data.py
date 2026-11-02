@@ -167,7 +167,8 @@ def sync_user_data(
     # A token-less connection of a hybrid provider (Google Health Connect via the SDK) has no
     # REST credentials: every provider call would 401 and the 247 sync would raise. Answer
     # that up front, as the async worker skips the same connections.
-    # Robin fork only: drop with the sync_vendor_data filter on rebase (the-momentum/open-wearables#1634).
+    # Robin fork only: drop with the sync_vendor_data filter on rebase (the-momentum/open-wearables#1634),
+    # including the _is_sdk_only_connection / UserConnectionRepository imports above.
     connection = UserConnectionRepository().get_active_connection(db, user_id, provider.value)
     if connection is not None and _is_sdk_only_connection(strategy.capabilities, connection):
         raise HTTPException(

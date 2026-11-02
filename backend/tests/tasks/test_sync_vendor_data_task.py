@@ -539,6 +539,8 @@ class TestSdkOnlyConnectionSkip:
 
     Robin fork only: drop on rebase onto upstream's health_connect/google_health split
     (the-momentum/open-wearables#1634), where ``provider="google"`` no longer resolves.
+    Drop alongside it the SDK-only 409 guard in app/api/routes/v1/sync_data.py and its two
+    route tests in tests/api/v1/test_sync_data.py (full list at the filter in sync_vendor_data).
     """
 
     @pytest.mark.parametrize(
