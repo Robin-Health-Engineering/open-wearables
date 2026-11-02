@@ -100,6 +100,16 @@ def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is
     return live_sync_mode == LiveSyncMode.PULL
 
 
+def _is_sdk_only_connection(caps: Any, connection: Any) -> bool:
+    """True if this connection exists only for SDK pushes and has no OAuth credentials.
+
+    Hybrid providers (Google: Health Connect SDK + Health API REST) usually share one
+    connection per user. A connection created by ``ensure_sdk_connection`` carries no access token,
+    so every REST call for it would 401 — its data arrives via the SDK instead.
+    """
+    return bool(caps.client_sdk) and not connection.access_token
+
+
 @shared_task
 def sync_vendor_data(
     user_id: str,
@@ -188,15 +198,39 @@ def sync_vendor_data(
                 )
             ]
 
-            if not connections:
+            # SDK-only connections of hybrid providers have no OAuth token: REST pulls
+            # cannot succeed for them, so skip rather than fail every data type.
+            # Robin fork only: superseded upstream by the health_connect/google_health split
+            # (the-momentum/open-wearables#1634). Drop on rebase, together: this filter,
+            # _is_sdk_only_connection, TestSdkOnlyConnectionSkip, the SDK-only 409 guard and its
+            # import in app/api/routes/v1/sync_data.py, and test_sync_sdk_only_google_connection_returns_409
+            # / test_sync_oauth_google_connection_still_runs in tests/api/v1/test_sync_data.py.
+            sdk_only = [c for c in connections if _is_sdk_only_connection(strategies[c.provider].capabilities, c)]
+            for c in sdk_only:
                 log_structured(
                     logger,
                     "info",
-                    f"No active connections found for user {user_id}",
+                    f"Skipping {c.provider} REST pull — SDK-only connection without OAuth token",
+                    provider=c.provider,
+                    task="sync_vendor_data",
+                    user_id=user_id,
+                    connection_id=str(c.id),
+                )
+            connections = [c for c in connections if c not in sdk_only]
+
+            if not connections:
+                if sdk_only:
+                    message = "Only SDK-only connections found; REST pull skipped"
+                else:
+                    message = "No active provider connections found"
+                log_structured(
+                    logger,
+                    "info",
+                    f"{message} for user {user_id}",
                     task="sync_vendor_data",
                     user_id=user_id,
                 )
-                result.message = "No active provider connections found"
+                result.message = message
                 return result.model_dump()
 
             log_structured(

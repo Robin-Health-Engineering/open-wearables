@@ -213,6 +213,59 @@ class TestSyncDataEndpoint:
         assert response.status_code == 501
         assert "does not support workouts" in response.json()["detail"]
 
+    def test_sync_sdk_only_google_connection_returns_409(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_provider_factory: MagicMock,
+    ) -> None:
+        """A token-less google connection (Health Connect SDK) is refused before any REST call."""
+        user = UserFactory()
+        api_key = ApiKeyFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="google",
+            status=ConnectionStatus.ACTIVE,
+            access_token=None,
+            refresh_token=None,
+            token_expires_at=None,
+        )
+        mock_strategy = mock_provider_factory.get_provider.return_value
+        mock_strategy.capabilities.client_sdk = True
+
+        response = client.post(
+            f"/api/v1/providers/google/users/{user.id}/sync",
+            headers={"X-Open-Wearables-API-Key": api_key.id},
+            params={"async": "false"},
+        )
+
+        assert response.status_code == 409
+        assert "SDK-only" in response.json()["detail"]
+        mock_strategy.workouts.load_data.assert_not_called()
+        mock_strategy.data_247.load_and_save_all.assert_not_called()
+
+    def test_sync_oauth_google_connection_still_runs(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_provider_factory: MagicMock,
+    ) -> None:
+        """A google connection with an OAuth token still syncs synchronously."""
+        user = UserFactory()
+        api_key = ApiKeyFactory()
+        UserConnectionFactory(user=user, provider="google", status=ConnectionStatus.ACTIVE)
+        mock_strategy = mock_provider_factory.get_provider.return_value
+        mock_strategy.capabilities.client_sdk = True
+
+        response = client.post(
+            f"/api/v1/providers/google/users/{user.id}/sync",
+            headers={"X-Open-Wearables-API-Key": api_key.id},
+            params={"async": "false", "data_type": "workouts"},
+        )
+
+        assert response.status_code == 200
+        mock_strategy.workouts.load_data.assert_called_once()
+
 
 class TestSyncHistoricalEndpoint:
     """Test suite for POST /api/v1/providers/{provider}/users/{user_id}/sync/historical."""
