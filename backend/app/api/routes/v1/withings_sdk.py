@@ -20,6 +20,7 @@ narrowed, it should be narrowed on purpose and not by someone reading a docstrin
 claimed it was.
 """
 
+import re
 from datetime import datetime, timezone
 from logging import getLogger
 from typing import Annotated, Any, Literal
@@ -477,6 +478,27 @@ def _refuse_if_already_placed(refs: list[str], *, client_id: str, client_secret:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ALREADY_PLACED)
 
 
+# Withings' envelope `error` when createorder refuses the shipping address (measured on staging,
+# 2026-11-02): "Invalid Params: Addresses of orders [<customer_ref_id>] are invalid". It is how they
+# say the street does not match their own data for that town ("Via Generale Armando Diaz 2", Rho:
+# refused; "Via Armando Diaz 2": accepted) — a real address can be refused, so only they can say.
+#
+# The PREFIX alone is matched: `upstream_reason()` caps the text at 200 characters, and a call with
+# several orders lists every ref before "are invalid", which the cap would cut off (Lucas, #25).
+_ADDRESS_REFUSAL = re.compile(r"\bAddresses of orders\b", re.IGNORECASE)
+
+# The header that tells the caller WHICH 422 this is, without it reading a body: robin-backend reads
+# no upstream body on this route by rule (a detail has quoted the signed payload back before), and
+# FastAPI's own request-validation 422 carries no such header.
+WITHINGS_REFUSAL_HEADER = "X-Withings-Refusal"
+ADDRESS_INVALID = "address_invalid"
+
+
+def _is_address_refusal(e: WithingsDropshipmentError) -> bool:
+    """Withings answered 503 because the shipping address is not one they will ship to. Nothing was placed."""
+    return e.withings_status == 503 and bool(e.upstream_reason) and bool(_ADDRESS_REFUSAL.search(e.upstream_reason))
+
+
 def _order_failure_detail(e: WithingsDropshipmentError, *, order: str) -> str:
     """The 502 detail for a failed order call, shaped the same on both order routes (contract C1).
 
@@ -634,6 +656,14 @@ def create_withings_cellular_order(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account already exists for this external_id; the order was already placed",
             ) from e
+        # NOT classified as an address refusal here, on purpose (Mike, #25). Measured on createorder
+        # only. Unmeasured for createuserorder: (1) whether it refuses with the same "Addresses of
+        # orders [...]" envelope; (2) whether getdetail then lists the refused ref. If it did, the
+        # pre-flight would answer the member's fix with a 409, which robin-backend reads as "already
+        # placed" (ORDERED, nothing ships); (3) if the refusal leaves the member's Withings account
+        # behind, whether the next createuserorder reuses it. A leftover account alone cannot trip the
+        # pre-flight, which asks for orders by customer_ref_id (Lucas, #25). Until measured, it stays a
+        # 502.
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="cellular order")
         ) from e
@@ -744,6 +774,23 @@ def create_withings_order(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except WithingsDropshipmentError as e:
+        if _is_address_refusal(e):
+            # The member can fix this and nothing else can, so it is not a 502 to retry: the caller
+            # parks the order and asks them for another address (robin-backend withingsDeviceOrder).
+            #
+            # The fix places the order again under the SAME customer_ref_id, through
+            # `_refuse_if_already_placed`, which refuses on any entry getdetail lists. That is safe
+            # only because getdetail does not list a refused ref — measured on staging 2026-11-02:
+            # ref 01M6DVG8D4TVX9PEWYPRXT1V02 was refused at 10:07 and 10:31, then passed the
+            # pre-flight and was placed under the same ref as D0850278 at 10:36; 01M6DSA3… was
+            # refused twice at 09:34 and placed as D0850266 at 09:45. Single-order calls only.
+            # A fixed detail, never Withings' text: it names our order ref, not the address, but the
+            # rule on this route is that no upstream words reach a client.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Withings refused the shipping address",
+                headers={WITHINGS_REFUSAL_HEADER: ADDRESS_INVALID},
+            ) from e
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=_order_failure_detail(e, order="order")
         ) from e
