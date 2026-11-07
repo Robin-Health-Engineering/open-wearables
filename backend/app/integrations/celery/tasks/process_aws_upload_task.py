@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.integrations.redis_client import get_redis_client
+from app.repositories.data_source_repository import DataSourceRepository
 from app.schemas.providers.apple.apple_xml import CompletedPart
 from app.schemas.sync_status import SyncSource, SyncStatus
 from app.services import event_record_service
@@ -358,7 +359,11 @@ def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: st
     normalized_source = Path(xml_source) if isinstance(xml_source, str) else xml_source
     xml_service = XMLService(normalized_source, getLogger(__name__))
 
+    data_source_repo = DataSourceRepository()
     for time_series_records, workouts, sync_request in xml_service.parse_xml(user_id):
+        # Same per-user lock as the SDK import (ImportService.load_data): serialises this batch's
+        # data_source / data point writes against concurrent imports for the user. Released on commit.
+        data_source_repo.lock_user_import(db, UUID(user_id))
         for record, detail in workouts:
             created_record = event_record_service.create(db, record)
             detail_for_record = detail.model_copy(update={"record_id": created_record.id})

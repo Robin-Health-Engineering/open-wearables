@@ -17,6 +17,7 @@ from app.constants.series_types.sdk import (
 )
 from app.constants.workout_types import get_unified_apple_workout_type_sdk
 from app.database import DbSession
+from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
@@ -131,6 +132,7 @@ class ImportService:
         self.event_record_service = event_record_service
         self.timeseries_service = timeseries_service
         self.user_connection_repo = UserConnectionRepository()
+        self.data_source_repo = DataSourceRepository()
 
     def _dec(self, value: float | int | Decimal | None) -> Decimal | None:
         return None if value is None else Decimal(str(value))
@@ -364,6 +366,10 @@ class ImportService:
         sleep_saved = 0
         types: set[str] = set()
 
+        # Serialise this user's import transactions (released by the commit below) so concurrent
+        # uploads can't deadlock on data_source / data point unique indexes.
+        self.data_source_repo.lock_user_import(db_session, UUID(user_id))
+
         # Process workouts in batch
         workout_bundles = list(self._build_workout_bundles(request, user_id))
         if workout_bundles:
@@ -595,6 +601,9 @@ class ImportService:
                 user_id=user_id,
                 error_type=type(e).__name__,
             )
+            # End the failed transaction now so its per-user import lock (and row locks) are released
+            # instead of being held until the caller's session closes.
+            db_session.rollback()
             return UploadDataResponse(
                 status_code=400,
                 response=f"Import failed: {str(e)}",
