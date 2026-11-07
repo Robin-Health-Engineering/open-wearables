@@ -601,6 +601,9 @@ class ImportService:
                 user_id=user_id,
                 error_type=type(e).__name__,
             )
+            # End the failed transaction now so its per-user import lock (and row locks) are released
+            # instead of being held until the caller's session closes.
+            db_session.rollback()
             return UploadDataResponse(
                 status_code=400,
                 response=f"Import failed: {str(e)}",

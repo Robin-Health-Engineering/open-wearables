@@ -344,6 +344,43 @@ class TestAppleSDKImport:
 
         assert result["records_saved"] >= 0
 
+    def test_load_data_takes_user_import_lock_before_writes(
+        self,
+        db: Session,
+        import_service: ImportService,
+        sample_sdk_payload: dict[str, Any],
+    ) -> None:
+        """Regression for OW-BACKEND-V: the per-user lock must be taken before any data_source write."""
+        user = UserFactory()
+        calls: list[str] = []
+
+        def record_write(result: Any) -> Any:
+            calls.append("write")
+            return result
+
+        with (
+            patch.object(
+                import_service.data_source_repo,
+                "lock_user_import",
+                side_effect=lambda *_a, **_k: calls.append("lock"),
+            ) as lock,
+            patch.object(
+                import_service.timeseries_service,
+                "bulk_create_samples",
+                side_effect=lambda *_a, **_k: record_write(MagicMock(inserted=0, updated=0)),
+            ),
+            patch.object(
+                import_service.event_record_service,
+                "bulk_create",
+                side_effect=lambda *_a, **_k: record_write([]),
+            ),
+        ):
+            import_service.load_data(db, sample_sdk_payload, str(user.id))
+
+        lock.assert_called_once_with(db, user.id)
+        assert calls[0] == "lock"
+        assert "write" in calls
+
     def test_types_written_reach_the_response(
         self,
         db: Session,

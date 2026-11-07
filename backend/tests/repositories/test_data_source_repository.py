@@ -102,7 +102,8 @@ class TestBatchEnsureDataSourcesDeadlockSafety:
             result = repo.batch_ensure_data_sources(db, ProviderName.GOOGLE, None, identities)
 
         assert set(result) == identities
-        insert_stmt = executed[-1]
+        # Query.all() also goes through session.execute, so pick the INSERT explicitly.
+        insert_stmt = next(s for s in executed if getattr(s, "is_insert", False))
         params = insert_stmt.compile().params
         inserted = [
             (params[f"user_id_m{i}"], params[f"device_model_m{i}"], params[f"source_m{i}"])
@@ -114,11 +115,17 @@ class TestBatchEnsureDataSourcesDeadlockSafety:
         user = UserFactory()
         repo = DataSourceRepository(DataSource)
 
-        repo.lock_user_import(db, user.id)
-        # Same transaction can take it again (e.g. a later batch in the same import) without blocking.
-        repo.lock_user_import(db, user.id)
+        held_sql = text(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()"
+        )
+        before = db.execute(held_sql).scalar_one()
 
-        held = db.execute(
-            text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()")
-        ).scalar_one()
-        assert held >= 1
+        repo.lock_user_import(db, user.id)
+        after_first = db.execute(held_sql).scalar_one()
+        # Same transaction can take it again (e.g. a later batch in the same import) without blocking,
+        # and re-taking it holds the same lock rather than a new one.
+        repo.lock_user_import(db, user.id)
+        after_second = db.execute(held_sql).scalar_one()
+
+        assert after_first == before + 1
+        assert after_second == after_first
