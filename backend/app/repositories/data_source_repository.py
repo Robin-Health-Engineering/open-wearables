@@ -1,7 +1,7 @@
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, asc, delete, func
+from sqlalchemy import CursorResult, and_, asc, delete, func, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -12,12 +12,30 @@ from app.repositories.repositories import CrudRepository
 from app.schemas.enums import DeviceType, ProviderName, infer_device_type_from_model, infer_device_type_from_source_name
 from app.schemas.model_crud.data_priority import DataSourceCreate, DataSourceUpdate
 
+_LOCK_USER_IMPORT = text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))")
+
+
+def _identity_sort_key(identity: tuple[UUID, str | None, str | None]) -> tuple[str, str, str, bool, bool]:
+    """Total, None-safe ordering for data_source identities (None sorts apart from "")."""
+    user_id, device_model, source = identity
+    return (str(user_id), device_model or "", source or "", device_model is None, source is None)
+
 
 class DataSourceRepository(
     CrudRepository[DataSource, DataSourceCreate, DataSourceUpdate],
 ):
     def __init__(self, model: type[DataSource] = DataSource):
         super().__init__(model)
+
+    def lock_user_import(self, db_session: DbSession, user_id: UUID) -> None:
+        """Take the user's transaction-scoped import lock; released by the caller's commit or rollback.
+
+        An import ensures data_source rows (unique index ``uq_data_source_identity``) in several
+        statements before it commits. Two concurrent imports for the same user could each hold an
+        uncommitted identity the other needs and deadlock. Serialising a user's import transactions
+        prevents that, while imports for different users still run in parallel.
+        """
+        db_session.execute(_LOCK_USER_IMPORT, {"key": f"data-import|{user_id}"})
 
     def _build_identity_filter(
         self,
@@ -134,7 +152,8 @@ class DataSourceRepository(
         for ds in existing:
             result[(ds.user_id, ds.device_model, ds.source)] = ds.id
 
-        missing = [i for i in identities_list if i not in result]
+        # Deterministic insert order so concurrent inserts take index locks in the same order.
+        missing = sorted((i for i in identities_list if i not in result), key=_identity_sort_key)
 
         if missing:
             values = []
